@@ -248,6 +248,7 @@ class ConfigAutoSave:
         self.fileconfig = None
         self.status_save_pending = {}
         self.save_config_pending = False
+        self.autosave_path = None
         gcode = self.printer.lookup_object('gcode')
         gcode.register_command("SAVE_CONFIG", self.cmd_SAVE_CONFIG,
                                desc=self.cmd_SAVE_CONFIG_help)
@@ -391,6 +392,15 @@ class ConfigAutoSave:
         if cfgname.endswith(".cfg"):
             backup_name = cfgname[:-4] + datestr + ".cfg"
             temp_name = cfgname[:-4] + "_autosave.cfg"
+        # if autosave_path was specified, then put the backup there
+        # instead of next to printer.cfg
+        if self.autosave_path is not None:
+            (bdir, bfile) = os.path.split(backup_name)
+            if not os.path.isabs(self.autosave_path):
+                bdir = os.path.join(bdir, self.autosave_path)
+            if not os.path.exists(bdir):
+                os.mkdir(bdir)
+            backup_name = os.path.join(bdir, bfile)
         # Create new config file with temporary name and swap with main config
         logging.info("SAVE_CONFIG to '%s' (backup in '%s')",
                      cfgname, backup_name)
@@ -485,6 +495,7 @@ class PrinterConfig:
             autosave_fileconfig)
         config = ConfigWrapper(self.printer, fileconfig,
                                access_tracking, 'printer')
+        self.autosave.autosave_path = config.get('autosave_path', default=None)
         self._build_status_config(config)
         return config
     def log_config(self, config):
