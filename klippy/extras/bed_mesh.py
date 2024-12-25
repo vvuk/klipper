@@ -133,7 +133,7 @@ class BedMesh:
         self.update_status()
     def handle_connect(self):
         self.toolhead = self.printer.lookup_object('toolhead')
-        self.bmc.print_generated_points(logging.info)
+        #self.bmc.print_generated_points(logging.info)
     def set_mesh(self, mesh):
         if mesh is not None and self.fade_end != self.FADE_DISABLE:
             self.log_fade_complete = True

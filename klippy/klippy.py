@@ -114,8 +114,8 @@ class Printer:
     def _read_config(self):
         self.objects['configfile'] = pconfig = configfile.PrinterConfig(self)
         config = pconfig.read_main_config()
-        if self.bglogger is not None:
-            pconfig.log_config(config)
+        ###if self.bglogger is not None:
+        ###    pconfig.log_config(config)
         # Create printer components
         for m in [pins, mcu]:
             m.add_printer_objects(config)
@@ -169,6 +169,9 @@ class Printer:
     def run(self):
         systime = time.time()
         monotime = self.reactor.monotonic()
+        logging.info("========================================")
+        logging.info("========================================")
+        logging.info("========================================")
         logging.info("Start printer at %s (%.1f %.1f)",
                      time.asctime(time.localtime(systime)), systime, monotime)
         # Enter main reactor loop
