@@ -354,8 +354,8 @@ class EddyEndstopWrapper:
         if not self._trigger_time:
             return trig_pos
         # Extract samples
-        start_time = self._trigger_time + 0.050
-        end_time = start_time + 0.100
+        start_time = self._trigger_time - 0.01 # + 0.050
+        end_time = start_time + 0.05 # + 0.100
         toolhead = self._printer.lookup_object("toolhead")
         toolhead_pos = toolhead.get_position()
         self._gather.note_probe(start_time, end_time, toolhead_pos)
