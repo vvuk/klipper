@@ -343,6 +343,8 @@ class ProbeSessionHelper:
             positions.append(pos)
             # Check samples tolerance
             z_positions = [p[2] for p in positions]
+            logging.info(f"z positions: {z_positions}")
+            logging.info(f"tolerance: actual: {max(z_positions)-min(z_positions)} max: {params['samples_tolerance']}")
             if max(z_positions)-min(z_positions) > params['samples_tolerance']:
                 if retries >= params['samples_tolerance_retries']:
                     raise gcmd.error("Probe samples exceed samples_tolerance")

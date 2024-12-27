@@ -257,6 +257,7 @@ class EddyGatherSamples:
         if not samp_count:
             # No sensor readings - raise error in pull_probed()
             return 0.
+        logging.info(f"_pull_freq averaged {samp_count} frequencies")
         return samp_sum / samp_count
     def _lookup_toolhead_pos(self, pos_time):
         toolhead = self._printer.lookup_object('toolhead')
@@ -295,9 +296,11 @@ class EddyGatherSamples:
         del self._probe_results[:]
         return results
     def note_probe(self, start_time, end_time, toolhead_pos):
+        logging.info(f"note_probe: {start_time} {end_time} {toolhead_pos}")
         self._probe_times.append((start_time, end_time, None, toolhead_pos))
         self._check_samples()
     def note_probe_and_position(self, start_time, end_time, pos_time):
+        logging.info(f"note_probe_and_position: {start_time} {end_time} {pos_time}")
         self._probe_times.append((start_time, end_time, pos_time, None))
         self._check_samples()
 
