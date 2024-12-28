@@ -162,4 +162,8 @@ config RPXXXX_CANBUS_GPIO_TX
     default 5
     range 0 29
 
+config IDM_ENABLE
+    bool "IDM"
+    default n
+
 endif
