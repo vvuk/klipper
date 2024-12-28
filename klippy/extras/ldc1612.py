@@ -135,6 +135,14 @@ class LDC1612:
             "query_ldc1612_home_state oid=%c",
             "ldc1612_home_state oid=%c homing=%c trigger_clock=%u",
             oid=self.oid, cq=cmdqueue)
+        self.query_ldc1612_latched_status_cmd = self.mcu.lookup_query_command(
+            "query_ldc1612_latched_status oid=%c",
+            "ldc1612_latched_status oid=%c status=%u",
+            oid=self.oid, cq=cmdqueue)
+        self.query_ldc1612_hack_cmd = self.mcu.lookup_query_command(
+            "query_ldc1612_hack oid=%c",
+            "ldc1612_hack oid=%c time=%u avg=%i cavg=%i adj=%i",
+            oid=self.oid, cq=cmdqueue)
     def get_mcu(self):
         return self.i2c.get_mcu()
     def read_reg(self, reg):
@@ -146,11 +154,29 @@ class LDC1612:
                            minclock=minclock)
     def add_client(self, cb):
         self.batch_bulk.add_client(cb)
+    def latched_status(self):
+        response = self.query_ldc1612_latched_status_cmd.send([self.oid])
+        return response['status']
+    def latched_status_str(self):
+        s = self.latched_status()
+        result = []
+        if (s & (1<<15)) != 0: result.append('ERR_CH1')
+        if (s & (1<<13)) != 0: result.append('ERR_UR')
+        if (s & (1<<12)) != 0: result.append('ERR_OR')
+        if (s & (1<<11)) != 0: result.append('ERR_WD')
+        if (s & (1<<10)) != 0: result.append('ERR_AHE')
+        if (s & (1<<9)) != 0: result.append('ERR_ALE')
+        if (s & (1<<8)) != 0: result.append('ERR_ZC')
+        if (s & (1<<6)) != 0: result.append('DRDY')
+        if (s & (1<<3)) != 0: result.append('UNREADCONV1')
+        return str.join(' ', result)
     # Homing
+    def to_ldc_freqval(self, freq):
+        return int(freq * (1<<28) / float(LDC1612_FREQ) + 0.5)
     def setup_home(self, print_time, trigger_freq,
                    trsync_oid, hit_reason, err_reason):
         clock = self.mcu.print_time_to_clock(print_time)
-        tfreq = int(trigger_freq * (1<<28) / float(LDC1612_FREQ) + 0.5)
+        tfreq = self.to_ldc_freqval(trigger_freq) #int(trigger_freq * (1<<28) / float(LDC1612_FREQ) + 0.5)
         self.ldc1612_setup_home_cmd.send(
             [self.oid, clock, tfreq, trsync_oid, hit_reason, err_reason,
              0, 0, 0, 0])
@@ -162,12 +188,14 @@ class LDC1612:
         if tap_clock - clock >= 1<<31:
             raise self.printer.command_error(
                 "ldc1612 tap time too far in future")
-        ptfreq = int(pretap_freq * (1<<28) / float(LDC1612_FREQ) + 0.5)
-        adj_factor = tap_factor / self.data_rate
-        tapfreq = -int(tap_threshold * adj_factor * (1<<28)
-                       / float(LDC1612_FREQ) + 0.5)
+        ptfreq = self.to_ldc_freqval(pretap_freq) #int(pretap_freq * (1<<28) / float(LDC1612_FREQ) + 0.5)
+        # vv: spread tap_factor into a per-sample adjustment factor
+        adj_factor = tap_factor / self.data_rate # data_rate = 250
+        tapfreq = -self.to_ldc_freqval(tap_threshold * adj_factor) # -int(tap_threshold * adj_factor * (1<<28) / float(LDC1612_FREQ) + 0.5)
+        # vv: then broadcast that per-sample adjustment factor (which.. must be between 0 and 1?) 
+        # into the range 0..2^32 so that we can do integer math on the other side
         tfactor = int(adj_factor * (1<<32) + 0.5)
-        logging.info("ptf=%f/%d tt=%f/%d tf=%f/%d", pretap_freq, ptfreq,
+        logging.info("TAP: pretap_freq=%f/%d tap_threshold=%f/%d tap_factor=%f/%d", pretap_freq, ptfreq,
                      tap_threshold, tapfreq, tap_factor, tfactor)
         self.ldc1612_setup_home_cmd.send(
             [self.oid, clock, ptfreq, trsync_oid, hit_reason, err_reason,
@@ -179,6 +207,15 @@ class LDC1612:
         params = self.query_ldc1612_home_state_cmd.send([self.oid])
         tclock = self.mcu.clock32_to_clock64(params['trigger_clock'])
         return self.mcu.clock_to_print_time(tclock)
+    def query_hack(self):
+        freq_conv = float(LDC1612_FREQ) / (1<<28)
+        logging.info("TAP: LDC DUMP:")
+        for i in range(64):
+            res = self.query_ldc1612_hack_cmd.send([self.oid])
+            if res['time'] > 0:
+                avg_ldc = res['avg']
+                avg = round(avg_ldc * freq_conv, 3)
+                logging.info(f"TAP: {i} {res['time']} {avg} / {res['avg']} {res['cavg']} {res['adj']}")
     # Measurement decoding
     def _convert_samples(self, samples):
         freq_conv = float(LDC1612_FREQ) / (1<<28)
@@ -207,9 +244,10 @@ class LDC1612:
         self.set_reg(REG_OFFSET0, 0)
         self.set_reg(REG_SETTLECOUNT0, int(SETTLETIME*LDC1612_FREQ/16. + .5))
         self.set_reg(REG_CLOCK_DIVIDERS0, (1 << 12) | 1)
-        self.set_reg(REG_ERROR_CONFIG, (0x1f << 11) | 1)
+        self.set_reg(REG_ERROR_CONFIG, (0x1f << 11) | 0b11001)
         self.set_reg(REG_MUX_CONFIG, 0x0208 | DEGLITCH)
-        self.set_reg(REG_CONFIG, 0x001 | (1<<12) | (1<<10) | (1<<9))
+        # RP_OVERRIDE_EN | AUTO_AMP_DIS | REF_CLK_SRC=clkin | reserved
+        self.set_reg(REG_CONFIG, (1<<12) | (1<<10) | (1<<9) | 0x001)
         self.set_reg(REG_DRIVE_CURRENT0, self.dccal.get_drive_current() << 11)
         # Start bulk reading
         rest_ticks = self.mcu.seconds_to_clock(0.5 / self.data_rate)

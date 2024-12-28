@@ -66,7 +66,7 @@ def wait_path(path, alt_path=None):
             if start_alt_path is None:
                 start_alt_path = cur_time
                 continue
-            if cur_time >= start_alt_path + 0.300:
+            if cur_time >= start_alt_path + 1.000:
                 sys.stderr.write("Device reconnect on alt path %s\n" % (
                     alt_path,))
                 return alt_path
