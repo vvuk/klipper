@@ -674,10 +674,12 @@ class Scanner:
                 self.toolhead.dwell(1.0)
 
                 samples.append(probe_position[2])
+                ppos = probe_position[2]
+                pdelta = ppos - z_max
                 self.log_debug_info(
                     verbose,
                     gcmd,
-                    f"Touch {len(samples)} result: {probe_position[2]:.4f}",
+                    f"Touch {len(samples)} result: {probe_position[2]:.4f} (down: {pdelta:.4f})",
                 )
 
                 average = np.median(samples)
@@ -697,7 +699,7 @@ class Scanner:
                         f"Deviation of {deviation:.4f} exceeds tolerance of {tolerance:.4f}",
                     )
                     gcmd.respond_info(
-                        f"Attempt {retries + 1}/{max_retries} failed with deviation {deviation:.4f}."
+                        f"Attempt {retries + 1}/{max_retries} failed with deviation {deviation:.4f} (tolerance: {tolerance:.4f})."
                     )
                     retries += 1
                     new_retry = True
@@ -706,7 +708,7 @@ class Scanner:
                 self.log_debug_info(
                     verbose,
                     gcmd,
-                    f"Deviation: {deviation:.4f}\nNew Average: {average:.4f}\nTolerance: {tolerance:.4f}",
+                    f"Deviation: {deviation:.4f} New Average: {average:.4f} (tolerance: {tolerance:.4f})",
                 )
 
             std_dev = np.std(samples)
@@ -789,6 +791,8 @@ class Scanner:
         else:
             has_increased_threshold_max = True  # max limit is set, dont increase
 
+        gcmd.respond_info(f"scan: step: {step} threshold: {threshold_min} .. {threshold_max} dtz: {self.detect_threshold_z}");
+
         override = gcmd.get_int("OVERRIDE", 0)
 
         confirmation_retries = gcmd.get_int(
@@ -829,7 +833,7 @@ class Scanner:
         self.validate_model_loaded(gcmd)
 
         # Check if bed leveling has been applied
-        if self.bed_level.requires_bed_leveling():
+        if False and self.bed_level.requires_bed_leveling():
             self.trigger_method = TriggerMethod.SCAN
             lines = ["Bed leveling required before threshold scan."]
             cmd = self.bed_level.get_bed_leveling_command()
@@ -845,15 +849,23 @@ class Scanner:
         self.previous_probe_success = 0
         current_threshold = threshold_min
 
-        start_position = kin_status["axis_maximum"][2]
         try:
-            initial_position = self.toolhead.get_position()[:]
-            homing_position = initial_position[:]
-            initial_position[2], homing_position[2] = (
-                start_position,
-                kin_status["axis_minimum"][2],
-            )
+            start_position = 5.0 # kin_status["axis_maximum"][2]
+            z_axis_min = -0.25 #kin_status["axis_minimum"][2]
+
+            tpos = self.toolhead.get_position()[:3]
+            start_position = tpos[2]
+            initial_position = [tpos[0], tpos[1], start_position]
+            homing_position = [tpos[0], tpos[1], z_axis_min]
+
             max_accel = self.toolhead.get_status(curtime)["max_accel"]
+
+            gcmd.respond_info(f"toolhead pre initial move: {self.toolhead.get_position()} q")
+            gcmd.respond_info(f"thresh initial position: {initial_position} homing pos: {homing_position}")
+            self.toolhead.move(initial_position, vars["speed"])
+            self.toolhead.wait_moves()
+            self.toolhead.dwell(0.250)
+            gcmd.respond_info(f"toolhead initial move: {self.toolhead.get_position()}")
 
             # Threshold scanning loop
             while current_threshold <= threshold_max:
@@ -941,7 +953,8 @@ class Scanner:
                             break
                 # Move to the next candidate if current threshold didn't succeed
                 current_threshold += step
-
+        except e:
+            gcmd.respond_info("Exception during probe: " + e)
         finally:
             self._zhop()
 
@@ -949,6 +962,10 @@ class Scanner:
             consistent_results = [
                 r for r in results if r.get("consistent_results", False)
             ]
+
+            if not results or len(results) == 0:
+                gcmd.respond_raw("!! No results during the scan!")
+                return
 
             # Check if there are any results at all
             if not results or all(not r["success"] for r in results):
@@ -1061,6 +1078,7 @@ class Scanner:
                 self.set_accel(accel)
 
                 try:
+                    gcmd.respond_info(f"probing_move to {homing_position}")
                     probe_position = self.phoming.probing_move(
                         self.mcu_probe, homing_position, speed
                     )
@@ -1080,12 +1098,15 @@ class Scanner:
                 self.toolhead.dwell(1.0)
 
                 samples.append(probe_position[2])
+                ppos = probe_position[2]
+                pdelta = ppos - z_max
                 self.log_debug_info(
                     verbose,
                     gcmd,
-                    f"Touch {len(samples)} result: {probe_position[2]:.4f}",
+                    f"Touch {len(samples)} result: {probe_position[2]:.4f} (down: {pdelta:.4f})",
                 )
 
+                gcmd.respond_info(f"Samples: {samples}")
                 average = np.median(samples)
                 deviation = max(abs(sample - average) for sample in samples)
                 deviation = round(deviation, 4)
@@ -1183,7 +1204,7 @@ class Scanner:
         return [sum([pos[i] for pos in positions]) / count for i in range(3)]
 
     def log_debug_info(self, verbose: bool, gcmd: GCodeCommand, *args: object):
-        if verbose:
+        if True: #verbose:
             for message in args:
                 gcmd.respond_info(str(message))
 
@@ -1377,7 +1398,7 @@ class Scanner:
             return gcmd.get_float(
                 "SAMPLES_TOLERANCE", self.samples_config["tolerance"], minval=0.0
             )
-        return self.samples_config["retract_dist"]
+        return self.samples_config["tolerance"]
 
     def get_samples_tolerance_retries(self, gcmd: Optional[GCodeCommand] = None):
         if gcmd is not None:
@@ -1713,11 +1734,13 @@ class Scanner:
         if self.trigger_freq is None:
             return
         self.untrigger_freq = self.trigger_freq * (1 - self.trigger_hysteresis)
+        logging.info(f"CARTO: _update_thresholds: trigger: {self.trigger_freq} untrigger: {self.untrigger_freq}")
 
     def _apply_threshold(self, moving_up=False):
         self._update_thresholds()
         trigger_c = int(self.freq_to_count(self.trigger_freq))
         untrigger_c = int(self.freq_to_count(self.untrigger_freq))
+        logging.info(f"CARTO: _apply_threshold: trigger: {trigger_c} ({self.trigger_freq}) untrigger: {untrigger_c} ({self.untrigger_freq})")
         self.scanner_set_threshold.send([trigger_c, untrigger_c])
 
     def register_model(self, name: str, model: "ScannerModel"):
@@ -1737,26 +1760,26 @@ class Scanner:
     def _check_hardware(self, sample):
         if not self.hardware_failure:
             msg = None
-            #logging.info(f"CARTO: {sample}")
             if sample["data"] == 0xFFFFFFF:
                 msg = "coil is shorted or not connected"
+            elif sample["data"] > 0x0fffffff:
+                msg = f"ldc1612 reported error. raw data: {hex(sample['data'])}"
             elif self.fmin is not None and sample["freq"] > 1.35 * self.fmin:
-                msg = f"coil expected max frequency exceeded (got {sample['freq']} raw:{hex(sample['data'])}, fmin: {self.fmin}, expected max: {1.35*self.fmin})"
-                #logging.info(msg)
-                return
+                msg = f"coil expected max frequency exceeded (got {sample['freq']} raw:{hex(sample['data'])}, fmin: {self.fmin}, expected max: {1.35*self.fmin}). Use CARTO_DRIVE_TEST to find range and then set fmin in scanner config."
+                ##return
             if msg:
                 msg = "Scanner hardware issue: " + msg
                 logging.error(msg)
                 self.gcode.respond_raw("!! " + msg + "\n")
-                self._stop_streaming()
 
                 if self._stream_en:
+                    self._stop_streaming()
                     self.printer.invoke_shutdown(msg)
                 else:
-                    #self.hardware_failure = msg
-                    #self.gcode.respond_raw("!! " + msg + "\n")
-                    pass
+                    self.hardware_failure = msg
+                    self.gcode.respond_raw("!! " + msg + "\n")
         elif self._stream_en:
+            self._stop_streaming()
             self.printer.invoke_shutdown(self.hardware_failure)
 
     def _enrich_sample_time(self, sample):
@@ -2096,7 +2119,7 @@ class Scanner:
         eraw = end_samp['data']
         temp = start_samp['temp_raw']
 
-        gcmd.respond_info(f"Frequency range: {round(sfreq,2)} - {round(efreq,2)} [diff: {round(sfreq-efreq,2)} ({round(sfreq/efreq,2)}] (raw: {sraw} - {eraw} ; raw_temp: {temp})")
+        gcmd.respond_info(f"Frequency range: {round(sfreq,2)} - {round(efreq,2)} [range: {round(sfreq-efreq,2)} ({round(sfreq/efreq,4)})] (raw: {sraw} - {eraw} ; raw_temp: {temp})")
 
     cmd_SCANNER_ESTIMATE_BACKLASH_help = "Estimate Z axis backlash"
 
@@ -2528,7 +2551,7 @@ class ScannerModel:
         if self.scanner.calibration_method == "scan":
             url = DOCS_SCAN_CALIBRATION
         cur_fw = self.scanner.fw_version
-        if cur_fw != self.fw_version:
+        if False and cur_fw != self.fw_version:
             raise self.scanner.printer.command_error(
                 f"Scanner model '{self.name}' was created with firmware version '{self.fw_version}',"
                 + f"current firmware version is '{cur_fw}'."
@@ -3054,6 +3077,7 @@ class ScannerEndstopWrapper:
         if self.scanner.mcu_probe in hmove.get_mcu_endstops():
             etrsync = self._trsyncs[0]
             if self.scanner.trigger_method == TriggerMethod.TOUCH:
+                logging.info(f"CARTO: (homing_move_begin) _home_cmd.send, detect threshold: {self.scanner.detect_threshold_z}")
                 self.scanner.scanner_home_cmd.send(
                     [
                         etrsync.get_oid(),
@@ -3128,6 +3152,7 @@ class ScannerEndstopWrapper:
         if self.scanner.trigger_method != TriggerMethod.SCAN:
             return self._trigger_completion
 
+        logging.info(f"CARTO: (scan) _home_cmd.send, detect threshold: {self.scanner.detect_threshold_z}")
         self.scanner.scanner_home_cmd.send(
             [
                 etrsync.get_oid(),
@@ -3154,7 +3179,9 @@ class ScannerEndstopWrapper:
                 "Communication timeout during homing"
             )
         if res[0] != etrsync.REASON_ENDSTOP_HIT:
+            logging.info(f"CARTO: reason {res[0]}")
             return 0.0
+        logging.info(f"CARTO: reason ENDSTOP_HIT")
         if self._mcu.is_fileoutput():
             return home_end_time
         return home_end_time

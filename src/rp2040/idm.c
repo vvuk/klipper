@@ -196,47 +196,74 @@ void cartographer_home_task(void) {
   }*/
   if (!cartographer_home_flag)
     return;
+
+  uint32_t time = timer_read_time();
+  uint32_t data = read_channel();
+
   if (trigger_method) {
-    if (homing_freq == 0) {
-      cartographer_hometime = timer_read_time();
-      homing_freq = read_channel();
+    // this is TOUCH
+
+    if (data < untrigger_freq) {
+      gpio_out_write(led, 0);
       return;
     }
-    uint32_t time = timer_read_time();
 
+    gpio_out_write(led, 1);
+
+    // homing_freq is the current frequency
+    if (homing_freq == 0) {
+      cartographer_hometime = time;
+      homing_freq = data;
+      return;
+    }
+
+    // "dur"? == 20. 2000us = 2ms, so every 2ms. I don't love that.
     if (timer_is_before(time,
                         cartographer_hometime + timer_from_us(dur * 100))) {
       return;
     }
+
+    // last time the homing_freq was updated
     cartographer_hometime = time;
-    uint32_t data = read_channel();
-    if (current < 6) {
-      stack[current] = data - homing_freq;
-      homing_freq = data;
-      current++;
-      if (start == 0)
-        return;
-    } else {
+
+    int32_t freq_change = data - homing_freq;
+    homing_freq = data;
+
+    // if we have the maximum values we're averaging
+    if (current == 5) {
       start = 1;
-      current = 0;
-      stack[current] = data - homing_freq;
-      homing_freq = data;
-      current++;
     }
-    int32_t avr = 0;
+
+    stack[current] = freq_change;
+    current = (current + 1) % 6;
+    if (start == 0)
+      return;
+
+    int32_t avg = 0;
     for (int i = 0; i < 6; i++)
-      avr += stack[i];
-    avr = avr / 6;
-    if (max > trigger_threshold + avr && max > 100) {
+      avg += stack[i];
+    // This is the average of the deltas. We're looking for this to go down, i.e.
+    // frequency not changing.
+    avg = avg / 6;
+
+    // the "max > 100" is a bit of a fudge; that's just trying to say we saw a big
+    // rate of change.
+
+    if (max > (trigger_threshold + avg) && max > 100) {
       trsync_do_trigger(cartographer_ts, cartographer_trigger_reason);
+
+      // ... this resets homing? shouldn't we stop homing at this point?
       homing_freq = 0;
-      for (int i = 0; i < 6; i++)
-        stack[i] = 0;
+      for (int i = 0; i < 6; i++) stack[i] = 0;
       start = 0;
       max = 0;
       current = 0;
-    } else if (avr > max) {
-      max = avr;
+
+      // lets assume yes
+      cartographer_home_flag = 0;
+    } else if (avg > max) {
+      // bigger delta average; update the max
+      max = avg;
     }
     // irq_disable();
 
@@ -247,7 +274,6 @@ void cartographer_home_task(void) {
       return;
     irq_disable();
     if (data > trigger_freq) {
-
       trsync_do_trigger(cartographer_ts, cartographer_trigger_reason);
       gpio_out_write(led, 1);
     } else if (data < untrigger_freq)
@@ -263,8 +289,8 @@ void command_cartographer_home(uint32_t *args) {
   trigger_threshold = args[3];
   trigger_method = args[4];
   homing_freq = 0;
-  start = 0;
   max = 0;
+  start = 0;
   current = 0;
   cartographer_home_flag = 1;
 }
