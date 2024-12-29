@@ -94,12 +94,29 @@ void configuration(void)
         uint8_t reg;
         uint16_t value;
     } reg_config[] = {
+        // RCOUNT0 -- conversion time: (RCOUNT0×16)/ƒREF0
+        // carto = 2188; same math gives data rate ~346
+        //  btt = 12_000_000 / 16 * (data_rate=250 - 4) = 3048
         { 0x08, 0x088c },
+        // SETTLECOUNT0 -- (tS0)= (SETTLECOUNT0ˣ16) ÷ ƒREF0
+        // carto = 0.00034s (0x100)
+        // btt = 0.0005 (0xea6)
         { 0x10, 0x0100 },
+        // CLOCK_DIVIDERS0  -- adjusting coil freq does scale the freqs, but
+        // no precision improvement
+        // carto = 1,1
+        // btt = (1 << 12) | 1 = 1,1
         { 0x14, 0x1001 },
+        // ERROR_CONFIG
         { 0x19, 0x0001 },
+        // CONFIG
+        // both = (1<<12) | (1<<10) | (1<<9) | 0x001 =
+        //   RP_OVERRIDE_EN | AUTO_AMP_DIS | REF_CLK_SRC=clkin, 
         { 0x1a, 0x1601 },
-        { 0x1b, 0x020c },
+        // MUX_CONFIG
+        // carto == deglitch 0x04 (3.3Mhz)
+        // btt   == deglitch 0x05 (10Mhz). 3.3 should be fine though, I never see freqs above 3.3mhz
+        { 0x1b, 0x020c }, // carto: 0x020c }, // btt should be ..0d
         // DRIVE_CURRENT0: (0xd000 >> 11): 26.  Carto drives this very high. Eddy defaults to 15.
         //{ 0x1e, (26 << 11) },
         { 0x1e, (15 << 11) },
