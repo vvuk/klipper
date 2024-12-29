@@ -174,12 +174,12 @@ class ProbeCommandHelper:
 
 # Homing via probe:z_virtual_endstop
 class HomingViaProbeHelper:
-    def __init__(self, config, mcu_probe):
+    def __init__(self, config, mcu_probe, nextra=''):
         self.printer = config.get_printer()
         self.mcu_probe = mcu_probe
         self.multi_probe_pending = False
         # Register z_virtual_endstop pin
-        self.printer.lookup_object('pins').register_chip('probe', self)
+        self.printer.lookup_object('pins').register_chip('probe' + nextra, self)
         # Register event handlers
         self.printer.register_event_handler('klippy:mcu_identify',
                                             self._handle_mcu_identify)
@@ -230,7 +230,7 @@ class HomingViaProbeHelper:
 
 # Helper to track multiple probe attempts in a single command
 class ProbeSessionHelper:
-    def __init__(self, config, mcu_probe):
+    def __init__(self, config, mcu_probe, nextra=''):
         self.printer = config.get_printer()
         self.mcu_probe = mcu_probe
         gcode = self.printer.lookup_object('gcode')
@@ -244,7 +244,7 @@ class ProbeSessionHelper:
             pconfig = config.getsection('printer')
             self.z_position = pconfig.getfloat('minimum_z_position', 0.,
                                                note_valid=False)
-        self.homing_helper = HomingViaProbeHelper(config, mcu_probe)
+        self.homing_helper = HomingViaProbeHelper(config, mcu_probe, nextra)
         # Configurable probing speeds
         self.speed = config.getfloat('speed', 5.0, above=0.)
         self.lift_speed = config.getfloat('lift_speed', self.speed, above=0.)
@@ -343,6 +343,8 @@ class ProbeSessionHelper:
             positions.append(pos)
             # Check samples tolerance
             z_positions = [p[2] for p in positions]
+            logging.info(f"z positions: {z_positions}")
+            logging.info(f"tolerance: actual: {max(z_positions)-min(z_positions)} max: {params['samples_tolerance']}")
             if max(z_positions)-min(z_positions) > params['samples_tolerance']:
                 if retries >= params['samples_tolerance_retries']:
                     raise gcmd.error("Probe samples exceed samples_tolerance")

@@ -53,7 +53,7 @@ class Polynomial2d:
                 sym = "-" if coef < 0 else "+"
                 parts.append("%s %f%s" % (sym, abs(coef), x_str))
         return " ".join(parts)
-
+    
     @classmethod
     def fit(cls, coords):
         xlist = [c[0] for c in coords]

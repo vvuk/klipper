@@ -47,6 +47,7 @@ class SerialReader:
                 self.reactor.async_complete(completion, params)
                 continue
             params = self.msgparser.parse(response.msg[0:count])
+            #logging.info(params)
             params['#sent_time'] = response.sent_time
             params['#receive_time'] = response.receive_time
             hdl = (params['#name'], params.get('oid'))

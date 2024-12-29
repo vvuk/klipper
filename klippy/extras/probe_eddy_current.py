@@ -5,9 +5,21 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging, math, bisect
 import mcu
+import numpy as np
 from . import ldc1612, probe, manual_probe
 
 OUT_OF_RANGE = 99.9
+TAP_NOISE_COMPENSATION = 0.8
+
+# Linear regression (a*x + b) for list of (x,y) pairs
+def simple_linear_regression(data):
+    inv_count = 1. / len(data)
+    x_avg = sum([d[0] for d in data]) * inv_count
+    y_avg = sum([d[1] for d in data]) * inv_count
+    x_var = sum([(d[0] - x_avg)**2 for d in data])
+    xy_covar = sum([(d[0] - x_avg)*(d[1] - y_avg) for d in data])
+    slope = xy_covar / x_var
+    return slope, y_avg - slope*x_avg
 
 # Tool for calibrating the sensor Z detection and applying that calibration
 class EddyCalibration:
@@ -23,6 +35,14 @@ class EddyCalibration:
             cal = [list(map(float, d.strip().split(':', 1)))
                    for d in cal.split(',')]
             self.load_calibration(cal)
+        self.tap_threshold = self.tap_factor = 0.
+        # Ensure we don't break if someone doesn't have a new calibration set
+        # up to 25mm
+        #if max(self.cal_zpos) > 5.0:
+            # Estimate toolhead velocity to change in frequency
+        self.calc_frequency_rate()
+        #else:
+        #    logging.warn("Please redo Eddy calibration to enable tap")
         # Probe calibrate state
         self.probe_speed = 0.
         # Register commands
@@ -33,41 +53,124 @@ class EddyCalibration:
                                    desc=self.cmd_EDDY_CALIBRATE_help)
     def is_calibrated(self):
         return len(self.cal_freqs) > 2
+    def calc_frequency_rate(self):
+        count = len(self.cal_freqs)
+        if count < 2:
+            return
+        data = []
+        for i in range(count-1):
+            f = self.cal_freqs[i]
+            z = self.cal_zpos[i]
+            f_next = self.cal_freqs[i+1]
+            z_next = self.cal_zpos[i+1]
+            # the change in frequency relative to the change in distance
+            chg_freq_per_dist = -((f_next - f) / (z_next - z))
+            # freq, df/dz
+            data.append((f, chg_freq_per_dist))
+        #logging.info("TAP: " + str(data))
+        # note: temperature calibration has not been loaded yet, so these
+        # are all raw values
+        raw_freq_rate = simple_linear_regression(data)
+        freq_min_tap = -raw_freq_rate[1] / raw_freq_rate[0]
+
+        freq_zero_p = self.height_to_freq_p(0.0)
+
+        # this is the height/frequency below which we will not try to
+        # to detect a tap. Use our polynomial approximation here,
+        # because we won't have pulled higher Z numbers
+        z_max_tap = self.freq_to_height_p(freq_min_tap)
+
+        # the tap_factor gets multiplied by the toolhead velocity -- basically, we're saying
+        # for a given velocity, we expect the frequency to increase like this
+        logging.info(f"TAP: raw_freq_rate: {raw_freq_rate}")
+        logging.info(f"TAP: freq_min_tap: {freq_min_tap} (0.0 at {freq_zero_p} from polynomial) z_max_tap: {z_max_tap}")
+
+        # this should never happen because we're using the polynomial approximation
+        if z_max_tap >= OUT_OF_RANGE or z_max_tap <= -OUT_OF_RANGE:
+            logging.warn(f"freq_min_tap out of calibration range; disabling tap")
+            return
+
+        # Pad rates to reduce impact of noise
+        adj_slope = raw_freq_rate[0] * TAP_NOISE_COMPENSATION
+
+        z_max_tap_adj = z_max_tap * TAP_NOISE_COMPENSATION
+        freq_min_tap_adj = self.height_to_freq_p(z_max_tap_adj)
+
+        logging.info(f"TAP: z_max_tap: {z_max_tap} ({freq_min_tap}) -> {z_max_tap_adj} ({freq_min_tap_adj})")
+        logging.info(f"TAP: adj_slope: {raw_freq_rate[0]} -> {adj_slope} TAP_NOISE: {TAP_NOISE_COMPENSATION}")
+
+        self.tap_factor = adj_slope
+        self.tap_threshold = freq_min_tap_adj
+
+        logging.info("TAP: eddy tap threshold thr=%.3f,%.3f tf=%s",
+                     self.tap_threshold,
+                     self.freq_to_height(self.tap_threshold),
+                     self.tap_factor)
     def load_calibration(self, cal):
         cal = sorted([(c[1], c[0]) for c in cal])
         self.cal_freqs = [c[0] for c in cal]
         self.cal_zpos = [c[1] for c in cal]
+
+        # empirically, freq-to-position results need a 3D polynomial to hit R^2=1
+        # where position-to-frequency fits cleanly with a 2D polynomial
+        self.cal_freq_to_pos_poly = np.polyfit(self.cal_freqs, self.cal_zpos, 3)
+        logging.info(f"TAP: cal_freq_to_pos_poly: {self.cal_freq_to_pos_poly}")
+        self.cal_pos_to_freq_poly = np.polyfit(self.cal_zpos, self.cal_freqs, 2)
+        logging.info(f"TAP: cal_pos_to_freq_poly: {self.cal_pos_to_freq_poly}")
+
     def apply_calibration(self, samples):
         cur_temp = self.drift_comp.get_temperature()
+        msq = 0.0
+        msq_cnt = 0
+        minz = 99.9
+        maxz = 0.0
         for i, (samp_time, freq, dummy_z) in enumerate(samples):
-            adj_freq = self.drift_comp.adjust_freq(freq, cur_temp)
-            pos = bisect.bisect(self.cal_freqs, adj_freq)
-            if pos >= len(self.cal_zpos):
-                zpos = -OUT_OF_RANGE
-            elif pos == 0:
-                zpos = OUT_OF_RANGE
-            else:
-                # XXX - could further optimize and avoid div by zero
-                this_freq = self.cal_freqs[pos]
-                prev_freq = self.cal_freqs[pos - 1]
-                this_zpos = self.cal_zpos[pos]
-                prev_zpos = self.cal_zpos[pos - 1]
-                gain = (this_zpos - prev_zpos) / (this_freq - prev_freq)
-                offset = prev_zpos - prev_freq * gain
-                zpos = adj_freq * gain + offset
+            zpos = self.freq_to_height(freq, cur_temp)
             samples[i] = (samp_time, freq, round(zpos, 6))
-    def freq_to_height(self, freq):
-        dummy_sample = [(0., freq, 0.)]
-        self.apply_calibration(dummy_sample)
-        return dummy_sample[0][2]
-    def height_to_freq(self, height):
+            if zpos != OUT_OF_RANGE and zpos != -OUT_OF_RANGE:
+                minz = min(minz, zpos)
+                maxz = max(maxz, zpos)
+                zpos_p = self.freq_to_height_p(freq, cur_temp)
+                msq += (zpos_p - zpos)**2
+                msq_cnt += 1
+        if msq_cnt > 0:
+            rmse = math.sqrt(msq / msq_cnt)
+            if rmse > 0.1:
+                logging.info(f"TAP: apply_calibration: rmse {round(rmse, 6)} zrange: {minz} - {maxz}")
+                for i, (samp_time, freq, real_z) in enumerate(samples):
+                    if real_z >= OUT_OF_RANGE or real_z <= -OUT_OF_RANGE:
+                        continue
+                    zpos_p = self.freq_to_height_p(freq, cur_temp)
+                    #logging.info(f"TAP:     {i} {freq} -> {round(real_z,6)} {round(zpos_p,6)}")
+    def freq_to_height_p(self, freq, cur_temp=None):
+        adj_freq = self.drift_comp.adjust_freq(freq, cur_temp)
+        return np.polyval(self.cal_freq_to_pos_poly, adj_freq)
+    def height_to_freq_p(self, height, cur_temp=None):
+        freq = np.polyval(self.cal_pos_to_freq_poly, height)
+        return self.drift_comp.unadjust_freq(freq, cur_temp)
+    def freq_to_height(self, freq, cur_temp=None):
+        adj_freq = self.drift_comp.adjust_freq(freq, cur_temp)
+        pos = bisect.bisect(self.cal_freqs, adj_freq)
+        if pos >= len(self.cal_zpos):
+            return -OUT_OF_RANGE
+        if pos == 0:
+            return OUT_OF_RANGE
+        # XXX - could further optimize and avoid div by zero
+        this_freq = self.cal_freqs[pos]
+        prev_freq = self.cal_freqs[pos - 1]
+        this_zpos = self.cal_zpos[pos]
+        prev_zpos = self.cal_zpos[pos - 1]
+        gain = (this_zpos - prev_zpos) / (this_freq - prev_freq)
+        offset = prev_zpos - prev_freq * gain
+        return adj_freq * gain + offset
+    def height_to_freq(self, height, cur_temp=None):
         # XXX - could optimize lookup
         rev_zpos = list(reversed(self.cal_zpos))
         rev_freqs = list(reversed(self.cal_freqs))
         pos = bisect.bisect(rev_zpos, height)
         if pos == 0 or pos >= len(rev_zpos):
             raise self.printer.command_error(
-                "Invalid probe_eddy_current height")
+                f"Invalid probe_eddy_current height in height_to_freq (out of range of calibration): {height}")
         this_freq = rev_freqs[pos]
         prev_freq = rev_freqs[pos - 1]
         this_zpos = rev_zpos[pos]
@@ -75,7 +178,7 @@ class EddyCalibration:
         gain = (this_freq - prev_freq) / (this_zpos - prev_zpos)
         offset = prev_freq - prev_zpos * gain
         freq = height * gain + offset
-        return self.drift_comp.unadjust_freq(freq)
+        return self.drift_comp.unadjust_freq(freq, cur_temp)
     def do_calibration_moves(self, move_speed):
         toolhead = self.printer.lookup_object('toolhead')
         kin = toolhead.get_kinematics()
@@ -91,10 +194,16 @@ class EddyCalibration:
         self.printer.lookup_object(self.name).add_client(handle_batch)
         toolhead.dwell(1.)
         self.drift_comp.note_z_calibration_start()
-        # Move to each 40um position
-        max_z = 4.0
-        samp_dist = 0.040
-        req_zpos = [i*samp_dist for i in range(int(max_z / samp_dist) + 1)]
+
+        # Move to each 40um up to 4mm, then each 5mm up to 25mm
+        samp_max_z1 = 4.0
+        samp_max_z2 = 25.0
+        samp_step1 = 0.040
+        samp_step2 = 5.000
+        req_zpos = [i*samp_step1 for i in range(int(samp_max_z1 / samp_step1) + 1)]
+        #req_zpos += [i*samp_step2 for i in range(1, int(samp_max_z2 / samp_step2) + 1)]
+        logging.info(f"req_zpos: {req_zpos}")
+
         start_pos = toolhead.get_position()
         times = []
         for zpos in req_zpos:
@@ -257,6 +366,7 @@ class EddyGatherSamples:
         if not samp_count:
             # No sensor readings - raise error in pull_probed()
             return 0.
+        logging.info(f"_pull_freq averaged {samp_count} frequencies")
         return samp_sum / samp_count
     def _lookup_toolhead_pos(self, pos_time):
         toolhead = self._printer.lookup_object('toolhead')
@@ -295,24 +405,45 @@ class EddyGatherSamples:
         del self._probe_results[:]
         return results
     def note_probe(self, start_time, end_time, toolhead_pos):
+        logging.info(f"note_probe: {start_time} {end_time} {toolhead_pos}")
         self._probe_times.append((start_time, end_time, None, toolhead_pos))
         self._check_samples()
     def note_probe_and_position(self, start_time, end_time, pos_time):
+        logging.info(f"note_probe_and_position: {start_time} {end_time} {pos_time}")
         self._probe_times.append((start_time, end_time, pos_time, None))
         self._check_samples()
 
 # Helper for implementing PROBE style commands (descend until trigger)
 class EddyEndstopWrapper:
     REASON_SENSOR_ERROR = mcu.MCU_trsync.REASON_COMMS_TIMEOUT + 1
-    def __init__(self, config, sensor_helper, calibration):
+    def __init__(self, config, sensor_helper, calibration, allow_tap):
         self._printer = config.get_printer()
         self._sensor_helper = sensor_helper
         self._mcu = sensor_helper.get_mcu()
         self._calibration = calibration
+        self._tap_height = config.getfloat('tap_height', None, minval=0.)
+        self._use_tap = self._tap_height and calibration.is_calibrated() and allow_tap
+        logging.info(f"Tap OK: {self._use_tap}")
         self._z_offset = config.getfloat('z_offset', minval=0.)
         self._dispatch = mcu.TriggerDispatch(self._mcu)
         self._trigger_time = 0.
         self._gather = None
+        # XXX
+        self._printer.register_event_handler('toolhead:drip', self._handle_drip)
+        self._delayed_setup = 0.
+    def _handle_drip(self, print_time, move):
+        # XXX - mega hack - delayed sensor start to obtain toolhead accel_t
+        if not self._use_tap or not self._delayed_setup:
+            return
+        logging.info(f"use tap: drip cruise {move.cruise_v}")
+        pretap_freq = self._calibration.height_to_freq(self._tap_height)
+        self._sensor_helper.setup_tap(
+            self._delayed_setup, print_time + move.accel_t, pretap_freq,
+            self._dispatch.get_oid(),
+            mcu.MCU_trsync.REASON_ENDSTOP_HIT, self.REASON_SENSOR_ERROR,
+            self._calibration.tap_threshold,
+            self._calibration.tap_factor * move.cruise_v)
+        self._delayed_setup = 0.
     # Interface for MCU_endstop
     def get_mcu(self):
         return self._mcu
@@ -325,6 +456,11 @@ class EddyEndstopWrapper:
         self._trigger_time = 0.
         trigger_freq = self._calibration.height_to_freq(self._z_offset)
         trigger_completion = self._dispatch.start(print_time)
+        if self._use_tap:
+            # XXX
+            logging.info(f"HOME_START with tap")
+            self._delayed_setup = print_time
+            return trigger_completion
         self._sensor_helper.setup_home(
             print_time, trigger_freq, self._dispatch.get_oid(),
             mcu.MCU_trsync.REASON_ENDSTOP_HIT, self.REASON_SENSOR_ERROR)
@@ -337,7 +473,8 @@ class EddyEndstopWrapper:
             if res == mcu.MCU_trsync.REASON_COMMS_TIMEOUT:
                 raise self._printer.command_error(
                     "Communication timeout during homing")
-            raise self._printer.command_error("Eddy current sensor error")
+            status = self._sensor_helper.latched_status_str()
+            raise self._printer.command_error(f"Eddy current sensor error; status: {status}")
         if res != mcu.MCU_trsync.REASON_ENDSTOP_HIT:
             return 0.
         if self._mcu.is_fileoutput():
@@ -351,7 +488,7 @@ class EddyEndstopWrapper:
         # Perform probing move
         phoming = self._printer.lookup_object('homing')
         trig_pos = phoming.probing_move(self, pos, speed)
-        if not self._trigger_time:
+        if not self._trigger_time or self._use_tap:
             return trig_pos
         # Extract samples
         start_time = self._trigger_time - 0.01 # + 0.050
@@ -424,12 +561,18 @@ class PrinterEddyProbe:
         self.sensor_helper = sensors[sensor_type](config, self.calibration)
         # Probe interface
         self.mcu_probe = EddyEndstopWrapper(config, self.sensor_helper,
-                                            self.calibration)
+                                            self.calibration, False)
+        self.mcu_probe_tap = EddyEndstopWrapper(config, self.sensor_helper,
+                                            self.calibration, True)
         self.cmd_helper = probe.ProbeCommandHelper(
             config, self, self.mcu_probe.query_endstop)
         self.probe_offsets = probe.ProbeOffsetsHelper(config)
         self.probe_session = probe.ProbeSessionHelper(config, self.mcu_probe)
+        self.probe_session2 = probe.ProbeSessionHelper(config, self.mcu_probe_tap, '2')
         self.printer.add_object('probe', self)
+
+        gcode = self.printer.lookup_object('gcode')
+        gcode.register_command('PROBE_TAP', self.cmd_PROBE_TAP)
     def add_client(self, cb):
         self.sensor_helper.add_client(cb)
     def get_probe_params(self, gcmd=None):
@@ -447,6 +590,15 @@ class PrinterEddyProbe:
         return self.probe_session.start_probe_session(gcmd)
     def register_drift_compensation(self, comp):
         self.calibration.register_drift_compensation(comp)
+    def cmd_PROBE_TAP(self, gcmd):
+        try:
+            probe_session = self.probe_session2.start_probe_session(gcmd)
+            probe_session.run_probe(gcmd)
+            pos = probe_session.pull_probed_results()[0]
+            probe_session.end_probe_session()
+            gcmd.respond_info("Result is z=%.6f" % (pos[2],))
+        finally:
+            self.sensor_helper.query_hack()
 
 class DummyDriftCompensation:
     def get_temperature(self):

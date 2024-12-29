@@ -17,8 +17,11 @@
 
 enum {
     LDC_PENDING = 1<<0, LDC_HAVE_INTB = 1<<1,
-    LH_AWAIT_HOMING = 1<<1, LH_CAN_TRIGGER = 1<<2
+    LH_AWAIT_HOMING = 1<<1, LH_AWAIT_TAP = 1<<2,
+    LH_CAN_TRIGGER = 1<<3, LH_WANT_TAP = 1<<4
 };
+
+#define HCOUNT 64
 
 struct ldc1612 {
     struct timer timer;
@@ -27,17 +30,33 @@ struct ldc1612 {
     uint8_t flags;
     struct sensor_bulk sb;
     struct gpio_in intb_pin;
+    uint16_t prev_status;
+
     // homing
     struct trsync *ts;
     uint8_t homing_flags;
-    uint8_t trigger_reason, error_reason;
+    uint8_t trigger_reason, error_reason, pretap_reason;
     uint8_t ema_factor;
-    uint32_t sensor_average;
+    uint32_t sensor_average, sensor_last;
+    int32_t change_average;
+    int32_t change_average_last;
+
     uint32_t trigger_threshold;
-    uint32_t homing_clock;
+    uint32_t homing_clock, tap_clock;
+    int32_t tap_threshold;
+    uint32_t tap_adjust_factor;
+
+    uint8_t hnext;
+    uint32_t htime[HCOUNT];
+    int32_t havg[HCOUNT];
+    int32_t hcavg[HCOUNT];
+    int32_t hadj[HCOUNT];
 };
 
 static struct task_wake ldc1612_wake;
+
+#define STATUS_ERR_AHE (1<<10)
+#define STATUS_ERR_ALE (1<<9)
 
 // Check if the intb line is "asserted"
 static int
@@ -97,11 +116,30 @@ command_ldc1612_setup_home(uint32_t *args)
     ld->ts = trsync_oid_lookup(args[3]);
     ld->trigger_reason = args[4];
     ld->error_reason = args[5];
-    ld->homing_flags = LH_AWAIT_HOMING | LH_CAN_TRIGGER;
+    ld->tap_threshold = args[6];
+    ld->tap_adjust_factor = args[7];
+    ld->tap_clock = args[8];
+    ld->pretap_reason = args[9];
+    ld->sensor_last = 0;
+    ld->change_average_last = 0;
+    ld->hnext = 0;
+    memset(ld->htime, 0, 4*HCOUNT);
+    memset(ld->havg, 0, 4*HCOUNT);
+    memset(ld->hcavg, 0, 4*HCOUNT);
+    memset(ld->hadj, 0, 4*HCOUNT);
+    if (ld->tap_threshold)
+        // Homing until a nozzle/bed contact is detected
+        ld->homing_flags = (LH_AWAIT_HOMING | LH_CAN_TRIGGER
+                            | LH_AWAIT_TAP | LH_WANT_TAP);
+    else
+        // Homing until threshold met
+        ld->homing_flags = LH_AWAIT_HOMING | LH_CAN_TRIGGER;
 }
 DECL_COMMAND(command_ldc1612_setup_home,
              "ldc1612_setup_home oid=%c clock=%u threshold=%u"
-             " trsync_oid=%c trigger_reason=%c error_reason=%c");
+             " trsync_oid=%c trigger_reason=%c error_reason=%c"
+             " tap_threshold=%i tap_adjust_factor=%u tap_clock=%u"
+             " pretap_reason=%c");
 
 // Exponential moving average base factor
 #define EMA_BASE 16
@@ -127,37 +165,131 @@ command_query_ldc1612_home_state(uint32_t *args)
 DECL_COMMAND(command_query_ldc1612_home_state,
              "query_ldc1612_home_state oid=%c");
 
+void
+command_query_ldc1612_hack(uint32_t *args)
+{
+    struct ldc1612 *ld = oid_lookup(args[0], command_config_ldc1612);
+    int idx = ld->hnext;
+    sendf("ldc1612_hack oid=%c time=%u avg=%i cavg=%i adj=%i",
+          args[0], ld->htime[idx], ld->havg[idx], ld->hcavg[idx], ld->hadj[idx]);
+    ld->hnext = (idx + 1) % HCOUNT;
+}
+DECL_COMMAND(command_query_ldc1612_hack,
+             "query_ldc1612_hack oid=%c");
+
+
+void
+command_query_ldc1612_latched_status(uint32_t *args)
+{
+    struct ldc1612 *ld = oid_lookup(args[0], command_config_ldc1612);
+    sendf("ldc1612_latched_status oid=%c status=%u"
+          , args[0], ld->prev_status);
+}
+DECL_COMMAND(command_query_ldc1612_latched_status,
+             "query_ldc1612_latched_status oid=%c");
+
+// Notify trsync of event
+static void
+notify_trigger(struct ldc1612 *ld, uint32_t time, uint8_t reason)
+{
+    ld->homing_flags = 0;
+    ld->homing_clock = time;
+    trsync_do_trigger(ld->ts, reason);
+}
+
 // Check if a sample should trigger a homing event
 static void
 check_home(struct ldc1612 *ld, uint32_t data)
 {
+    uint8_t hidx = ld->hnext++;
+
     uint8_t homing_flags = ld->homing_flags;
     if (!(homing_flags & LH_CAN_TRIGGER))
         return;
     if (data > 0x0fffffff) {
+        ld->havg[hidx] = ld->prev_status;
+        ld->hcavg[hidx] = data;
+        ld->hadj[hidx] = 900033;
+
+        // ignore over-amplitude errors (probe too far)
+        if ((ld->prev_status & STATUS_ERR_AHE) != 0)
+            return;
+
         // Sensor reports an issue - cancel homing
-        ld->homing_flags = 0;
-        trsync_do_trigger(ld->ts, ld->error_reason);
+        notify_trigger(ld, 0, ld->error_reason);
         return;
     }
     // Perform sensor averaging
     uint32_t ema_factor = ld->ema_factor;
+
+    // EMA
     uint32_t scaled_prev = ld->sensor_average * ema_factor;
     uint32_t scaled_data = data * (EMA_BASE - ema_factor);
     uint32_t new_avg = DIV_ROUND_CLOSEST(scaled_data + scaled_prev, EMA_BASE);
+
     ld->sensor_average = new_avg;
+    // Track rate of change between sensor samples
+    int32_t change = data - ld->sensor_last;
+    ld->sensor_last = data;
+
+    // EMA
+    int32_t scaled_cprev = ld->change_average * ema_factor;
+    int32_t scaled_chg = change * (EMA_BASE - ema_factor);
+    int32_t new_cavg = DIV_ROUND_CLOSEST(scaled_chg + scaled_cprev, EMA_BASE);
+
+    ld->change_average_last = ld->change_average;
+    ld->change_average = new_cavg;
+
     // Check if should signal a trigger event
     uint32_t time = timer_read_time();
-    if ((homing_flags & LH_AWAIT_HOMING)
-        && timer_is_before(time, ld->homing_clock))
-        return;
-    homing_flags &= ~LH_AWAIT_HOMING;
-    if (new_avg > ld->trigger_threshold) {
-        homing_flags = 0;
-        ld->homing_clock = time;
-        trsync_do_trigger(ld->ts, ld->trigger_reason);
+
+    ld->htime[hidx] = time;
+    ld->havg[hidx] = new_avg;
+    ld->hcavg[hidx] = new_cavg;
+
+    if (ld->hnext == HCOUNT)
+        ld->hnext = 0;
+
+    if (homing_flags & LH_AWAIT_HOMING) {
+        if (timer_is_before(time, ld->homing_clock))
+            return;
+        ld->homing_flags = homing_flags = homing_flags & ~LH_AWAIT_HOMING;
     }
-    ld->homing_flags = homing_flags;
+
+    if (!(homing_flags & LH_WANT_TAP)) {
+        // Trigger on simple threshold check
+        ld->hadj[hidx] = 900077;
+        if (new_avg > ld->trigger_threshold)
+            notify_trigger(ld, time, ld->trigger_reason);
+        return;
+    }
+
+    if (homing_flags & LH_AWAIT_TAP) {
+        // Check if can start tap detection
+        if (timer_is_before(time, ld->tap_clock)) {
+            ld->hadj[hidx] = 900099;
+            if (new_avg > ld->trigger_threshold) {
+                ld->hadj[hidx] = 900088;
+                // Sensor too close to bed prior to start of tap detection
+                notify_trigger(ld, time, ld->pretap_reason);
+            }
+            return;
+        }
+        ld->homing_flags = homing_flags = homing_flags & ~LH_AWAIT_TAP;
+    }
+
+    // tap_adjust_factor is (tap_factor / data_rate) broadcast to
+    // the 0..2^32-1 range. This is equivalent to doing
+    // new_avg * (tap_factor / data_rate). The () value is going to be
+    // something like 0.0048. So we're taking how much of the average
+    // we want to consider
+    int32_t adjust = (int32_t)(((uint64_t)new_avg * (uint64_t)(ld->tap_adjust_factor)) >> 32);
+    ld->hadj[hidx] = adjust;
+
+    if (new_cavg < ld->tap_threshold + adjust) {
+        // Tap detected (sensor no longer moving closer to bed)
+        notify_trigger(ld, time, ld->trigger_reason);
+    }
 }
 
 // Chip registers
@@ -179,7 +311,8 @@ read_reg_status(struct ldc1612 *ld)
 {
     uint8_t data_status[2];
     read_reg(ld, REG_STATUS, data_status);
-    return (data_status[0] << 8) | data_status[1];
+    ld->prev_status = (data_status[0] << 8) | data_status[1];
+    return ld->prev_status;
 }
 
 #define BYTES_PER_SAMPLE 4
