@@ -32,6 +32,9 @@ struct gpio_out led;
 struct gpio_out power;
 struct timer cartographer_update_timer;
 //struct gpio_in complete;
+
+uint32_t stop_timer = 0;
+
 uint16_t
 readRegister(uint8_t reg) 
 {
@@ -87,15 +90,32 @@ void cartographer_sleep(uint32_t delay)
 
 void configuration(void)
 {
-    uint8_t addr[7]={0x1B,0x1E,0x10,0x14,0x08,0x19,0x1A};
-    uint16_t config[7]={0x020C,0xD000,0x0100,0x1001,0x088C,0x0001,0x1601};
-    for(uint8_t i=0;i<7;i++)
-    {
-        writeRegister(addr[i],config[i]);
-        //gpio_out_write(led,0);
+    struct {
+        uint8_t reg;
+        uint16_t value;
+    } reg_config[] = {
+        { 0x08, 0x088c },
+        { 0x10, 0x0100 },
+        { 0x14, 0x1001 },
+        { 0x19, 0x0001 },
+        { 0x1a, 0x1601 },
+        { 0x1b, 0x020c },
+        // DRIVE_CURRENT0: (0xd000 >> 11): 26.  Carto drives this very high. Eddy defaults to 15.
+        //{ 0x1e, (26 << 11) },
+        { 0x1e, (15 << 11) },
+        { 0xff, 0 },
+    };
+
+    //uint8_t addr[7]={0x1B,0x1E,0x10,0x14,0x08,0x19,0x1A};
+    //uint16_t config[7]={0x020C,0xD000,0x0100,0x1001,0x088C,0x0001,0x1601};
+    //for(uint8_t i=0;i<7;i++) { writeRegister(addr[i],config[i]); }
+    for (int i = 0; i < 100; i++) {
+        if (reg_config[i].reg == 0xff)
+            break;
+        writeRegister(reg_config[i].reg, reg_config[i].value);
     }
-    
 }
+
 struct i2c_software {
     struct gpio_out scl_out, sda_out;
     struct gpio_in scl_in, sda_in;
@@ -122,7 +142,7 @@ cartographer_init(void)
 
     cartographer_i2c= cartographer_mem_alloc(sizeof(*cartographer_i2c));
     // cargo eddy -- eddy uses i2c ch 5 here
-    cartographer_i2c->i2c_hw = i2c_setup(5, 400000,(0x2A & 0x7f));
+    cartographer_i2c->i2c_hw = i2c_setup(5, 100000, (0x2A & 0x7f));
     cartographer_i2c->flags |= 2;
     configuration();
     cartographer_update_timer.waketime=timer_read_time()+100000;
@@ -146,6 +166,7 @@ command_cartographer_stream(uint32_t *args)
     if(args[0])
     {
         cartographer_status=1;
+        stop_timer = timer_read_time() + timer_from_us(10000000);
     }
     else
     {
@@ -278,20 +299,39 @@ DECL_COMMAND(command_cartographer_stop_home,"cartographer_stop_home");
 void
 command_cartographer_base_read(uint32_t *args)
 {
+    static uint32_t last_drive = 0;
+
+    // vlad: this is pretty broken; offset is ignored, as is data_len
+
     uint8_t data_len=args[0];
     uint8_t offset=args[1];
+    uint32_t drive=args[2];
+    if (drive != last_drive) {
+        writeRegister(0x1e, drive << 11);
+        last_drive = drive;
+    }
+
+    output("scanner: base_read offset:%hu", offset);
+
     uint32_t f_count=32917500;
     uint16_t adc_count=55927;
+
     uint64_t data=((uint64_t)adc_count)<<32 | f_count;
     sendf("cartographer_base_data bytes=%*s offset=%hu", data_len, &data, offset);
 }
-DECL_COMMAND(command_cartographer_base_read,"cartographer_base_read len=%c offset=%hu");
+DECL_COMMAND(command_cartographer_base_read,"cartographer_base_read len=%c offset=%hu drive=%u");
 
 void
 cartographer_update_task(void)
 {
     if((!cartographer_status)&&(!sched_check_wake(&cartographer_update)))
         return;
+
+    //if(!timer_is_before(timer_read_time(), stop_timer)) {
+    //    cartographer_status = 0;
+    //    return;
+    //}
+
     uint32_t data,clock;
     //if(gpio_in_read(complete))
     //    continue;
@@ -308,9 +348,9 @@ cartographer_update_task(void)
             j++;
         }
     sendf("cartographer_data clock=%u data=%u temp=%u", clock, data, temp);
-    #if CONFIG_FOR_K1
-      idm_sleep(500);
-    #endif
+    //#if CONFIG_FOR_K1
+    //  cartographer_sleep(50);
+    //#endif
     if(data>trigger_freq)
     {
 	gpio_out_write(led,1);	
