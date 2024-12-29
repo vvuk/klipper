@@ -143,6 +143,9 @@ class LDC1612:
             "query_ldc1612_hack oid=%c",
             "ldc1612_hack oid=%c time=%u avg=%i cavg=%i adj=%i",
             oid=self.oid, cq=cmdqueue)
+        self.mcu.register_response(self._handle_debug_print, "debug_print")
+    def _handle_debug_print(self, params):
+        logging.info(params["m"])
     def get_mcu(self):
         return self.i2c.get_mcu()
     def read_reg(self, reg):

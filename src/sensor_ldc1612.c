@@ -14,6 +14,9 @@
 #include "sched.h" // DECL_TASK
 #include "sensor_bulk.h" // sensor_bulk_report
 #include "trsync.h" // trsync_do_trigger
+#include "printf.h"
+
+void dprint(const char *fmt, ...);
 
 enum {
     LDC_PENDING = 1<<0, LDC_HAVE_INTB = 1<<1,
@@ -134,6 +137,8 @@ command_ldc1612_setup_home(uint32_t *args)
     else
         // Homing until threshold met
         ld->homing_flags = LH_AWAIT_HOMING | LH_CAN_TRIGGER;
+
+    dprint("ZZZ setup home");
 }
 DECL_COMMAND(command_ldc1612_setup_home,
              "ldc1612_setup_home oid=%c clock=%u threshold=%u"
@@ -408,3 +413,15 @@ ldc1612_task(void)
     }
 }
 DECL_TASK(ldc1612_task);
+
+void dprint(const char *fmt, ...)
+{
+    char buf[60];
+
+    va_list args;
+    va_start(args, fmt);
+    int len = vsnprintf(buf, sizeof(buf)-1, fmt, args);
+    va_end(args);
+
+    sendf("debug_print m=%*s", len, buf);
+}
