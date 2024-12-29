@@ -237,6 +237,12 @@ class Scanner:
 
         self.probe_calibrate_z = 0.0
 
+        self.explicit_fmin = config.getint("fmin", default=None)
+        self.explicit_fmin_temp = config.getint("fmin_temp", default=None)
+        self.explicit_drive = config.getint("drive", default=None)
+        if self.explicit_drive is not None and (self.explicit_drive < 0 or self.explicit_drive > 31):
+                raise config.config_error(f"explicit_drive must be 0..31, but was: {explicit_drive}")
+
         if config.getint("detect_threshold_z", None) is not None:
             raise self.printer.command_error(
                 "Please change detect_threshold_z to scanner_touch_threshold in printer.cfg"
@@ -357,6 +363,11 @@ class Scanner:
                     sensor_name + "_TOUCH",
                     self.cmd_SCANNER_TOUCH,
                     desc=self.cmd_SCANNER_TOUCH_help,
+                )
+                self.gcode.register_command(
+                    sensor_name + "_DRIVE_TEST",
+                    self.cmd_DRIVE_TEST,
+                    desc=self.cmd_DRIVE_TEST_help,
                 )
         self.gcode.register_command("PROBE", self.cmd_PROBE, desc=self.cmd_PROBE_help)
         self.gcode.register_command(
@@ -1258,7 +1269,14 @@ class Scanner:
         # Ensure streaming mode is stopped
         self.scanner_stream_cmd.send([0])
 
-        self.model_temp = self.model_temp_builder.build_with_base(self)
+        if self.explicit_drive:
+            # ignore result
+            self.scanner_base_read_cmd.send([6, 0, self.explicit_drive])
+
+        if self.explicit_fmin and self.explicit_fmin_temp:
+            self.model_temp = self.model_temp_builder.build_with_explicit(self.explicit_fmin, self.explicit_fmin_temp)
+        else:
+            self.model_temp = self.model_temp_builder.build_with_base(self)
         if self.model_temp:
             self.fmin = self.model_temp.fmin
         self.model = self.models.get(self.default_model_name, None)
@@ -1305,7 +1323,7 @@ class Scanner:
             self.sensor.lower() + "_stop_home", cq=self.cmd_queue
         )
         self.scanner_base_read_cmd = self._mcu.lookup_query_command(
-            self.sensor.lower() + "_base_read len=%c offset=%hu",
+            self.sensor.lower() + "_base_read len=%c offset=%hu drive=%u",
             self.sensor.lower() + "_base_data bytes=%*s offset=%hu",
             cq=self.cmd_queue,
         )
@@ -1587,6 +1605,8 @@ class Scanner:
         move_speed = gcmd.get_float("MOVE_SPEED", self.cal_config["move_speed"])
         model_name = gcmd.get("MODEL_NAME", "default")
 
+        logging.info(f"CARTO: calibration: {cal_floor} - {cal_ceil} (@ {cal_speed} speed, move_speed {move_speed}) model: {model_name}")
+
         toolhead = self.toolhead
         toolhead.wait_moves()
 
@@ -1594,6 +1614,7 @@ class Scanner:
             nozzle_z = gcmd.get_float("NOZZLE_Z", self.cal_config["nozzle_z"])
             cal_min_z = kin_pos[2] - nozzle_z + cal_floor
             cal_max_z = kin_pos[2] - nozzle_z + cal_ceil
+            logging.info(f"CARTO: nozzle_z: {nozzle_z} cal_min_z - cal_max_z: {cal_min_z} - {cal_max_z}")
         elif cal_nozzle_z is None:
             raise Exception(
                 "A calculated nozzle Z position is required if not in manual mode,"
@@ -1625,9 +1646,11 @@ class Scanner:
             self._start_streaming()
             self._sample_printtime_sync(50)
             with self.streaming_session(cb):
+                logging.info("CARTO: streaming_session")
                 self._sample_printtime_sync(50)
                 toolhead.dwell(0.250)
                 curpos[2] = cal_min_z
+                logging.info(f"CARTO: doing toolhead manual move to {curpos} at {cal_speed}")
                 toolhead.manual_move(curpos, cal_speed)
                 toolhead.dwell(0.250)
                 self._sample_printtime_sync(50)
@@ -1637,6 +1660,8 @@ class Scanner:
             self._zhop()
         finally:
             self._stop_streaming()
+
+        logging.info(f"CARTO: smpling done")
 
         # Fit the sampled data
         z_offset = [
@@ -1712,18 +1737,25 @@ class Scanner:
     def _check_hardware(self, sample):
         if not self.hardware_failure:
             msg = None
+            #logging.info(f"CARTO: {sample}")
             if sample["data"] == 0xFFFFFFF:
                 msg = "coil is shorted or not connected"
             elif self.fmin is not None and sample["freq"] > 1.35 * self.fmin:
-                msg = "coil expected max frequency exceeded"
+                msg = f"coil expected max frequency exceeded (got {sample['freq']} raw:{hex(sample['data'])}, fmin: {self.fmin}, expected max: {1.35*self.fmin})"
+                #logging.info(msg)
+                return
             if msg:
                 msg = "Scanner hardware issue: " + msg
-                self.hardware_failure = msg
                 logging.error(msg)
+                self.gcode.respond_raw("!! " + msg + "\n")
+                self._stop_streaming()
+
                 if self._stream_en:
                     self.printer.invoke_shutdown(msg)
                 else:
-                    self.gcode.respond_raw("!! " + msg + "\n")
+                    #self.hardware_failure = msg
+                    #self.gcode.respond_raw("!! " + msg + "\n")
+                    pass
         elif self._stream_en:
             self.printer.invoke_shutdown(self.hardware_failure)
 
@@ -1732,6 +1764,7 @@ class Scanner:
         sample["time"] = self._mcu.clock_to_print_time(clock)
 
     def _enrich_sample_temp(self, sample):
+        sample["temp_raw"] = sample["temp"]
         if self.thermistor_override is None:
             temp_adc = sample["temp"] / self.temp_smooth_count * self.inv_adc_max
             sample["temp"] = self.thermistor.calc_temp(temp_adc)
@@ -1766,6 +1799,9 @@ class Scanner:
         self._stream_flush()
 
     def _stop_streaming(self):
+        if self._stream_en == 0:
+            #logging.info("_stop_streaming: unbalanced stop")
+            return
         self._stream_en -= 1
         if self._stream_en == 0:
             self.reactor.update_timer(self._stream_timeout_timer, self.reactor.NEVER)
@@ -1904,10 +1940,14 @@ class Scanner:
         samples = []
         total = skip + count
 
+        logging.info(f"move_time: {move_time} settle_clock: {settle_clock}")
+
         def cb(sample):
+            #logging.info(f"got sample @ {sample['clock']} (settle: {settle_clock})")
             if sample["clock"] >= settle_clock:
                 samples.append(sample)
                 if len(samples) >= total:
+                    #logging.info(f"StopStreaming")
                     raise StopStreaming
 
         with self.streaming_session(cb, latency=skip + count) as ss:
@@ -2022,6 +2062,42 @@ class Scanner:
         configfile.set("scanner", "scanner_touch_threshold", "%d" % int(threshold))
         configfile.set("scanner", "scanner_touch_speed", "%d" % int(speed))
 
+    cmd_DRIVE_TEST_help = "Test ldc1612 drive current"
+
+    def cmd_DRIVE_TEST(self, gcmd: GCodeCommand):
+        drive = gcmd.get_int("DRIVE", 0)
+        if drive > 0:
+            if drive > 31:
+                raise gcmd.error("drive must be 0..31")
+            self.scanner_base_read_cmd.send([6, 0, drive])
+
+        speed = gcmd.get_float("PROBE_SPEED", self.speed, above=0.0)
+        dist = gcmd.get_float("DIST", 3.0, above=0.0)
+
+        cur_z = self.toolhead.get_position()[2]
+        self.toolhead.dwell(0.251)
+        self.toolhead.wait_moves()
+
+        start_samp = self._sample_async()
+
+        self.toolhead.manual_move([None, None, cur_z + dist], speed)
+        self.toolhead.dwell(0.251)
+        self.toolhead.wait_moves()
+
+        end_samp = self._sample_async()
+
+        self.toolhead.manual_move([None, None, cur_z], speed)
+        self.toolhead.dwell(0.251)
+        self.toolhead.wait_moves()
+
+        sfreq = start_samp['freq'] 
+        efreq = end_samp['freq']
+        sraw = start_samp['data']
+        eraw = end_samp['data']
+        temp = start_samp['temp_raw']
+
+        gcmd.respond_info(f"Frequency range: {round(sfreq,2)} - {round(efreq,2)} [diff: {round(sfreq-efreq,2)} ({round(sfreq/efreq,2)}] (raw: {sraw} - {eraw} ; raw_temp: {temp})")
+
     cmd_SCANNER_ESTIMATE_BACKLASH_help = "Estimate Z axis backlash"
 
     def cmd_SCANNER_ESTIMATE_BACKLASH(self, gcmd: GCodeCommand):
@@ -2081,6 +2157,8 @@ class Scanner:
 
     def cmd_SCANNER_QUERY(self, gcmd: GCodeCommand):
         sample = self._sample_async()
+        raw = sample["data"]
+        err = sample["data"] >> 28
         last_value = sample["freq"]
         dist = sample["dist"]
         temp = sample["temp"]
@@ -2092,15 +2170,17 @@ class Scanner:
         }
         if dist is None:
             gcmd.respond_info(
-                "Last reading: %.2fHz, %.2fC, no model"
+                "Last reading: %.2fHz, %.2fC, no model. data: %s %s"
                 % (
                     last_value,
                     temp,
+                    hex(raw),
+                    f"ERROR {hex(err)}" if err else ""
                 )
             )
         else:
             gcmd.respond_info(
-                "Last reading: %.2fHz, %.2fC, %.5fmm" % (last_value, temp, dist)
+                "Last reading: %.2fHz, %.2fC, %.5fmm raw %s %s" % (last_value, temp, dist, hex(raw), f"ERROR {hex(err)}" if err else "")
             )
 
     cmd_SCANNER_STREAM_help = "Enable Scanner Streaming"
@@ -2532,9 +2612,16 @@ class ScannerTempModelBuilder:
         logging.info("scanner: built tempco model %s", self.parameters)
         return ScannerTempModel(**self.parameters)
 
+    def build_with_explicit(self, fmin: float, fmin_temp: float):
+        self.parameters["fmin"] = fmin
+        self.parameters["fmin_temp"] = fmin_temp
+        logging.info(f"scanner: building with explicit fmin={fmin} fmin_temp={fmin_temp}")
+        self.build()
+
     def build_with_base(self, scanner: Scanner):
-        base_data = scanner.scanner_base_read_cmd.send([6, 0])
+        base_data = scanner.scanner_base_read_cmd.send([6, 0, 13])
         (f_count, adc_count) = struct.unpack("<IH", base_data["bytes"])
+        # these come straight from base_read, and we're going to ignore them
         if f_count < 0xFFFFFFFF and adc_count < 0xFFFF:
             if self.parameters["fmin"] is None:
                 self.parameters["fmin"] = scanner.count_to_freq(f_count)
@@ -2546,8 +2633,7 @@ class ScannerTempModelBuilder:
                     float(adc_count) / scanner.temp_smooth_count * scanner.inv_adc_max
                 )
                 self.parameters["fmin_temp"] = scanner.thermistor.calc_temp(temp_adc)
-                logging.info(
-                    "scanner: loaded fmin_temp=%.2f from base",
+                logging.info("scanner: loaded fmin_temp=%.2f from base",
                     self.parameters["fmin_temp"],
                 )
         else:
@@ -2742,6 +2828,7 @@ class StreamingHelper:
         if latency is not None:
             self.latency_key = self.scanner.request_stream_latency(latency)
 
+        self.stopped = False
         self.scanner._stream_callbacks[self] = self._handle
         self.scanner._start_streaming()
 
@@ -2755,21 +2842,29 @@ class StreamingHelper:
         try:
             self.cb(sample)
         except StopStreaming:
+            #logging.info(f"StopStreaming! calling complete()")
+            self.scanner._stop_streaming()
+            self.stopped = True
             self.completion.complete(())
 
     def stop(self):
         if self not in self.scanner._stream_callbacks:
             return
         del self.scanner._stream_callbacks[self]
-        self.scanner._stop_streaming()
+        if not self.stopped:
+            self.stopped = True
+            self.scanner._stop_streaming()
         if self.latency_key is not None:
             self.scanner.drop_stream_latency_request(self.latency_key)
         if self.completion_cb is not None:
             self.completion_cb()
 
     def wait(self):
+        logging.info(f"CARTO waiting on completion")
         self.completion.wait()
+        logging.info(f"CARTO completion wait done")
         self.stop()
+        logging.info(f"CARTO stopped")
 
 
 class StopStreaming(Exception):
@@ -3815,9 +3910,11 @@ def load_config(config: ConfigWrapper):
     config.get_printer().add_object("probe", ScannerWrapper(scanner))
     temp = ScannerTempWrapper(scanner)
     if scanner.sensor == "cartographer":
-        config.get_printer().add_object("temperature_sensor cartographer_coil", temp)
+        #config.get_printer().add_object("temperature_sensor cartographer_coil", temp)
         pheaters = scanner.printer.load_object(config, "heaters")
-        pheaters.available_sensors.append("temperature_sensor cartographer_coil")
+        # if I include this, I get a duplicate cartographer_coil entry in the temperatures list.
+        # I don't understand why, because nothing else is making it
+        #pheaters.available_sensors.append("temperature_sensor cartographer_coil")
     elif scanner.sensor == "idm":
         config.get_printer().add_object("temperature_sensor idm_coil", temp)
         pheaters = scanner.printer.load_object(config, "heaters")
