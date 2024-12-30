@@ -335,11 +335,14 @@ ldc1612_query_one(struct ldc1612 *ld)
         return 0;
 
     // Read coil0 frequency
-    uint16_t msb, lsb;
-    read_reg(ld, REG_DATA0_MSB, &msb);
-    read_reg(ld, REG_DATA0_LSB, &lsb);
+    uint8_t d[4];
+    read_reg(ld, REG_DATA0_MSB, &d[0]);
+    read_reg(ld, REG_DATA0_LSB, &d[2]);
 
-    return ((uint32_t)msb << 16) | ((uint32_t)lsb);
+    return ((uint32_t)d[0] << 24)
+        | ((uint32_t)d[1] << 16)
+        | ((uint32_t)d[2] << 8)
+        | ((uint32_t)d[3]);
 }
 
 static void

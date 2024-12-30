@@ -141,27 +141,48 @@ class ProbeEddy:
         gcmd.respond_info(f"Current coil value: {freq} ({height:.3f}mm)")
     
     def cmd_CALIBRATE(self, gcmd: GCodeCommand):
+        # z-hop so that manual probe helper doesn't complain if we're already
+        # at the right place
+        toolhead: ToolHead = self._printer.lookup_object('toolhead')
+        curpos = toolhead.get_position()
+        curpos[2] = curpos[2] + 5
+        toolhead.manual_move(curpos, self.params['probe_speed'])
+
         manual_probe.ManualProbeHelper(self._printer, gcmd,
                                        lambda kin_pos: self.cmd_CALIBRATE_next(gcmd, kin_pos))
+
     def cmd_CALIBRATE_next(self, gcmd: GCodeCommand, kin_pos: float):
+        if kin_pos is None:
+            return
+
         toolhead: ToolHead = self._printer.lookup_object('toolhead')
         toolhead_kin = toolhead.get_kinematics()
 
         # we're going to set the kinematic position to kin_height to make
         # the following code easier, so it can assume z=0 is actually real zero
-        curpos = list(kin_pos)
+        curpos = toolhead.get_position()
+        logging.info(f"kin_pos: {kin_pos} curpos: {curpos}")
+        for k in range(3):
+            curpos[k] = kin_pos[k]
         toolhead.set_position(curpos, homing_axes=(0, 1, 2))
 
         def move_to(x: float, y: float, z: float):
-            toolhead.manual_move((x, y, z), self.params['probe_speed'])
+            nonlocal curpos
+            curpos[0] = x
+            curpos[1] = y
+            curpos[2] = z
+            logging.info(f"move_to: {curpos} {type(curpos)}")
+            toolhead.manual_move(curpos, self.params['probe_speed'])
             toolhead.wait_moves()
             curpos = toolhead.get_position()
 
         def move_by(xoffs: float, yoffs: float, zoffs: float):
+            nonlocal curpos
             move_to(curpos[0] + xoffs, curpos[1] + yoffs, curpos[2] + zoffs)
             curpos = toolhead.get_position()
 
         def move_to_z(z: float):
+            nonlocal curpos
             move_to(curpos[0], curpos[1], z)
             curpos = toolhead.get_position()
 
@@ -213,7 +234,7 @@ class ProbeEddy:
         for th_past_time, th_recorded_z in toolhead_positions:
             th_past_z = toolhead_kin_z(at=th_past_time)
             if abs(th_past_z - th_recorded_z) > 0.001:
-                gcmd.respond_error(f"Error in historical movement at {th_past_time}: {th_past_z} != {th_recorded_z}")
+                gcmd.respond_raw(f"!! Error in historical movement at {th_past_time}: {th_past_z} != {th_recorded_z}\n")
 
 
         # the samples are a list of [print_time, freq] pairs.
