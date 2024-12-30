@@ -143,6 +143,9 @@ class LDC1612:
             "query_ldc1612_hack oid=%c",
             "ldc1612_hack oid=%c time=%u avg=%i cavg=%i adj=%i",
             oid=self.oid, cq=cmdqueue)
+        self._ldc1612_read = self.mcu.lookup_query_command(
+            "ldc1612_read oid=%c", "ldc1612_read_reply oid=%c time=%u val=%u",
+            oid=self.oid, cq=cmdqueue)
         self.mcu.register_response(self._handle_debug_print, "debug_print")
     def _handle_debug_print(self, params):
         logging.info(params["m"])
@@ -173,9 +176,17 @@ class LDC1612:
         if (s & (1<<6)) != 0: result.append('DRDY')
         if (s & (1<<3)) != 0: result.append('UNREADCONV1')
         return str.join(' ', result)
+    def read_one_value(self):
+        params = self._ldc1612_read.send([self.oid])
+        return (params['time'], params['val'])
     # Homing
     def to_ldc_freqval(self, freq):
         return int(freq * (1<<28) / float(LDC1612_FREQ) + 0.5)
+    def from_ldc_freqval(self, val):
+        if val >= 0x0fffffff:
+            raise self.printer.command_error(f"LDC1612 frequency value has error bits: {hex(val)}")
+        return round(val * (float(LDC1612_FREQ) / (1<<28)), 3)
+
     def setup_home(self, print_time, trigger_freq,
                    trsync_oid, hit_reason, err_reason):
         clock = self.mcu.print_time_to_clock(print_time)
@@ -229,6 +240,9 @@ class LDC1612:
                 self.last_error_count += 1
             samples[count] = (round(ptime, 6), round(freq_conv * mv, 3), 999.9)
             count += 1
+        # remove the error samples
+        del samples[count:]
+
     # Start, stop, and process message batches
     def _start_measurements(self):
         # In case of miswiring, testing LDC1612 device ID prevents treating

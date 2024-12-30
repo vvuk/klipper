@@ -323,8 +323,8 @@ read_reg_status(struct ldc1612 *ld)
 #define BYTES_PER_SAMPLE 4
 
 // Query ldc1612 data
-static void
-ldc1612_query(struct ldc1612 *ld, uint8_t oid)
+static uint32_t
+ldc1612_query_one(struct ldc1612 *ld)
 {
     // Check if data available (and clear INTB line)
     uint16_t status = read_reg_status(ld);
@@ -332,19 +332,29 @@ ldc1612_query(struct ldc1612 *ld, uint8_t oid)
     ld->flags &= ~LDC_PENDING;
     irq_enable();
     if (!(status & 0x08))
-        return;
+        return 0;
 
     // Read coil0 frequency
+    uint16_t msb, lsb;
+    read_reg(ld, REG_DATA0_MSB, &msb);
+    read_reg(ld, REG_DATA0_LSB, &lsb);
+
+    return ((uint32_t)msb << 16) | ((uint32_t)lsb);
+}
+
+static void
+ldc1612_query(struct ldc1612 *ld, uint8_t oid)
+{
+    uint32_t data = ldc1612_query_one(ld);
+    if (data == 0)
+        return;
+
+    // Store data in streaming buffer    
     uint8_t *d = &ld->sb.data[ld->sb.data_count];
-    read_reg(ld, REG_DATA0_MSB, &d[0]);
-    read_reg(ld, REG_DATA0_LSB, &d[2]);
+    memcpy(d, &data, BYTES_PER_SAMPLE);
     ld->sb.data_count += BYTES_PER_SAMPLE;
 
     // Check for endstop trigger
-    uint32_t data =   ((uint32_t)d[0] << 24)
-                    | ((uint32_t)d[1] << 16)
-                    | ((uint32_t)d[2] << 8)
-                    | ((uint32_t)d[3]);
     check_home(ld, data);
 
     // Flush local buffer if needed
@@ -397,6 +407,18 @@ command_query_status_ldc1612(uint32_t *args)
     sensor_bulk_status(&ld->sb, args[0], time1, time2-time1, fifo);
 }
 DECL_COMMAND(command_query_status_ldc1612, "query_status_ldc1612 oid=%c");
+
+void
+command_ldc1612_read(uint32_t *args)
+{
+    struct ldc1612 *ld = oid_lookup(args[0], command_config_ldc1612);
+
+    uint32_t time1 = timer_read_time();
+    uint32_t value = ldc1612_query_one(ld);
+
+    sendf("ldc1612_read_reply oid=%c time=%u val=%u", args[0], time1, value);
+}
+DECL_COMMAND(command_ldc1612_read, "ldc1612_read oid=%c");
 
 void
 ldc1612_task(void)
