@@ -35,6 +35,8 @@ struct ldc1612 {
     struct gpio_in intb_pin;
     uint16_t prev_status;
 
+    uint32_t last_read_value;
+
     // homing
     struct trsync *ts;
     uint8_t homing_flags;
@@ -187,8 +189,8 @@ void
 command_query_ldc1612_latched_status(uint32_t *args)
 {
     struct ldc1612 *ld = oid_lookup(args[0], command_config_ldc1612);
-    sendf("ldc1612_latched_status oid=%c status=%u"
-          , args[0], ld->prev_status);
+    sendf("ldc1612_latched_status oid=%c status=%u lastval=%u"
+          , args[0], ld->prev_status, ld->last_read_value);
 }
 DECL_COMMAND(command_query_ldc1612_latched_status,
              "query_ldc1612_latched_status oid=%c");
@@ -339,10 +341,14 @@ ldc1612_query_one(struct ldc1612 *ld)
     read_reg(ld, REG_DATA0_MSB, &d[0]);
     read_reg(ld, REG_DATA0_LSB, &d[2]);
 
-    return ((uint32_t)d[0] << 24)
+    uint32_t data = ((uint32_t)d[0] << 24)
         | ((uint32_t)d[1] << 16)
         | ((uint32_t)d[2] << 8)
         | ((uint32_t)d[3]);
+
+    ld->last_read_value = data;
+
+    return data;
 }
 
 static void
@@ -366,7 +372,7 @@ ldc1612_query(struct ldc1612 *ld, uint8_t oid)
 }
 
 void
-command_query_ldc1612(uint32_t *args)
+command_ldc1612_start_stop(uint32_t *args)
 {
     struct ldc1612 *ld = oid_lookup(args[0], command_config_ldc1612);
 
@@ -384,10 +390,10 @@ command_query_ldc1612(uint32_t *args)
     sched_add_timer(&ld->timer);
     irq_enable();
 }
-DECL_COMMAND(command_query_ldc1612, "query_ldc1612 oid=%c rest_ticks=%u");
+DECL_COMMAND(command_ldc1612_start_stop, "ldc1612_start_stop oid=%c rest_ticks=%u");
 
 void
-command_query_status_ldc1612(uint32_t *args)
+command_ldc1612_query_bulk_status(uint32_t *args)
 {
     struct ldc1612 *ld = oid_lookup(args[0], command_config_ldc1612);
 
@@ -398,30 +404,17 @@ command_query_status_ldc1612(uint32_t *args)
         int p = check_intb_asserted(ld);
         irq_enable();
         sensor_bulk_status(&ld->sb, args[0], time, 0, p ? BYTES_PER_SAMPLE : 0);
-        return;
+    } else {
+        // Query sensor to see if a sample is pending
+        uint32_t time1 = timer_read_time();
+        uint16_t status = read_reg_status(ld);
+        uint32_t time2 = timer_read_time();
+
+        uint32_t fifo = status & 0x08 ? BYTES_PER_SAMPLE : 0;
+        sensor_bulk_status(&ld->sb, args[0], time1, time2-time1, fifo);
     }
-
-    // Query sensor to see if a sample is pending
-    uint32_t time1 = timer_read_time();
-    uint16_t status = read_reg_status(ld);
-    uint32_t time2 = timer_read_time();
-
-    uint32_t fifo = status & 0x08 ? BYTES_PER_SAMPLE : 0;
-    sensor_bulk_status(&ld->sb, args[0], time1, time2-time1, fifo);
 }
-DECL_COMMAND(command_query_status_ldc1612, "query_status_ldc1612 oid=%c");
-
-void
-command_ldc1612_read(uint32_t *args)
-{
-    struct ldc1612 *ld = oid_lookup(args[0], command_config_ldc1612);
-
-    uint32_t time1 = timer_read_time();
-    uint32_t value = ldc1612_query_one(ld);
-
-    sendf("ldc1612_read_reply oid=%c time=%u val=%u", args[0], time1, value);
-}
-DECL_COMMAND(command_ldc1612_read, "ldc1612_read oid=%c");
+DECL_COMMAND(command_ldc1612_query_bulk_status, "ldc1612_query_bulk_status oid=%c");
 
 void
 ldc1612_task(void)

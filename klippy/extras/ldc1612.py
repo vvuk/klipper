@@ -88,7 +88,7 @@ class LDC1612:
                                            default_speed=400000)
         self.mcu = mcu = self.i2c.get_mcu()
         self.oid = oid = mcu.create_oid()
-        self.query_ldc1612_cmd = None
+        self.ldc1612_start_stop_cmd = None
         self.ldc1612_setup_home_cmd = self.query_ldc1612_home_state_cmd = None
         if config.get('intb_pin', None) is not None:
             ppins = config.get_printer().lookup_object("pins")
@@ -105,13 +105,14 @@ class LDC1612:
         factor = min(EMA_BASE - 1, max(0, factor))
         mcu.add_config_cmd("ldc1612_setup_averaging oid=%d factor=%d"
                            % (oid, factor))
-        mcu.add_config_cmd("query_ldc1612 oid=%d rest_ticks=0"
+        mcu.add_config_cmd("ldc1612_start_stop oid=%d rest_ticks=0"
                            % (oid,), on_restart=True)
         mcu.register_config_callback(self._build_config)
         # Bulk sample message reading
         chip_smooth = self.data_rate * BATCH_UPDATES * 2
         self.ffreader = bulk_sensor.FixedFreqReader(mcu, chip_smooth, ">I")
         self.last_error_count = 0
+        self._chip_initialized = False
         # Process messages in batches
         self.batch_bulk = bulk_sensor.BatchBulkHelper(
             self.printer, self._process_batch,
@@ -122,9 +123,9 @@ class LDC1612:
                                          self.name, {'header': hdr})
     def _build_config(self):
         cmdqueue = self.i2c.get_command_queue()
-        self.query_ldc1612_cmd = self.mcu.lookup_command(
-            "query_ldc1612 oid=%c rest_ticks=%u", cq=cmdqueue)
-        self.ffreader.setup_query_command("query_status_ldc1612 oid=%c",
+        self.ldc1612_start_stop_cmd = self.mcu.lookup_command(
+            "ldc1612_start_stop oid=%c rest_ticks=%u", cq=cmdqueue)
+        self.ffreader.setup_query_command("ldc1612_query_bulk_status oid=%c",
                                           oid=self.oid, cq=cmdqueue)
         self.ldc1612_setup_home_cmd = self.mcu.lookup_command(
             "ldc1612_setup_home oid=%c clock=%u threshold=%u"
@@ -137,14 +138,11 @@ class LDC1612:
             oid=self.oid, cq=cmdqueue)
         self.query_ldc1612_latched_status_cmd = self.mcu.lookup_query_command(
             "query_ldc1612_latched_status oid=%c",
-            "ldc1612_latched_status oid=%c status=%u",
+            "ldc1612_latched_status oid=%c status=%u lastval=%u",
             oid=self.oid, cq=cmdqueue)
         self.query_ldc1612_hack_cmd = self.mcu.lookup_query_command(
             "query_ldc1612_hack oid=%c",
             "ldc1612_hack oid=%c time=%u avg=%i cavg=%i adj=%i",
-            oid=self.oid, cq=cmdqueue)
-        self._ldc1612_read = self.mcu.lookup_query_command(
-            "ldc1612_read oid=%c", "ldc1612_read_reply oid=%c time=%u val=%u",
             oid=self.oid, cq=cmdqueue)
         self.mcu.register_response(self._handle_debug_print, "debug_print")
     def _handle_debug_print(self, params):
@@ -177,8 +175,9 @@ class LDC1612:
         if (s & (1<<3)) != 0: result.append('UNREADCONV1')
         return str.join(' ', result)
     def read_one_value(self):
-        params = self._ldc1612_read.send([self.oid])
-        return (params['time'], params['val'])
+        self._init_chip()
+        res = self.query_ldc1612_latched_status_cmd.send([self.oid])
+        return (res['status'], res['lastval'])
     # Homing
     def to_ldc_freqval(self, freq):
         return int(freq * (1<<28) / float(LDC1612_FREQ) + 0.5)
@@ -243,8 +242,7 @@ class LDC1612:
         # remove the error samples
         del samples[count:]
 
-    # Start, stop, and process message batches
-    def _start_measurements(self):
+    def _verify_chip(self):
         # In case of miswiring, testing LDC1612 device ID prevents treating
         # noise or wrong signal as a correctly initialized device
         manuf_id = self.read_reg(REG_MANUFACTURER_ID)
@@ -255,6 +253,12 @@ class LDC1612:
                 "This is generally indicative of connection problems\n"
                 "(e.g. faulty wiring) or a faulty ldc1612 chip."
                 % (manuf_id, dev_id, LDC1612_MANUF_ID, LDC1612_DEV_ID))
+
+    def _init_chip(self):
+        if self._chip_initialized:
+            return
+
+        self._verify_chip()
         # Setup chip in requested query rate
         rcount0 = LDC1612_FREQ / (16. * (self.data_rate - 4))
         self.set_reg(REG_RCOUNT0, int(rcount0 + 0.5))
@@ -266,16 +270,21 @@ class LDC1612:
         # RP_OVERRIDE_EN | AUTO_AMP_DIS | REF_CLK_SRC=clkin | reserved
         self.set_reg(REG_CONFIG, (1<<12) | (1<<10) | (1<<9) | 0x001)
         self.set_reg(REG_DRIVE_CURRENT0, self.dccal.get_drive_current() << 11)
+        self._initialized = True
+
+    # Start, stop, and process message batches
+    def _start_measurements(self):
+        self._init_chip()
         # Start bulk reading
         rest_ticks = self.mcu.seconds_to_clock(0.5 / self.data_rate)
-        self.query_ldc1612_cmd.send([self.oid, rest_ticks])
+        self.ldc1612_start_stop_cmd.send([self.oid, rest_ticks])
         logging.info("LDC1612 starting '%s' measurements", self.name)
         # Initialize clock tracking
         self.ffreader.note_start()
         self.last_error_count = 0
     def _finish_measurements(self):
         # Halt bulk reading
-        self.query_ldc1612_cmd.send_wait_ack([self.oid, 0])
+        self.ldc1612_start_stop_cmd.send_wait_ack([self.oid, 0])
         self.ffreader.note_end()
         logging.info("LDC1612 finished '%s' measurements", self.name)
     def _process_batch(self, eventtime):

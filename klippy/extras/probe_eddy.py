@@ -68,8 +68,12 @@ class ProbeEddyFrequencyMap:
             cfile.set("height_to_freq_p", self.height_to_freq.coef)
 
     def raw_freqval_to_height(self, raw_freq: int, temp: float = None) -> float:
+        if self.freq_to_height is None:
+            return math.inf
         return self.freq_to_height(self._sensor.from_ldc_freqval(raw_freq))
     def height_to_raw_freqval(self, height: float, temp: float = None) -> int:
+        if self.height_to_freq is None:
+            return 0
         return self._sensor.to_ldc_freqval(self.height_to_freq(height))
     def freq_to_height(self, freq: float, temp: float = None) -> float:
         if self.freq_to_height is None:
@@ -132,14 +136,28 @@ class ProbeEddy:
         self.define_commands(gcode)
     
     def define_commands(self, gcode):
-        gcode.register_command("PROBE_EDDY_QUERY", self.cmd_QUERY)
-        gcode.register_command("PROBE_EDDY_CALIBRATE", self.cmd_CALIBRATE)
+        gcode.register_command("PROBE_EDDY_QUERY", self.cmd_QUERY_wrapper)
+        gcode.register_command("PROBE_EDDY_CALIBRATE", self.cmd_CALIBRATE_wrapper)
     
+    def cmd_QUERY_wrapper(self, gcmd: GCodeCommand):
+        try:
+            return self.cmd_QUERY(gcmd)
+        except Exception as e:
+            logging.error(f"Error in cmd_QUERY: {e}")
+            gcmd.respond_error(f"Error: {e}")
+
     def cmd_QUERY(self, gcmd: GCodeCommand):
-        freq = self._sensor.read_one_value()[1]
+        status, freq = self._sensor.read_one_value()
         height = self._fmap.raw_freqval_to_height(freq)
-        gcmd.respond_info(f"Current coil value: {freq} ({height:.3f}mm)")
-    
+        gcmd.respond_info(f"Last coil value: {freq} ({height:.3f}mm) @ status: {hex(status)}")
+
+    def cmd_CALIBRATE_wrapper(self, gcmd: GCodeCommand):
+        try:
+            return self.cmd_CALIBRATE(gcmd)
+        except Exception as e:
+            logging.error(f"Error in cmd_CALIBRATE: {e}")
+            gcmd.respond_error(f"Error: {e}")    
+
     def cmd_CALIBRATE(self, gcmd: GCodeCommand):
         # z-hop so that manual probe helper doesn't complain if we're already
         # at the right place
@@ -156,100 +174,72 @@ class ProbeEddy:
             return
 
         toolhead: ToolHead = self._printer.lookup_object('toolhead')
-        toolhead_kin = toolhead.get_kinematics()
-
-        # we're going to set the kinematic position to kin_height to make
-        # the following code easier, so it can assume z=0 is actually real zero
         curpos = toolhead.get_position()
-        logging.info(f"kin_pos: {kin_pos} curpos: {curpos}")
-        for k in range(3):
-            curpos[k] = kin_pos[k]
-        toolhead.set_position(curpos, homing_axes=(0, 1, 2))
+        logging.info(f"CALIBRATE: kin_pos: {kin_pos} curpos: {curpos}")
 
-        def move_to(x: float, y: float, z: float):
-            nonlocal curpos
-            curpos[0] = x
-            curpos[1] = y
-            curpos[2] = z
-            logging.info(f"move_to: {curpos} {type(curpos)}")
-            toolhead.manual_move(curpos, self.params['probe_speed'])
-            toolhead.wait_moves()
-            curpos = toolhead.get_position()
+        sample_time = 0.200
+        sample_pad = 0.050
 
-        def move_by(xoffs: float, yoffs: float, zoffs: float):
-            nonlocal curpos
-            move_to(curpos[0] + xoffs, curpos[1] + yoffs, curpos[2] + zoffs)
-            curpos = toolhead.get_position()
+        with ToolheadMovementHelper(self) as th:
+            # we're going to set the kinematic position to kin_height to make
+            # the following code easier, so it can assume z=0 is actually real zero
+            th.set_absolute_position(*kin_pos)
 
-        def move_to_z(z: float):
-            nonlocal curpos
-            move_to(curpos[0], curpos[1], z)
-            curpos = toolhead.get_position()
+            # away from bed, over nozzle position, then back to bed
+            #th.move(0, 0, 5.0)
+            #th.move(-self.offset['x'], -self.offset['y'], 0)
 
-        def toolhead_kin_z(at = None):
-            toolhead.flush_step_generation()
-            if at is None:
-                kin_spos = {s.get_name(): s.get_commanded_position()
-                            for s in toolhead_kin.get_steppers()}
-            else:
-                kin_spos = {s.get_name(): s.mcu_to_commanded_position(s.get_past_mcu_position(at))
-                            for s in toolhead_kin.get_steppers()}
-            return toolhead_kin.calc_position(kin_spos)[2]
+            #  FIXME FIXME FIXME -- PUT THIS BACK! -- FIXME FIXME FIXME
+            #th.move_by(-self.offset['x'], -self.offset['y'], 5.0)
+            th.move_by(0, 0, 5.0)
+            th.dwell(0.5)
 
-        # away from bed, over nozzle position, then back to bed
-        #move(0, 0, 5.0)
-        #move(-self.offset['x'], -self.offset['y'], 0)
+            #th.move(0, 0, -5.0)
 
-        move_by(-self.offset['x'], -self.offset['y'], 5.0)
+            # now do the calibration move.
+            # move to the start of calibration
+            cal_z_max = self.params['calibration_z_max']
+            th.move_to_z(cal_z_max)
 
-        #move(0, 0, -5.0)
+            mapping = None
+            toolhead_positions = []
+            first_sample_time = None
+            last_sample_time = None
 
-        # now do the calibration move.
-        # move to the start of calibration
-        cal_z_max = self.params['calibration_z_max']
-        move_to_z(cal_z_max)
+            with ProbeEddySampler(self._printer, self._sensor) as sampler:
+                # move down in steps, taking samples
+                for z in np.arange(cal_z_max, 0, -self.params['calibration_step']):
+                    # hop up, then move downward to z to reduce backlash
+                    th.move_to_z(z + 1.000)
+                    th.move_to_z(z)
 
-        mapping = None
-        toolhead_positions = []
-        first_sample_time = None
-        last_sample_time = None
+                    th_tstart, th_tend, th_z = th.note_time_and_position(sample_time)
 
-        with ProbeEddySampler(self._printer, self._sensor) as sampler:
-            # move down in steps, taking samples
-            for z in np.arange(cal_z_max, 0, -self.params['calibration_step']):
-                # hop up, then move downward to z to reduce backlash
-                move_to_z(z + 1.000)
-                move_to_z(z)
-                toolhead_time = toolhead.get_last_move_time()
-                toolhead.dwell(0.200)
-
-                first_sample_time = first_sample_time or toolhead_time
-                last_sample_time = toolhead_time
-
-                toolhead_positions.append((toolhead_time, toolhead_kin_z()))
-
-        move_to_z(5.0)
+                    first_sample_time = first_sample_time or th_tstart
+                    last_sample_time = th_tend
 
         # verify historical movements
         for th_past_time, th_recorded_z in toolhead_positions:
-            th_past_z = toolhead_kin_z(at=th_past_time)
-            if abs(th_past_z - th_recorded_z) > 0.001:
-                gcmd.respond_raw(f"!! Error in historical movement at {th_past_time}: {th_past_z} != {th_recorded_z}\n")
-
+            th_past_z = th.get_kin_z(at=th_past_time)
+            logging.info(f"calibration: time: {th_past_time} z: {th_recorded_z:.3f} past_z: {th_past_z:.3f}")
 
         # the samples are a list of [print_time, freq] pairs.
         # in toolhead_positions, we have a list of [print_time, kin_z] pairs.
         samples = sampler.get_samples()
-        # delete samples that come before first_time or after last_time
-        samples = [s for s in samples if first_sample_time <= s[0] <= last_sample_time]
+        movement_notes = th.notes()
 
-        gcmd.respond_info(f"Collected {len(samples)} samples")
+        freqs = []
+        heights = []
 
-        # now pull out the freqs, and the kin_z values based on the sample time
-        # from the movement history.
-        # TODO: verify with toolhead_positions, but I don't see why this would be wrong
-        freqs = [s[1] for s in samples]
-        heights = [toolhead_kin_z(at=s[0]) for s in samples]
+        for s_t, s_freq in samples:
+            # TODO: make this more elegant
+            for n_start, n_end, n_z in movement_notes:
+                if (n_start+sample_pad) <= s_t <= (n_end-sample_pad):
+                    freqs.append(s_freq)
+                    heights.append(n_z)
+                    logging.info(f"calibration: sample: {n_z:.3f} {s_freq:.2f}")
+
+        gcmd.respond_info(f"Collected {len(samples)} samples, filtered to {len(freqs)}")
 
         # and build a map
         mapping = ProbeEddyFrequencyMap(self._printer, self._sensor, self._temp_sensor)
@@ -320,6 +310,7 @@ class ProbeEddy:
 
 
 # Tool to gather samples and convert them to probe positions
+@final
 class ProbeEddySampler:
     def __init__(self, printer, sensor):
         self._printer = printer
@@ -333,6 +324,7 @@ class ProbeEddySampler:
 
     def __enter__(self):
         self._sensor.add_client(self._add_hw_measurement)
+        return self
     
     def __exit__(self, exc_type, exc_value, traceback):
         self._need_stop = True
@@ -383,6 +375,88 @@ class ProbeEddyEndstopWrapper:
 
     def get_position_endstop(self):
         return self.eddy.params['home_trigger_z']
+
+@final
+class ToolheadMovementHelper:
+    def __init__(self, eddy: ProbeEddy):
+        self._eddy = eddy
+        self._speed = eddy.params['probe_speed']
+        self._printer = eddy._printer
+        self._toolhead = eddy._printer.lookup_object('toolhead')
+        self._toolhead_kin = self._toolhead.get_kinematics()
+        self._notes = []
+        self._startpos = None
+        self._return = True
+    
+    def __enter__(self):
+        self._startpos = np.array(self._toolhead.get_position())
+        return self
+    
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self._return is not None:
+            self._toolhead.manual_move(self._startpos.tolist(), 5.0)
+            self._toolhead.wait_moves()
+
+    def no_return(self):
+        self._return = False
+
+    def dwell(self, dur: float):
+        self._toolhead.dwell(dur)
+
+    def set_absolute_position(self, x: float, y: float, z: float):
+        newpos = np.array(self._toolhead.get_position())
+        newpos[:3] = [x, y, z]
+        self._toolhead.set_position(newpos, homing_axes=(0, 1, 2))
+
+    def get_position(self):
+        curpos = np.array(self._toolhead.get_position())
+        if self._startpos:
+            curpos[:3] -= self._startpos[:3]
+        return curpos.tolist()
+    
+    def get_last_move_time(self):
+        return self._toolhead.get_last_move_time()
+
+    def move_to(self, x: float, y: float, z: float):
+        newpos = np.array(self._toolhead.get_position())
+        newpos[:3] = [x, y, z]
+        self._toolhead.manual_move(newpos, self._speed)
+        self._toolhead.wait_moves()
+
+    def move_by(self, xoffs: float, yoffs: float, zoffs: float):
+        newpos = np.array(self._toolhead.get_position()[:3])
+        newpos += [xoffs, yoffs, zoffs]
+        self.move_to(*newpos)
+
+    def move_to_z(self, z: float):
+        newpos = np.array(self._toolhead.get_position()[:3])
+        newpos[2] = z
+        self.move_to(*newpos)
+
+    def note_time_and_position(self, dwell: float = 0.200):
+        self._toolhead.wait_moves()
+        time = self._toolhead.get_last_move_time()
+        kin_z = self.get_kin_z()
+        self.dwell(dwell)
+        self._toolhead.wait_moves()
+
+        note = (time, time + dwell, kin_z)
+        self._notes.append(note)
+        return note
+
+    def notes(self):
+        return self._notes
+
+    def get_kin_z(self, at = None):
+        self._toolhead.flush_step_generation()
+        if at is None:
+            kin_spos = {s.get_name(): s.get_commanded_position()
+                        for s in self._toolhead_kin.get_steppers()}
+        else:
+            kin_spos = {s.get_name(): s.mcu_to_commanded_position(s.get_past_mcu_position(at))
+                        for s in self._toolhead_kin.get_steppers()}
+        return self._toolhead_kin.calc_position(kin_spos)[2]
+
 
 def load_config_prefix(config: ConfigWrapper):
     return ProbeEddy(config)
