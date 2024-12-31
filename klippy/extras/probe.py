@@ -68,6 +68,7 @@ class ProbeCommandHelper:
                 'last_z_result': self.last_z_result}
     cmd_QUERY_PROBE_help = "Return the status of the z-probe"
     def cmd_QUERY_PROBE(self, gcmd):
+        logging.info("QUERY_PROBE")
         if self.query_endstop is None:
             raise gcmd.error("Probe does not support QUERY_PROBE")
         toolhead = self.printer.lookup_object('toolhead')
@@ -77,6 +78,7 @@ class ProbeCommandHelper:
         gcmd.respond_info("probe: %s" % (["open", "TRIGGERED"][not not res],))
     cmd_PROBE_help = "Probe Z-height at current XY position"
     def cmd_PROBE(self, gcmd):
+        logging.info("PROBE")
         pos = run_single_probe(self.probe, gcmd)
         gcmd.respond_info("Result is z=%.6f" % (pos[2],))
         self.last_z_result = pos[2]
@@ -93,6 +95,7 @@ class ProbeCommandHelper:
         configfile.set(self.name, 'z_offset', "%.3f" % (z_offset,))
     cmd_PROBE_CALIBRATE_help = "Calibrate the probe's z_offset"
     def cmd_PROBE_CALIBRATE(self, gcmd):
+        logging.info("PROBE_CALIBRATE")
         manual_probe.verify_no_manual_probe(self.printer)
         params = self.probe.get_probe_params(gcmd)
         # Perform initial probe
@@ -111,6 +114,7 @@ class ProbeCommandHelper:
                                        self.probe_calibrate_finalize)
     cmd_PROBE_ACCURACY_help = "Probe Z-height accuracy at current XY position"
     def cmd_PROBE_ACCURACY(self, gcmd):
+        logging.info("PROBE_ACCURACY")
         params = self.probe.get_probe_params(gcmd)
         sample_count = gcmd.get_int("SAMPLES", 10, minval=1)
         toolhead = self.printer.lookup_object('toolhead')
@@ -157,6 +161,7 @@ class ProbeCommandHelper:
             max_value, min_value, range_value, avg_value, median, sigma))
     cmd_Z_OFFSET_APPLY_PROBE_help = "Adjust the probe's z_offset"
     def cmd_Z_OFFSET_APPLY_PROBE(self, gcmd):
+        logging.info("Z_OFFSET_APPLY_PROBE")
         gcode_move = self.printer.lookup_object("gcode_move")
         offset = gcode_move.get_status()['homing_origin'].z
         if offset == 0:

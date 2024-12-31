@@ -147,7 +147,7 @@ class LDC1612:
         self.ldc1612_setup_home2_cmd = self.mcu.lookup_command(
              "ldc1612_setup_home2 oid=%c"
              " trsync_oid=%c trigger_reason=%c other_reason_base=%c"
-             " trigger_freq=%u start_freq=%u", cq=cmdqueue);
+             " trigger_freq=%u start_freq=%u start_time=%u", cq=cmdqueue);
         self.query_ldc1612_home_state_cmd = self.mcu.lookup_query_command(
             "query_ldc1612_home_state oid=%c",
             "ldc1612_home_state oid=%c homing=%c trigger_clock=%u",
@@ -214,12 +214,13 @@ class LDC1612:
              0, 0, 0, 0])
 
     def setup_home2(self, trsync_oid, hit_reason, reason_base,
-                    trigger_freq, start_freq):
+                    trigger_freq, start_freq, start_time):
         t_freqvl = self.to_ldc_freqval(trigger_freq)
         s_freqval = self.to_ldc_freqval(start_freq)
-        logging.info(f"LD1612 setup_home2: trigger: {trigger_freq:.2f} ({hex(t_freqvl)}) start: {start_freq:.2f} ({hex(s_freqval)}) trsync: {trsync_oid} {hit_reason} {reason_base}")
+        start_time_mcu = self.mcu.print_time_to_clock(start_time)
+        logging.info(f"LD1612 setup_home2: trigger: {trigger_freq:.2f} ({hex(t_freqvl)}) start: {start_freq:.2f} ({hex(s_freqval)}) @ {start_time:.2f} trsync: {trsync_oid} {hit_reason} {reason_base}")
         self.ldc1612_setup_home2_cmd.send([self.oid, trsync_oid, hit_reason,
-                                           reason_base, t_freqvl, s_freqval])
+                                           reason_base, t_freqvl, s_freqval, start_time_mcu])
 
     def setup_tap(self, print_time, tap_time, pretap_freq,
                   trsync_oid, hit_reason, err_reason,

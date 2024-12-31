@@ -27,7 +27,7 @@ enum {
 
 #define REASON_ERROR_SENSOR 0
 #define REASON_ERROR_PROBE_TOO_LOW 1
-#define REASON_TOUCH 2
+#define REASON_TOUCH 5
 
 #define HCOUNT 64
 
@@ -67,6 +67,7 @@ struct ldc1612 {
     // homing2
     uint32_t homing_start_freq; // if below this, we will ignore homing
     uint32_t homing_trigger_freq; // trigger frequency
+    uint32_t homing_start_time; // we need to hit homing_start_freq at or after this time
     // trigger_reason
     uint8_t other_reason_base;
 };
@@ -129,6 +130,7 @@ command_ldc1612_setup_home2(uint32_t *args)
     uint8_t other_reason_base = args[3];
     uint32_t trigger_freq = args[4];
     uint32_t start_freq = args[5];
+    uint32_t start_time = args[6];
 
     if (trigger_freq == 0 || trsync_oid == 0) {
         dprint("ZZZ clearing homing!");
@@ -138,10 +140,12 @@ command_ldc1612_setup_home2(uint32_t *args)
     }
 
     ld->ts = trsync_oid_lookup(trsync_oid);
-    ld->homing_start_freq = start_freq;
-    ld->homing_trigger_freq = trigger_freq;
     ld->trigger_reason = trigger_reason;
     ld->other_reason_base = other_reason_base;
+
+    ld->homing_start_freq = start_freq;
+    ld->homing_trigger_freq = trigger_freq;
+    ld->homing_start_time = start_time;
 
     ld->homing_flags = LH_HOME2 | LH_AWAIT_HOMING | LH_CAN_TRIGGER;
     dprint("ZZZ home2 sf=%u tf=%u", start_freq, trigger_freq);
@@ -149,7 +153,7 @@ command_ldc1612_setup_home2(uint32_t *args)
 DECL_COMMAND(command_ldc1612_setup_home2,
              "ldc1612_setup_home2 oid=%c"
              " trsync_oid=%c trigger_reason=%c other_reason_base=%c"
-             " trigger_freq=%u start_freq=%u");
+             " trigger_freq=%u start_freq=%u start_time=%u");
 
 
 void
@@ -296,6 +300,13 @@ check_home2(struct ldc1612* ld, uint32_t data)
             //dprint("data=%u < %u", data, ld->homing_start_freq);
             return;
         }
+
+        if (timer_is_before(time, ld->homing_start_time)) {
+            dprint("ZZZ EARLY! time=%u < %u", time, ld->homing_start_time);
+            notify_trigger(ld, 0, ld->other_reason_base + REASON_ERROR_PROBE_TOO_LOW);
+            return;
+        }
+
         dprint("ZZZ -AWAIT_HOMING");
         ld->homing_flags = homing_flags = homing_flags & ~LH_AWAIT_HOMING;
     }
