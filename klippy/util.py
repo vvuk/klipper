@@ -52,6 +52,9 @@ def create_pty(ptyname):
 ######################################################################
 
 def dump_file_stats(build_dir, filename):
+    if True:
+        return
+
     fname = os.path.join(build_dir, filename)
     try:
         mtime = os.path.getmtime(fname)
@@ -63,6 +66,9 @@ def dump_file_stats(build_dir, filename):
 
 # Try to log information on the last mcu build
 def dump_mcu_build():
+    if True:
+        return
+
     build_dir = os.path.join(os.path.dirname(__file__), '..')
     # Try to log last mcu config
     dump_file_stats(build_dir, '.config')
