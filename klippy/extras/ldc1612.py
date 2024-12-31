@@ -92,6 +92,7 @@ class LDC1612:
         self.calibration = calibration
         self.dccal = DriveCurrentCalibrate(config, self)
         self.data_rate = 250
+        self._start_count = 0
         # Setup mcu sensor_ldc1612 bulk query code
         self.i2c = bus.MCU_I2C_from_config(config,
                                            default_addr=LDC1612_ADDR,
@@ -99,7 +100,7 @@ class LDC1612:
         self.mcu = mcu = self.i2c.get_mcu()
         self.oid = oid = mcu.create_oid()
         self.ldc1612_start_stop_cmd = None
-        self.ldc1612_setup_home_cmd = self.query_ldc1612_home_state_cmd = None
+        self.ldc1612_setup_home_cmd = self.ldc1612_setup_home2_cmd = self.query_ldc1612_home_state_cmd = None
         if config.get('intb_pin', None) is not None:
             ppins = config.get_printer().lookup_object("pins")
             pin_params = ppins.lookup_pin(config.get('intb_pin'))
@@ -143,6 +144,10 @@ class LDC1612:
             " trsync_oid=%c trigger_reason=%c error_reason=%c"
             " tap_threshold=%i tap_adjust_factor=%u tap_clock=%u"
             " pretap_reason=%c", cq=cmdqueue)
+        self.ldc1612_setup_home2_cmd = self.mcu.lookup_command(
+             "ldc1612_setup_home2 oid=%c"
+             " trsync_oid=%c trigger_reason=%c other_reason_base=%c"
+             " trigger_freq=%u start_freq=%u", cq=cmdqueue);
         self.query_ldc1612_home_state_cmd = self.mcu.lookup_query_command(
             "query_ldc1612_home_state oid=%c",
             "ldc1612_home_state oid=%c homing=%c trigger_clock=%u",
@@ -203,9 +208,19 @@ class LDC1612:
                    trsync_oid, hit_reason, err_reason):
         clock = self.mcu.print_time_to_clock(print_time)
         tfreq = self.to_ldc_freqval(trigger_freq) #int(trigger_freq * (1<<28) / float(LDC1612_FREQ) + 0.5)
+        logging.info(f"LD1612 setup_home: {clock} {trigger_freq:.2f} ({hex(tfreq)}), trsync {trsync_oid}")
         self.ldc1612_setup_home_cmd.send(
             [self.oid, clock, tfreq, trsync_oid, hit_reason, err_reason,
              0, 0, 0, 0])
+
+    def setup_home2(self, trsync_oid, hit_reason, reason_base,
+                    trigger_freq, start_freq):
+        t_freqvl = self.to_ldc_freqval(trigger_freq)
+        s_freqval = self.to_ldc_freqval(start_freq)
+        logging.info(f"LD1612 setup_home2: trigger: {trigger_freq:.2f} ({hex(t_freqvl)}) start: {start_freq:.2f} ({hex(s_freqval)}) trsync: {trsync_oid} {hit_reason} {reason_base}")
+        self.ldc1612_setup_home2_cmd.send([self.oid, trsync_oid, hit_reason,
+                                           reason_base, t_freqvl, s_freqval])
+
     def setup_tap(self, print_time, tap_time, pretap_freq,
                   trsync_oid, hit_reason, err_reason,
                   tap_threshold, tap_factor):
@@ -296,6 +311,11 @@ class LDC1612:
     # Start, stop, and process message batches
     def _start_measurements(self):
         self._init_chip()
+        self._start_count += 1
+
+        if self._start_count > 1:
+            return
+
         # Start bulk reading
         rest_ticks = self.mcu.seconds_to_clock(0.5 / self.data_rate)
         self.ldc1612_start_stop_cmd.send([self.oid, rest_ticks])
@@ -304,6 +324,11 @@ class LDC1612:
         self.ffreader.note_start()
         self.last_error_count = 0
     def _finish_measurements(self):
+        self._start_count -= 1
+
+        if self._start_count > 0:
+            return
+
         # Halt bulk reading
         self.ldc1612_start_stop_cmd.send_wait_ack([self.oid, 0])
         self.ffreader.note_end()

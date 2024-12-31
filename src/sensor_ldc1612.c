@@ -21,10 +21,17 @@ void dprint(const char *fmt, ...);
 enum {
     LDC_PENDING = 1<<0, LDC_HAVE_INTB = 1<<1,
     LH_AWAIT_HOMING = 1<<1, LH_AWAIT_TAP = 1<<2,
-    LH_CAN_TRIGGER = 1<<3, LH_WANT_TAP = 1<<4
+    LH_CAN_TRIGGER = 1<<3, LH_WANT_TAP = 1<<4,
+    LH_HOME2 = 1<<5,
 };
 
+#define REASON_ERROR_SENSOR 0
+#define REASON_ERROR_PROBE_TOO_LOW 1
+#define REASON_TOUCH 2
+
 #define HCOUNT 64
+
+#define SAMPLE_ERROR(data) ((data) >> 28)
 
 struct ldc1612 {
     struct timer timer;
@@ -56,6 +63,12 @@ struct ldc1612 {
     int32_t havg[HCOUNT];
     int32_t hcavg[HCOUNT];
     int32_t hadj[HCOUNT];
+
+    // homing2
+    uint32_t homing_start_freq; // if below this, we will ignore homing
+    uint32_t homing_trigger_freq; // trigger frequency
+    // trigger_reason
+    uint8_t other_reason_base;
 };
 
 static struct task_wake ldc1612_wake;
@@ -107,16 +120,53 @@ DECL_COMMAND(command_config_ldc1612_with_intb,
              "config_ldc1612_with_intb oid=%c i2c_oid=%c intb_pin=%c");
 
 void
+command_ldc1612_setup_home2(uint32_t *args)
+{
+    struct ldc1612 *ld = oid_lookup(args[0], command_config_ldc1612);
+
+    uint32_t trsync_oid = args[1];
+    uint8_t trigger_reason = args[2];
+    uint8_t other_reason_base = args[3];
+    uint32_t trigger_freq = args[4];
+    uint32_t start_freq = args[5];
+
+    if (trigger_freq == 0 || trsync_oid == 0) {
+        dprint("ZZZ clearing homing!");
+        ld->ts = NULL;
+        ld->homing_flags = 0;
+        return;
+    }
+
+    ld->ts = trsync_oid_lookup(trsync_oid);
+    ld->homing_start_freq = start_freq;
+    ld->homing_trigger_freq = trigger_freq;
+    ld->trigger_reason = trigger_reason;
+    ld->other_reason_base = other_reason_base;
+
+    ld->homing_flags = LH_HOME2 | LH_AWAIT_HOMING | LH_CAN_TRIGGER;
+    dprint("ZZZ home2 sf=%u tf=%u", start_freq, trigger_freq);
+}
+DECL_COMMAND(command_ldc1612_setup_home2,
+             "ldc1612_setup_home2 oid=%c"
+             " trsync_oid=%c trigger_reason=%c other_reason_base=%c"
+             " trigger_freq=%u start_freq=%u");
+
+
+void
 command_ldc1612_setup_home(uint32_t *args)
 {
     struct ldc1612 *ld = oid_lookup(args[0], command_config_ldc1612);
 
     ld->trigger_threshold = args[2];
     if (!ld->trigger_threshold) {
+        dprint("ZZZ clearing homing!");
         ld->ts = NULL;
         ld->homing_flags = 0;
         return;
     }
+
+    // contains both the time that homing shuold start (ignore samples before this),
+    // as well as the trigger time when homing triggers
     ld->homing_clock = args[1];
     ld->ts = trsync_oid_lookup(args[3]);
     ld->trigger_reason = args[4];
@@ -140,7 +190,8 @@ command_ldc1612_setup_home(uint32_t *args)
         // Homing until threshold met
         ld->homing_flags = LH_AWAIT_HOMING | LH_CAN_TRIGGER;
 
-    dprint("ZZZ setup home");
+    uint32_t time = timer_read_time();
+    dprint("ZZZ home fut=%u", ld->homing_clock-time);
 }
 DECL_COMMAND(command_ldc1612_setup_home,
              "ldc1612_setup_home oid=%c clock=%u threshold=%u"
@@ -202,6 +253,59 @@ notify_trigger(struct ldc1612 *ld, uint32_t time, uint8_t reason)
     ld->homing_flags = 0;
     ld->homing_clock = time;
     trsync_do_trigger(ld->ts, reason);
+    dprint("ZZZ notify_trigger: %u", reason);
+}
+
+static void
+update_sensor_average(struct ldc1612 *ld, uint32_t data)
+{
+    uint32_t ema_factor = ld->ema_factor;
+
+    if (ema_factor == 0) {
+        ld->sensor_average = data;
+        return;
+    }
+
+    uint32_t scaled_prev = ld->sensor_average * ema_factor;
+    uint32_t scaled_data = data * (EMA_BASE - ema_factor);
+    uint32_t new_avg = DIV_ROUND_CLOSEST(scaled_data + scaled_prev, EMA_BASE);
+
+    ld->sensor_average = new_avg;
+}
+
+static void
+check_home2(struct ldc1612* ld, uint32_t data)
+{
+    uint32_t time = timer_read_time();
+
+    if (SAMPLE_ERROR(data)) {
+        dprint("ZZZ home2 err=%u", data);
+        // ignore over-amplitude errors (probe too far)
+        if ((ld->prev_status & STATUS_ERR_AHE) != 0)
+            return;
+
+        // Sensor reports an issue - cancel homing
+        notify_trigger(ld, 0, ld->other_reason_base + REASON_ERROR_SENSOR);
+        return;
+    }
+
+    uint8_t homing_flags = ld->homing_flags;
+
+    if (homing_flags & LH_AWAIT_HOMING) {
+        if (data < ld->homing_start_freq) {
+            //dprint("data=%u < %u", data, ld->homing_start_freq);
+            return;
+        }
+        dprint("ZZZ -AWAIT_HOMING");
+        ld->homing_flags = homing_flags = homing_flags & ~LH_AWAIT_HOMING;
+    }
+
+    update_sensor_average(ld, data);
+    uint32_t avg = ld->sensor_average;
+
+    //dprint("data=%u avg %u", data, avg);
+    if (avg > ld->homing_trigger_freq)
+        notify_trigger(ld, time, ld->trigger_reason);
 }
 
 // Check if a sample should trigger a homing event
@@ -213,7 +317,7 @@ check_home(struct ldc1612 *ld, uint32_t data)
     uint8_t homing_flags = ld->homing_flags;
     if (!(homing_flags & LH_CAN_TRIGGER))
         return;
-    if (data > 0x0fffffff) {
+    if (SAMPLE_ERROR(data)) {
         ld->havg[hidx] = ld->prev_status;
         ld->hcavg[hidx] = data;
         ld->hadj[hidx] = 900033;
@@ -229,12 +333,9 @@ check_home(struct ldc1612 *ld, uint32_t data)
     // Perform sensor averaging
     uint32_t ema_factor = ld->ema_factor;
 
-    // EMA
-    uint32_t scaled_prev = ld->sensor_average * ema_factor;
-    uint32_t scaled_data = data * (EMA_BASE - ema_factor);
-    uint32_t new_avg = DIV_ROUND_CLOSEST(scaled_data + scaled_prev, EMA_BASE);
+    update_sensor_average(ld, data);
+    uint32_t new_avg = ld->sensor_average;
 
-    ld->sensor_average = new_avg;
     // Track rate of change between sensor samples
     int32_t change = data - ld->sensor_last;
     ld->sensor_last = data;
@@ -260,6 +361,7 @@ check_home(struct ldc1612 *ld, uint32_t data)
     if (homing_flags & LH_AWAIT_HOMING) {
         if (timer_is_before(time, ld->homing_clock))
             return;
+        dprint("ZZZ -AWAIT_HOMING");
         ld->homing_flags = homing_flags = homing_flags & ~LH_AWAIT_HOMING;
     }
 
@@ -347,8 +449,14 @@ ldc1612_query(struct ldc1612 *ld, uint8_t oid)
                     | ((uint32_t)d[3]);
 
     ld->last_read_value = data;
-    // Check for endstop trigger
-    check_home(ld, data);
+
+    if (ld->homing_flags & LH_CAN_TRIGGER) {
+        // Check for endstop trigger
+        if (ld->homing_flags & LH_HOME2)
+            check_home2(ld, data);
+        else
+            check_home(ld, data);
+    }
 
     // Flush local buffer if needed
     if (ld->sb.data_count + BYTES_PER_SAMPLE > ARRAY_SIZE(ld->sb.data))
@@ -362,9 +470,13 @@ command_ldc1612_start_stop(uint32_t *args)
 
     sched_del_timer(&ld->timer);
     ld->flags &= ~LDC_PENDING;
-    if (!args[1])
+    if (!args[1]) {
         // End measurements
+        dprint("ZZZ stop");
         return;
+    }
+
+    dprint("ZZZ start");
 
     // Start new measurements query
     ld->rest_ticks = args[1];

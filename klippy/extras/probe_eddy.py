@@ -25,6 +25,8 @@ from .temperature_sensor import PrinterSensorGeneric
 
 from . import ldc1612, probe, manual_probe
 
+from .ldc1612 import SETTLETIME as LDC1612_SETTLETIME
+
 @final
 class ProbeEddyFrequencyMap:
     def __init__(self, eddy: ProbeEddy):
@@ -125,15 +127,15 @@ class ProbeEddyFrequencyMap:
     def freq_to_height(self, freq: float, temp: float = None) -> float:
         if self._freq_to_height is None:
             return math.inf
-        logging.info(str(self._coefs(self._freq_to_height)))
-        logging.info(str(self._freq_to_height))
-        logging.info(str(self._freq_to_height(freq)))
         return float(self._freq_to_height(freq))
 
     def height_to_freq(self, height: float, temp: float = None) -> float:
         if self._height_to_freq is None:
             return math.inf
         return float(self._height_to_freq(height))
+
+    def calibrated(self) -> bool:
+        return self._freq_to_height is not None and self._height_to_freq is not None
 
 @final
 class ProbeEddy:
@@ -180,9 +182,18 @@ class ProbeEddy:
         self._fmap.load_from_config(config)
 
         self._endstop_wrapper = ProbeEddyEndstopWrapper(self)
+        self._last_z_result = 0.
 
-        self._printer.lookup_object('pins').register_chip('probe', self)
+        # the virtual z endstop pin
+        #self._printer.lookup_object('pins').register_chip('probe', self)
+
+        # We are a "PrinterProbe". We use some existing helpers.
+        # ProbeSessionHelper creates a HomingViaProbeHelper which registers the probe
+        # z endstop pin. They all connect to _endstop_wrapper, which is the "mcu_probe"
+        self._probe_session = probe.ProbeSessionHelper(config, self._endstop_wrapper)
         self._printer.add_object('probe', self)
+
+        self._cmd_helper = probe.ProbeCommandHelper(config, self, self._endstop_wrapper.query_endstop)
 
         gcode = self._printer.lookup_object('gcode')
         self.define_commands(gcode)
@@ -202,6 +213,18 @@ class ProbeEddy:
 
         height = self._fmap.freq_to_height(freq)
         gcmd.respond_info(f"Last coil value: {freq:.2f} ({hex(freqval)} ({height:.3f}mm) @ status: {self._sensor.status_to_str(status)} {hex(status)}")
+
+    def read_current_freq_and_height(self):
+        self._sensor._start_measurements()
+        status, freqval, freq = self._sensor.read_one_value()
+        self._sensor._finish_measurements()
+
+        # if in error, return -inf height to make endstop checks easier
+        if freqval > 0x0fffffff:
+            return None, -math.inf
+
+        height = self._fmap.freq_to_height(freq)
+        return freq, height
 
     def cmd_CALIBRATE(self, gcmd: GCodeCommand):
         # z-hop so that manual probe helper doesn't complain if we're already
@@ -255,7 +278,7 @@ class ProbeEddy:
             first_sample_time = None
             last_sample_time = None
 
-            with ProbeEddySampler(self._printer, self._sensor) as sampler:
+            with ProbeEddyFrequencySampler(self) as sampler:
                 # move down in steps, taking samples
                 # note: np.arange is exclusive of the stop value; this will _not_ include z=0
                 for z in np.arange(cal_z_max, 0, -self.params['calibration_step']):
@@ -338,100 +361,86 @@ class ProbeEddy:
         gcmd.respond_info(f"Calibration complete, R^2: freq-to-height={r2_fth:.3f}, height-to-freq={r2_htf:.3f}")
 
     # Virtual endstop
+    #def setup_pin(self, pin_type, pin_params):
+    #    if pin_type != "endstop" or pin_params["pin"] != "z_virtual_endstop":
+    #        raise pins.error("Probe virtual endstop only useful as endstop pin")
+    #    if pin_params["invert"] or pin_params["pullup"]:
+    #        raise pins.error("Can not pullup/invert probe virtual endstop")
+    #    return self._endstop_wrapper
 
-    def setup_pin(self, pin_type, pin_params):
-        if pin_type != "endstop" or pin_params["pin"] != "z_virtual_endstop":
-            raise pins.error("Probe virtual endstop only useful as endstop pin")
-        if pin_params["invert"] or pin_params["pullup"]:
-            raise pins.error("Can not pullup/invert probe virtual endstop")
-        return self._endstop_wrapper
+    # forward to the map
+    def height_to_freq(self, height: float, temp: float = None) -> float:
+        return self._fmap.height_to_freq(height, temp)
+    
+    def freq_to_height(self, freq: float, temp: float = None) -> float:
+        return self._fmap.freq_to_height(freq, temp)
 
-    # Probe interface
+    def calibrated(self) -> bool:
+        return self._fmap.calibrated()
 
-    def multi_probe_begin(self):
-        pass
-
-    def multi_probe_end(self):
-        pass
-
+    # PrinterProbe interface
+    # I am seriously lost with PrinterProbe, ProbeEndstopWrapper, ProbeSessionWrapper, etc.
+    # it's not clear at all to me what the relationships are between all of these.
+    # PrinterProbe is what `probe` typically is, so we're instead emulating it here.
     def get_offsets(self):
         return self.offset["x"], self.offset["y"], self.params['home_trigger_z']
+    
+    def get_probe_params(self, gcmd=None):
+        return self._probe_session.get_probe_params(gcmd)
 
-    def get_lift_speed(self, gcmd: Optional[GCodeCommand] = None):
-        if gcmd is not None:
-            return gcmd.get_float("LIFT_SPEED", self.lift_speed, above=0.0)
-        return self.params['lift_speed']
+    def start_probe_session(self, gcmd):
+        method = gcmd.get('METHOD', 'automatic').lower()
+        if method in ('scan', 'rapid_scan'):
+            z_offset = self.get_offsets()[2]
+            raise NotImplementedError("scan and rapid_scan not implemented")
+            #return EddyScanningProbe(self.printer, self.sensor_helper, self.calibration, z_offset, gcmd)
 
-    def get_samples(self, gcmd: Optional[GCodeCommand] = None):
-        if gcmd is not None:
-            return gcmd.get_int("SAMPLES", self.samples_config["samples"], minval=1)
-        return 1 # self.samples_config["samples"]
-
-    def get_sample_retract_dist(self, gcmd: Optional[GCodeCommand] = None):
-        if gcmd is not None:
-            return gcmd.get_float(
-                "SAMPLE_RETRACT_DIST", self.samples_config["retract_dist"], above=0.0
-            )
-        return 0 # self.samples_config["retract_dist"]
-
-    def get_samples_tolerance(self, gcmd: Optional[GCodeCommand] = None):
-        if gcmd is not None:
-            return gcmd.get_float(
-                "SAMPLES_TOLERANCE", self.samples_config["tolerance"], minval=0.0
-            )
-        return 0.001
-
-    def get_samples_tolerance_retries(self, gcmd: Optional[GCodeCommand] = None):
-        if gcmd is not None:
-            return gcmd.get_int(
-                "SAMPLES_TOLERANCE_RETRIES",
-                self.samples_config["tolerance_retries"],
-                minval=0,
-            )
-        return 5
-
-    def get_samples_result(self, gcmd: Optional[GCodeCommand] = None):
-        if gcmd is not None:
-            return gcmd.get("SAMPLES_RESULT", self.samples_config["result"])
-        return self.samples_config["result"]
-
-    def run_probe(self, gcmd: GCodeCommand):
-        raise gcmd.error("can't run_probe")
+        return self._probe_session.start_probe_session(gcmd)
+    
+    def get_status(self, eventtime):
+        return { 'name': self._full_name, 'last_z_result': self._last_z_result, 'home_trigger_z': self.params['home_trigger_z'] } # XXX
 
 
 # Tool to gather samples and convert them to probe positions
 @final
-class ProbeEddySampler:
-    def __init__(self, printer, sensor):
-        self._printer = printer
-        self._sensor = sensor
+class ProbeEddyFrequencySampler:
+    def __init__(self, eddy: ProbeEddy):
+        self.eddy = eddy
+        self._sensor = eddy._sensor
         # Results storage
         self._samples = []
         self._probe_times = []
         self._probe_results = []
         self._need_stop = False
         self._errors = 0
+        self._started = False
 
     def __enter__(self):
-        self._sensor.add_client(self._add_hw_measurement)
-        #logging.info("ProbeEddySampler: __enter__")
+        self.start()
         return self
     
     def __exit__(self, exc_type, exc_value, traceback):
-        #logging.info("ProbeEddySampler: __exit__")
-        self._need_stop = True
+        #logging.info("ProbeEddyFrequencySampler: __exit__")
+        self.finish()
 
     def _add_hw_measurement(self, msg):
         if self._need_stop:
-            #logging.info(f"ProbeEddySampler: stopping in _add_hw_measurement")
+            #logging.info(f"ProbeEddyFrequencySampler: stopping in _add_hw_measurement")
             return False
         
-        #logging.info(f"ProbeEddySampler: adding {len(msg['data'])} samples ({msg['errors']} errors)")
+        #logging.info(f"ProbeEddyFrequencySampler: adding {len(msg['data'])} samples ({msg['errors']} errors)")
         self._errors += msg['errors']
         self._samples.extend(msg['data'])
         return True
 
+    def start(self):
+        if not self._started:
+            self._sensor.add_client(self._add_hw_measurement)
+            self._started = True
+
     def finish(self):
+        if not self._started:
+            raise Exception("ProbeEddyFrequencySampler.finish() called without start()")
         self._need_stop = True
 
     def get_samples(self):
@@ -441,31 +450,208 @@ class ProbeEddySampler:
         return self._errors
 
 @final
-class ProbeEddyEndstopWrapper:
+class ProbeEddyHeightSampler:
     def __init__(self, eddy: ProbeEddy):
         self.eddy = eddy
-        self._mcu = eddy._mcu
+        self._fsampler = ProbeEddyFrequencySampler(eddy)
+        self._started = False
+        self._samples = None
+    
+    def __enter__(self):
+        self.start()
+        return self
+    
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.finish()
 
+    def start(self):
+        if not self._started:
+            self._fsampler.start()
+            self._started = True
+    
+    def finish(self):
+        if not self._started:
+            raise Exception("ProbeEddyHeightSampler.finish() called without start()")
+        self._fsampler.finish()
+
+    def get_samples(self):
+        if self._samples is None:
+            # fill in the height value
+            self._samples = [(t, f, self.eddy.freq_to_height(f)) for t, f, _ in self._fsampler._samples]
+        return self._samples.copy()
+
+    def get_error_count(self):
+        return self._fsampler.get_error_count()
+    
+    def find_height_at_time(self, start_time, end_time):
+        if end_time < start_time:
+            raise ValueError("find_height_at_time: end_time is before start_time")
+
+        samples = self.get_samples()
+        if len(samples) == 0:
+            return None
+        
+        # find the first sample that is >= start_time
+        start_idx = bisect.bisect_left([t for t, _, _ in samples], start_time)
+        if start_idx >= len(samples):
+            # nothing in range
+            return None
+        
+        # find the last sample that is <= end_time
+        end_idx = bisect.bisect_right([t for t, _, _ in samples], end_time)
+        if end_idx == 0:
+            raise ValueError("found something at start_time, but not before end_time?")
+        
+        # average the heights of the samples in the range
+        heights = [h for _, _, h in samples[start_idx:end_idx]]
+        mean = np.mean(heights)
+        avg = np.average(heights)
+        median = np.median(heights)
+        logging.info(f"find_height_at_time: {len(heights)} samples, mean: {mean:.3f} avg: {avg:.3f} median: {median:.3f}")
+
+        return mean
+
+
+# This is a ProbeEndstopWrapper-compatible class,
+# which also forwards the "mcu_probe" methods.
+@final
+class ProbeEddyEndstopWrapper:
+    REASON_BASE = mcu.MCU_trsync.REASON_COMMS_TIMEOUT + 1
+    REASON_SENSOR_ERROR = REASON_BASE + 1
+    REASON_PROBE_TOO_LOW = REASON_BASE + 2
+    REASON_PROBE_TOUCH = REASON_BASE + 3
+
+    def __init__(self, eddy: ProbeEddy):
+        self.eddy = eddy
+        self._sensor = eddy._sensor
+        self._mcu = eddy._mcu
+        self._reactor = eddy._printer.get_reactor()
+
+        self._dispatch = mcu.TriggerDispatch(self._mcu)
+        self._trigger_time = 0.
+
+        self._home_trigger_z = eddy.params['home_trigger_z']
+
+    # these are the "MCU Probe" methods
     def get_mcu(self):
         return self._mcu
 
     def add_stepper(self, stepper: MCU_stepper):
-        pass
+        logging.info(f"add_stepper: {stepper}")
+        self._dispatch.add_stepper(stepper)
 
     def get_steppers(self):
-        return []
+        logging.info(f"get_steppers: {[s.get_name() for s in self._dispatch.get_steppers()]}")
+        return self._dispatch.get_steppers()
 
     def home_start(self, print_time, sample_time, sample_count, rest_time, triggered=True):
-        raise self.eddy._printer.error("Can't home yet")
+        self._trigger_time = 0.
+
+        ## XXX FIXME -- +2.0 for debugging so I don't crash the toolhead
+        debug_offset = 0.0
+
+        trigger_height = self.eddy.params['home_trigger_z'] + debug_offset
+        start_height = trigger_height + 2.0
+
+        trigger_freq = self.eddy.height_to_freq(trigger_height)
+        start_freq = self.eddy.height_to_freq(start_height)
+
+        trigger_completion = self._dispatch.start(print_time)
+
+        logging.info(f"EDDY home_start: {print_time:.3f} freq: {trigger_freq:.2f} start: {start_freq:.2f}")
+        # setup homing -- will start scanning and trigger when we hit
+        # trigger_freq
+        self._sensor.setup_home2(self._dispatch.get_oid(),
+                                 mcu.MCU_trsync.REASON_ENDSTOP_HIT, self.REASON_BASE,
+                                 trigger_freq, start_freq)
+
+        return trigger_completion
 
     def home_wait(self, home_end_time):
-        raise self.eddy._printer.error("Can't home yet")
+        curtime = self._reactor.monotonic()
+        est_print_time = self._mcu.estimated_print_time(curtime)
+        est_he_time = self._mcu.estimated_print_time(home_end_time)
+
+        logging.info(f"EDDY home_wait {home_end_time} cur {curtime} ept {est_print_time} ehe {est_he_time}")
+        self._dispatch.wait_end(home_end_time)
+
+        logging.info(f"EDDY calling clear_home")
+
+        # reset homing setup
+        trigger_time = self._sensor.clear_home()
+        logging.info(f"EDDY clear_home trigger_time {trigger_time}")
+
+        # nb: _dispatch.stop() will treat anything >= REASON_COMMS_TIMEOUT as an error,
+        # and will only return those results. Fine for us since we only have one trsync,
+        # but annoying in general.
+        res = self._dispatch.stop()
+        if res == mcu.MCU_trsync.REASON_ENDSTOP_HIT:
+            # success
+            self._trigger_time = trigger_time
+            return trigger_time
+
+        # various errors
+        if res == mcu.MCU_trsync.REASON_COMMS_TIMEOUT:
+            raise self.eddy._printer.command_error("Communication timeout during homing")
+        if res >= self.REASON_BASE:
+            status = self._sensor.latched_status_str()
+            raise self.eddy._printer.command_error(f"Eddy current sensor error; status: {status}")
+
+        raise self.eddy._printer.command_error(f"Unknown homing error: {res}")
 
     def query_endstop(self, print_time):
-        return 1
+        curtime = self._reactor.monotonic()
+        est_print_time = self._mcu.estimated_print_time(curtime)
+        if est_print_time < (print_time-0.050) or est_print_time > (print_time+0.050):
+            logging.warning(f"query_endstop: print_time {print_time} is too far from current {est_print_time}")
+            return True
 
+        _, height = self.eddy.read_current_freq_and_height()
+        return height < self._home_trigger_z
+
+    # these are the ProbeEndstopWrapper methods
+    def multi_probe_begin(self):
+        logging.info("EDDY multi_probe_begin")
+        self._gather = ProbeEddyHeightSampler(self.eddy)
+        self._gather.start()
+    def multi_probe_end(self):
+        logging.info("EDDY multi_probe_end")
+        self._gather.finish()
+        self._gather = None
+    def probing_move(self, pos, speed):
+        logging.info(f"EDDY probing_move: {pos} {speed}")
+        phoming = self.eddy._printer.lookup_object('homing')
+        trigger_position = phoming.probing_move(self, pos, speed)
+        # if we don't have a trigger time, just return the position. Otherwise we can
+        # do better, and pull the height from the time
+        if not self._trigger_time:
+            return trigger_position
+
+        # the probe says that it triggered at trigger_time, but it has a
+        # settle time -- so start averaging slightly before that point
+        # and a few settle points after that to try to find the toolhead height
+        # TODO -- actually measure and quantify this somehow
+        start_time = self._trigger_time - LDC1612_SETTLETIME
+        end_time = self._trigger_time + LDC1612_SETTLETIME*10
+
+        height = self._gather.find_height_at_time(start_time, end_time)
+        self.eddy._last_z_result = height
+
+        toolhead = self.eddy._printer.lookup_object('toolhead')
+        toolhead_pos = toolhead.get_position()
+        logging.info(f"EDDY probing_move trigger_pos: {trigger_position} toolhead_pos {toolhead_pos}")
+        toolhead_pos[2] = height
+
+        logging.info(f"EDDY probing_move: result height {height:.3f} between {start_time:.3f} and {end_time:.3f}")
+        return toolhead_pos
+
+    def probe_prepare(self, hmove):
+        logging.info(f"EDDY probe_prepare: {hmove}")
+    def probe_finish(self, hmove):
+        logging.info(f"EDDY probe_finish: {hmove}")
     def get_position_endstop(self):
-        return self.eddy.params['home_trigger_z']
+        return self._home_trigger_z
+
 
 @final
 class ToolheadMovementHelper:

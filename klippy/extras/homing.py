@@ -99,7 +99,7 @@ class HomingMove:
         error = None
         try:
             znow = self.toolhead.get_position()[2]
-            logging.info(f"HOMING: drip_move to {movepos}, last move time before: {self.toolhead.get_last_move_time()}, znow: {znow}")
+            logging.info(f"HOMING: drip_move to {movepos} @ {speed}, last move time before: {self.toolhead.get_last_move_time()}, znow: {znow}")
             self.toolhead.drip_move(movepos, speed, all_endstop_trigger)
         except self.printer.command_error as e:
             error = "Error during homing move: %s" % (str(e),)
