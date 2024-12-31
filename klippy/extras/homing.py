@@ -99,7 +99,7 @@ class HomingMove:
         error = None
         try:
             znow = self.toolhead.get_position()[2]
-            logging.info(f"CARTO: drip_move to {movepos}, last move time before: {self.toolhead.get_last_move_time()}, znow: {znow}")
+            logging.info(f"HOMING: drip_move to {movepos}, last move time before: {self.toolhead.get_last_move_time()}, znow: {znow}")
             self.toolhead.drip_move(movepos, speed, all_endstop_trigger)
         except self.printer.command_error as e:
             error = "Error during homing move: %s" % (str(e),)
@@ -108,7 +108,7 @@ class HomingMove:
         move_end_print_time = self.toolhead.get_last_move_time()
         for mcu_endstop, name in self.endstops:
             try:
-                logging.info(f"CARTO: home_wait {move_end_print_time}")
+                logging.info(f"HOMING: home_wait {move_end_print_time}")
                 trigger_time = mcu_endstop.home_wait(move_end_print_time)
             except self.printer.command_error as e:
                 if error is None:

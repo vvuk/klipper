@@ -325,44 +325,28 @@ read_reg_status(struct ldc1612 *ld)
 #define BYTES_PER_SAMPLE 4
 
 // Query ldc1612 data
-static uint32_t
-ldc1612_query_one(struct ldc1612 *ld)
+static void
+ldc1612_query(struct ldc1612 *ld, uint8_t oid)
 {
-    // Check if data available (and clear INTB line)
     uint16_t status = read_reg_status(ld);
     irq_disable();
     ld->flags &= ~LDC_PENDING;
     irq_enable();
-    if (!(status & 0x08))
-        return 0;
-
-    // Read coil0 frequency
-    uint8_t d[4];
-    read_reg(ld, REG_DATA0_MSB, &d[0]);
-    read_reg(ld, REG_DATA0_LSB, &d[2]);
-
-    uint32_t data = ((uint32_t)d[0] << 24)
-        | ((uint32_t)d[1] << 16)
-        | ((uint32_t)d[2] << 8)
-        | ((uint32_t)d[3]);
-
-    ld->last_read_value = data;
-
-    return data;
-}
-
-static void
-ldc1612_query(struct ldc1612 *ld, uint8_t oid)
-{
-    uint32_t data = ldc1612_query_one(ld);
-    if (data == 0)
+    if (!(status & 0x08)) // UNREADCONV1
         return;
 
-    // Store data in streaming buffer    
+    // Read coil0 frequency
     uint8_t *d = &ld->sb.data[ld->sb.data_count];
-    memcpy(d, &data, BYTES_PER_SAMPLE);
+    read_reg(ld, REG_DATA0_MSB, &d[0]);
+    read_reg(ld, REG_DATA0_LSB, &d[2]);
     ld->sb.data_count += BYTES_PER_SAMPLE;
 
+    uint32_t data =   ((uint32_t)d[0] << 24)
+                    | ((uint32_t)d[1] << 16)
+                    | ((uint32_t)d[2] << 8)
+                    | ((uint32_t)d[3]);
+
+    ld->last_read_value = data;
     // Check for endstop trigger
     check_home(ld, data);
 

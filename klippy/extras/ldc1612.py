@@ -47,8 +47,18 @@ class DriveCurrentCalibrate:
                                    "CHIP", self.name.split()[-1],
                                    self.cmd_LDC_CALIBRATE,
                                    desc=self.cmd_LDC_CALIBRATE_help)
+        gcode.register_mux_command("LDC_SET_DRIVE_CURRENT",
+                                   "CHIP", self.name.split()[-1],
+                                   self.cmd_LDC_SET,
+                                   desc=self.cmd_LDC_SET_help)
     def get_drive_current(self):
         return self.drive_cur
+    cmd_LDC_SET_help = "Set LDC1612 DRIVE_CURRENT register (idrive value only)"
+    def cmd_LDC_SET(self, gcmd):
+        drive_cur = gcmd.get_int('VAL', self.drive_cur, minval=0, maxval=31)
+        self.sensor.set_drive_current(drive_cur)
+        self.drive_cur = drive_cur
+        gcmd.respond_info("%s: ldc drive current: %d" % (self.name, drive_cur))
     cmd_LDC_CALIBRATE_help = "Calibrate LDC1612 DRIVE_CURRENT register"
     def cmd_LDC_CALIBRATE(self, gcmd):
         is_in_progress = True
@@ -112,6 +122,7 @@ class LDC1612:
         chip_smooth = self.data_rate * BATCH_UPDATES * 2
         self.ffreader = bulk_sensor.FixedFreqReader(mcu, chip_smooth, ">I")
         self.last_error_count = 0
+        self.last_err_kind = 0
         self._chip_initialized = False
         # Process messages in batches
         self.batch_bulk = bulk_sensor.BatchBulkHelper(
@@ -163,6 +174,8 @@ class LDC1612:
         return response['status']
     def latched_status_str(self):
         s = self.latched_status()
+        return self.status_to_str(s)
+    def status_to_str(self, s: int):
         result = []
         if (s & (1<<15)) != 0: result.append('ERR_CH1')
         if (s & (1<<13)) != 0: result.append('ERR_UR')
@@ -177,12 +190,12 @@ class LDC1612:
     def read_one_value(self):
         self._init_chip()
         res = self.query_ldc1612_latched_status_cmd.send([self.oid])
-        return (res['status'], res['lastval'])
+        return (res['status'], res['lastval'], self.from_ldc_freqval(res['lastval'], ignore_err=True))
     # Homing
     def to_ldc_freqval(self, freq):
         return int(freq * (1<<28) / float(LDC1612_FREQ) + 0.5)
-    def from_ldc_freqval(self, val):
-        if val >= 0x0fffffff:
+    def from_ldc_freqval(self, val, ignore_err = False):
+        if val >= 0x0fffffff and not ignore_err:
             raise self.printer.command_error(f"LDC1612 frequency value has error bits: {hex(val)}")
         return round(val * (float(LDC1612_FREQ) / (1<<28)), 3)
 
@@ -234,11 +247,14 @@ class LDC1612:
         freq_conv = float(LDC1612_FREQ) / (1<<28)
         count = 0
         for ptime, val in samples:
-            mv = val & 0x0fffffff
-            if mv != val:
+            if val > 0x0fffffff: # high nibble indicates an error
+                if self.last_err_kind != (val >> 28):
+                    logging.info(f"LDC1612 error: {hex(val)}")
+                    self.last_err_kind = val >> 28
                 self.last_error_count += 1
-            samples[count] = (round(ptime, 6), round(freq_conv * mv, 3), 999.9)
-            count += 1
+            else:
+                samples[count] = (round(ptime, 6), round(freq_conv * val, 3), 999.9)
+                count += 1
         # remove the error samples
         del samples[count:]
 
@@ -271,6 +287,11 @@ class LDC1612:
         self.set_reg(REG_CONFIG, (1<<12) | (1<<10) | (1<<9) | 0x001)
         self.set_reg(REG_DRIVE_CURRENT0, self.dccal.get_drive_current() << 11)
         self._initialized = True
+
+    def set_drive_current(self, cval: int):
+        if cval < 0 or cval > 31:
+            raise self.printer.command_error("Drive current must be between 0 and 31")
+        self.set_reg(REG_DRIVE_CURRENT0, cval << 11)
 
     # Start, stop, and process message batches
     def _start_measurements(self):

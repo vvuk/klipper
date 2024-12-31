@@ -1,7 +1,11 @@
+from __future__ import annotations
+
 import logging, math, bisect
 import mcu
 import numpy as np
 import numpy.polynomial as npp
+
+import pins
 
 from dataclasses import dataclass
 from enum import IntEnum
@@ -23,66 +27,113 @@ from . import ldc1612, probe, manual_probe
 
 @final
 class ProbeEddyFrequencyMap:
-    def __init__(self, config: ConfigWrapper, sensor: ldc1612.LDC1612, temp_sensor: PrinterSensorGeneric):
-        self._sensor = sensor
-        self._temp_sensor = temp_sensor
+    def __init__(self, eddy: ProbeEddy):
+        self._eddy = eddy
+        self._sensor = eddy._sensor
+        self._temp_sensor = eddy._temp_sensor
 
+    def load_from_config(self, config: ConfigWrapper):
         ftoh = config.getfloatlist("freq_to_height_p", default=None)
         htof = config.getfloatlist("height_to_freq_p", default=None)
 
-        # TODO: save domain and window
         if ftoh and htof:
-            self.freq_to_height = npp.Polynomial(ftoh)
-            self.height_to_freq = npp.Polynomial(htof)
+            self._freq_to_height = npp.Polynomial(ftoh)
+            self._height_to_freq = npp.Polynomial(htof)
+            logging.info(f"Loaded polynomial freq-to-height: {self._coefs(self._freq_to_height)}\n" + \
+                f"                  height-to-freq: {self._coefs(self._height_to_freq)}")
         else:
-            self.freq_to_height = None
-            self.height_to_freq = None
+            self._freq_to_height = None
+            self._height_to_freq = None
 
-    def calibrate_from_values(self, freqs: List[float], heights: List[float]):
-        if len(freqs) != len(heights):
+    # helper. numpy.Polynomial .coef returns coefficients with domain/range mapping baked in.
+    # until we store those, those are no good for round-tripping. convert() gives us
+    # the unscaled values.
+    def _coefs(self, p):
+        return p.convert().coef.tolist()
+
+    def calibrate_from_values(self, raw_freqs: List[float], raw_heights: List[float], gcmd: Optional[GCodeCommand] = None):
+        if len(raw_freqs) != len(raw_heights):
             raise ValueError("freqs and heights must be the same length")
-        freqs = np.array(freqs)
-        heights = np.array(heights)
+        raw_freqs = np.array(raw_freqs)
+        raw_heights = np.array(raw_heights)
 
-        # empirically, freq-to-position results need a 3D polynomial to hit R^2=1
-        # where position-to-frequency fits cleanly with a 2D polynomial
-        self.freq_to_height = npp.Polynomial.fit(freqs, heights, 3)
-        self.height_to_freq = npp.Polynomial.fit(heights, freqs, 2)
+        # Group frequencies by heights and compute the median for each height
+        heights = np.unique(raw_heights)
+        freqs = np.array([np.median(raw_freqs[raw_heights == h]) for h in heights])
 
-        # estimate R^2 for both
         def r2(p, x, y):
             y_hat = p(x)
             ss_res = np.sum((y - y_hat)**2)
             ss_tot = np.sum((y - np.mean(y))**2)
             return 1 - (ss_res / ss_tot)
-        r2_fth = r2(self.freq_to_height, freqs, heights)
-        r2_htf = r2(self.height_to_freq, heights, freqs)
+        
+        r2_tolerance = 0.95
 
-        logging.info(f"Calibrated polynomial R^2: freq-to-height={r2_fth:.3f}, height-to-freq={r2_htf:.3f}")
+        # empirically, freq-to-position results need a 3D polynomial to hit R^2=1
+        # where position-to-frequency fits cleanly with a 2D polynomial. But find
+        # the best r^2 
+        for i in range(3, 9):
+            self._freq_to_height = npp.Polynomial.fit(freqs, heights, i)
+            r2_fth = r2(self._freq_to_height, freqs, heights)
+            if r2_fth >= r2_tolerance:
+                break
+        
+        for i in range(3, 9):
+            self._height_to_freq = npp.Polynomial.fit(heights, freqs, i)
+            r2_htf = r2(self._height_to_freq, heights, freqs)
+            if r2_htf >= r2_tolerance:
+                break
+
+        msg = f"Calibrated polynomial freq-to-height (R^2={r2_fth:.3f}): {self._coefs(self._freq_to_height)}\n" + \
+              f"                      height-to-freq (R^2={r2_htf:.3f}): {self._coefs(self._height_to_freq)}"
+        logging.info(msg)
+        if gcmd:
+            gcmd.respond_info(msg, gcmd)
+            if r2_htf < r2_tolerance or r2_fth < r2_tolerance:
+                gcmd.respond_raw("!! R^2 values are below tolerance; calibration may not be accurate.\n")
+
+        self.save_calibration()
+
         return (r2_fth, r2_htf)
 
-    def save_calibration(self, cfile: ConfigWrapper):
-        if self.freq_to_height:
-            cfile.set("freq_to_height_p", self.freq_to_height.coef)
-        if self.height_to_freq:
-            cfile.set("height_to_freq_p", self.height_to_freq.coef)
+
+    def save_calibration(self, gcmd: Optional[GCodeCommand] = None):
+        if not self._freq_to_height or not self._height_to_freq:
+            return
+
+        ftohs = str(self._coefs(self._freq_to_height)).replace("[","").replace("]","")
+        htofs = str(self._coefs(self._height_to_freq)).replace("[","").replace("]","")
+
+        configfile = self._eddy._printer.lookup_object('configfile')
+        # why is there a floatarray getter, but not a setter?
+        configfile.set(self._eddy._full_name, "freq_to_height_p", ftohs)
+        configfile.set(self._eddy._full_name, "height_to_freq_p", htofs)
+
+        if gcmd:
+            gcmd.respond_info("Calibration saved. Issue a SAVE_CONFIG to write the values to your config file and restart Klipper.")
 
     def raw_freqval_to_height(self, raw_freq: int, temp: float = None) -> float:
-        if self.freq_to_height is None:
-            return math.inf
+        if raw_freq > 0x0fffffff:
+            return -math.inf #error bits set
         return self.freq_to_height(self._sensor.from_ldc_freqval(raw_freq))
+
     def height_to_raw_freqval(self, height: float, temp: float = None) -> int:
-        if self.height_to_freq is None:
+        if self._height_to_freq is None:
             return 0
-        return self._sensor.to_ldc_freqval(self.height_to_freq(height))
+        return self._sensor.to_ldc_freqval(self._height_to_freq(height))
+
     def freq_to_height(self, freq: float, temp: float = None) -> float:
-        if self.freq_to_height is None:
+        if self._freq_to_height is None:
             return math.inf
-        return float(self.freq_to_height(freq))
+        logging.info(str(self._coefs(self._freq_to_height)))
+        logging.info(str(self._freq_to_height))
+        logging.info(str(self._freq_to_height(freq)))
+        return float(self._freq_to_height(freq))
+
     def height_to_freq(self, height: float, temp: float = None) -> float:
-        if self.height_to_freq is None:
+        if self._height_to_freq is None:
             return math.inf
-        return float(self.height_to_freq(height))
+        return float(self._height_to_freq(height))
 
 @final
 class ProbeEddy:
@@ -125,7 +176,8 @@ class ProbeEddy:
             "y": config.getfloat("y_offset", 0.0),
         }
 
-        self._fmap = ProbeEddyFrequencyMap(config, self._sensor, self._temp_sensor)
+        self._fmap = ProbeEddyFrequencyMap(self)
+        self._fmap.load_from_config(config)
 
         self._endstop_wrapper = ProbeEddyEndstopWrapper(self)
 
@@ -136,27 +188,20 @@ class ProbeEddy:
         self.define_commands(gcode)
     
     def define_commands(self, gcode):
-        gcode.register_command("PROBE_EDDY_QUERY", self.cmd_QUERY_wrapper)
-        gcode.register_command("PROBE_EDDY_CALIBRATE", self.cmd_CALIBRATE_wrapper)
+        gcode.register_command("PROBE_EDDY_QUERY", self.cmd_QUERY)
+        gcode.register_command("PROBE_EDDY_CALIBRATE", self.cmd_CALIBRATE)
     
-    def cmd_QUERY_wrapper(self, gcmd: GCodeCommand):
-        try:
-            return self.cmd_QUERY(gcmd)
-        except Exception as e:
-            logging.error(f"Error in cmd_QUERY: {e}")
-            gcmd.respond_error(f"Error: {e}")
-
     def cmd_QUERY(self, gcmd: GCodeCommand):
-        status, freq = self._sensor.read_one_value()
-        height = self._fmap.raw_freqval_to_height(freq)
-        gcmd.respond_info(f"Last coil value: {freq} ({height:.3f}mm) @ status: {hex(status)}")
+        reactor = self._printer.get_reactor()
 
-    def cmd_CALIBRATE_wrapper(self, gcmd: GCodeCommand):
-        try:
-            return self.cmd_CALIBRATE(gcmd)
-        except Exception as e:
-            logging.error(f"Error in cmd_CALIBRATE: {e}")
-            gcmd.respond_error(f"Error: {e}")    
+        self._sensor._start_measurements()
+        systime = reactor.monotonic()
+        reactor.pause(systime + 0.050)
+        status, freqval, freq = self._sensor.read_one_value()
+        self._sensor._finish_measurements()
+
+        height = self._fmap.freq_to_height(freq)
+        gcmd.respond_info(f"Last coil value: {freq:.2f} ({hex(freqval)} ({height:.3f}mm) @ status: {self._sensor.status_to_str(status)} {hex(status)}")
 
     def cmd_CALIBRATE(self, gcmd: GCodeCommand):
         # z-hop so that manual probe helper doesn't complain if we're already
@@ -172,6 +217,10 @@ class ProbeEddy:
     def cmd_CALIBRATE_next(self, gcmd: GCodeCommand, kin_pos: float):
         if kin_pos is None:
             return
+
+        # We just did a ManualProbeHelper; so we want to tell the printer
+        # the current position is actually zero.
+        kin_pos[2] = 0.0
 
         toolhead: ToolHead = self._printer.lookup_object('toolhead')
         curpos = toolhead.get_position()
@@ -208,15 +257,20 @@ class ProbeEddy:
 
             with ProbeEddySampler(self._printer, self._sensor) as sampler:
                 # move down in steps, taking samples
+                # note: np.arange is exclusive of the stop value; this will _not_ include z=0
                 for z in np.arange(cal_z_max, 0, -self.params['calibration_step']):
                     # hop up, then move downward to z to reduce backlash
-                    th.move_to_z(z + 1.000)
+                    #th.move_to_z(z + 1.000)
                     th.move_to_z(z)
 
                     th_tstart, th_tend, th_z = th.note_time_and_position(sample_time)
+                    logging.info(f"th: {th_tstart} {th_z:.3f}")
 
                     first_sample_time = first_sample_time or th_tstart
                     last_sample_time = th_tend
+
+            # back to a safe spot
+            th.move_to_z(cal_z_max)
 
         # verify historical movements
         for th_past_time, th_recorded_z in toolhead_positions:
@@ -226,24 +280,60 @@ class ProbeEddy:
         # the samples are a list of [print_time, freq] pairs.
         # in toolhead_positions, we have a list of [print_time, kin_z] pairs.
         samples = sampler.get_samples()
+        logging.info(f"samples:\n{samples}")
         movement_notes = th.notes()
 
         freqs = []
         heights = []
 
-        for s_t, s_freq in samples:
-            # TODO: make this more elegant
-            for n_start, n_end, n_z in movement_notes:
-                if (n_start+sample_pad) <= s_t <= (n_end-sample_pad):
+        data_file = open("/tmp/eddy-samples.csv", "w")
+        data_file.write(f"time,frequency,z\n")
+
+        # we know that both the movement notes and the samples are going to be in increasing time.
+        # so we can walk through both in parallel
+        si = iter(samples)
+        try:
+            for ni in range(len(movement_notes)):
+                n_start, n_end, n_z = movement_notes[ni]
+
+                s_t, s_freq, _ = next(si)
+                while s_t < (n_start+sample_pad):
+                    data_file.write(f"{s_t},{s_freq},\n")
+                    s_t, s_freq, _ = next(si)
+                
+                while s_t < (n_end-sample_pad):
+                    data_file.write(f"{s_t},{s_freq},{n_z}\n")
                     freqs.append(s_freq)
                     heights.append(n_z)
-                    logging.info(f"calibration: sample: {n_z:.3f} {s_freq:.2f}")
+                    s_t, s_freq, _ = next(si)
+                
+                # move on to the next note range
+        except StopIteration:
+            pass
+
+        data_file.close()
+
+#        for s_t, s_freq, _ in samples:
+#            logging.info(f"calibration: sample: {s_t} {s_freq:.2f}")
+#            # TODO: make this more elegant
+#            for n_start, n_end, n_z in movement_notes:
+#                if (n_start+sample_pad) <= s_t <= (n_end-sample_pad):
+#                    freqs.append(s_freq)
+#                    heights.append(n_z)
+#                    data_file.write(f"{s_t},{s_freq},{n_z}\n")
+#
+#                    logging.info(f"calibration: toolhead: {s_t} {s_freq:.2f} {n_z:.3f}")
 
         gcmd.respond_info(f"Collected {len(samples)} samples, filtered to {len(freqs)}")
 
+        if len(freqs) == 0:
+            gcmd.respond_raw("!! No samples collected\n")
+            return
+
         # and build a map
-        mapping = ProbeEddyFrequencyMap(self._printer, self._sensor, self._temp_sensor)
-        r2_fth, r2_htf = mapping.calibrate_from_values(freqs, heights)
+        mapping = ProbeEddyFrequencyMap(self)
+        r2_fth, r2_htf = mapping.calibrate_from_values(freqs, heights, gcmd)
+        self._fmap = mapping
 
         gcmd.respond_info(f"Calibration complete, R^2: freq-to-height={r2_fth:.3f}, height-to-freq={r2_htf:.3f}")
 
@@ -324,27 +414,28 @@ class ProbeEddySampler:
 
     def __enter__(self):
         self._sensor.add_client(self._add_hw_measurement)
+        #logging.info("ProbeEddySampler: __enter__")
         return self
     
     def __exit__(self, exc_type, exc_value, traceback):
+        #logging.info("ProbeEddySampler: __exit__")
         self._need_stop = True
 
     def _add_hw_measurement(self, msg):
         if self._need_stop:
-            del self._samples[:]
+            #logging.info(f"ProbeEddySampler: stopping in _add_hw_measurement")
             return False
         
+        #logging.info(f"ProbeEddySampler: adding {len(msg['data'])} samples ({msg['errors']} errors)")
         self._errors += msg['errors']
-        # make sure we store a copy here, no idea who owns the data
-        # data: [time, freq]
-        self._samples.append(list(msg['data']))
+        self._samples.extend(msg['data'])
         return True
 
     def finish(self):
         self._need_stop = True
 
     def get_samples(self):
-        return list(self._samples)
+        return self._samples.copy()
     
     def get_error_count(self):
         return self._errors
@@ -378,7 +469,7 @@ class ProbeEddyEndstopWrapper:
 
 @final
 class ToolheadMovementHelper:
-    def __init__(self, eddy: ProbeEddy):
+    def __init__(self, eddy: ProbeEddy, back_to_start: bool = False):
         self._eddy = eddy
         self._speed = eddy.params['probe_speed']
         self._printer = eddy._printer
@@ -386,16 +477,16 @@ class ToolheadMovementHelper:
         self._toolhead_kin = self._toolhead.get_kinematics()
         self._notes = []
         self._startpos = None
-        self._return = True
+        self._return = back_to_start
     
     def __enter__(self):
-        self._startpos = np.array(self._toolhead.get_position())
+        self._startpos = self._toolhead.get_position()
         return self
     
     def __exit__(self, exc_type, exc_value, traceback):
-        if self._return is not None:
-            self._toolhead.manual_move(self._startpos.tolist(), 5.0)
-            self._toolhead.wait_moves()
+        if self._return:
+            pos = self._startpos[:3]
+            self.move_to(*pos, speed=5.0)
 
     def no_return(self):
         self._return = False
@@ -407,6 +498,10 @@ class ToolheadMovementHelper:
         newpos = np.array(self._toolhead.get_position())
         newpos[:3] = [x, y, z]
         self._toolhead.set_position(newpos, homing_axes=(0, 1, 2))
+        curpos = np.array(self._toolhead.get_position())
+        # TODO just do the mapping but whatever
+        self._return = False
+        logging.info(f"set_absolute_position, th now at: {curpos}")
 
     def get_position(self):
         curpos = np.array(self._toolhead.get_position())
@@ -419,7 +514,9 @@ class ToolheadMovementHelper:
 
     def move_to(self, x: float, y: float, z: float):
         newpos = np.array(self._toolhead.get_position())
+        oldpos = newpos
         newpos[:3] = [x, y, z]
+        logging.info(f"move_to, manual_move to {newpos} from {oldpos}")
         self._toolhead.manual_move(newpos, self._speed)
         self._toolhead.wait_moves()
 
@@ -433,7 +530,7 @@ class ToolheadMovementHelper:
         newpos[2] = z
         self.move_to(*newpos)
 
-    def note_time_and_position(self, dwell: float = 0.200):
+    def note_time_and_position(self, dwell: float = 0.100):
         self._toolhead.wait_moves()
         time = self._toolhead.get_last_move_time()
         kin_z = self.get_kin_z()
