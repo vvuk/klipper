@@ -185,7 +185,6 @@ class ProbeEddy:
         self.offset = {
             "x": config.getfloat("x_offset", 0.0),
             "y": config.getfloat("y_offset", 0.0),
-            "z": config.getfloat("z_offset", 0.0),
         }
 
         self._fmap = ProbeEddyFrequencyMap(self)
@@ -221,7 +220,7 @@ class ProbeEddy:
         self._sensor._finish_measurements()
 
         height = self._fmap.freq_to_height(freq)
-        gcmd.respond_info(f"Last coil value: {freq:.2f} ({hex(freqval)} ({height:.3f}mm) @ status: {self._sensor.status_to_str(status)} {hex(status)}")
+        gcmd.respond_info(f"Last coil value: {freq:.2f} ({height:.3f}mm) (raw: {hex(freqval)} {self._sensor.status_to_str(status)} {hex(status)})")
 
     def read_current_freq_and_height(self):
         self._sensor._start_measurements()
