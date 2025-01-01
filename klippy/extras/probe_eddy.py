@@ -454,9 +454,11 @@ class ProbeEddy:
         probe_params = self._probe_session.get_probe_params(gcmd)
         sample_retract_dist = probe_params['sample_retract_dist']
         # retract to at least the home start height
-        if sample_retract_dist + self.params['home_trigger_height'] < self._home_start_height:
-            # 0.100 to give ourselves a bit of room to make sure we hit it, due to stepper precision
-            probe_params['sample_retract_dist'] = self._home_start_height - sample_retract_dist + 0.100
+        if sample_retract_dist + self.params['home_trigger_height'] < self._home_start_height + 0.500:
+            # give ourselves a bit of room to make sure we hit it, due to stepper precision;
+            # also because the toolhead will keep moving down before the probe trigger so it'll
+            # miss the home_trigger_height
+            probe_params['sample_retract_dist'] = self._home_start_height + 0.500 - self.params['home_trigger_height']
         return probe_params
 
     def start_probe_session(self, gcmd):
