@@ -99,8 +99,6 @@ class ProbeEddyFrequencyMap:
             if r2_htf < r2_tolerance or r2_fth < r2_tolerance:
                 gcmd.respond_raw("!! R^2 values are below tolerance; calibration may not be accurate.\n")
 
-        self.save_calibration()
-
         return (r2_fth, r2_htf)
 
 
@@ -301,8 +299,9 @@ class ProbeEddy:
         sample_pad = 0.050
 
         with ToolheadMovementHelper(self) as th:
-            # we're going to set the kinematic position to kin_height to make
-            # the following code easier, so it can assume z=0 is actually real zero
+            # We're going to set the kinematic position to kin_height to make
+            # the following code easier, so it can assume z=0 is actually real zero.
+            # The Eddy sensor calibration is done to nozzle height (not sensor height).
             th.set_absolute_position(*kin_pos)
 
             # away from bed, over nozzle position, then back to bed
@@ -310,6 +309,9 @@ class ProbeEddy:
             #th.move(-self.offset['x'], -self.offset['y'], 0)
 
             #  FIXME FIXME FIXME -- PUT THIS BACK! -- FIXME FIXME FIXME
+            # move the probe to where the nozzle was (i.e. where we set nozzle zero)
+            # TODO -- this might not actually matter. We're going to do tap,
+            # so we just need a "good enough"
             #th.move_by(-self.offset['x'], -self.offset['y'], 5.0)
             th.move_by(0, 0, 5.0)
             th.dwell(0.5)
@@ -344,14 +346,14 @@ class ProbeEddy:
             th.move_to_z(cal_z_max)
 
         # verify historical movements
+        # TODO -- figure out if get_kin_z(at=) actually gives useful values
         for th_past_time, th_recorded_z in toolhead_positions:
             th_past_z = th.get_kin_z(at=th_past_time)
-            logging.info(f"calibration: time: {th_past_time} z: {th_recorded_z:.3f} past_z: {th_past_z:.3f}")
+            logging.info(f"EDDY calibration: time: {th_past_time} z: {th_recorded_z:.3f} past_z: {th_past_z:.3f}")
 
         # the samples are a list of [print_time, freq] pairs.
         # in toolhead_positions, we have a list of [print_time, kin_z] pairs.
         samples = sampler.get_samples()
-        logging.info(f"samples:\n{samples}")
         movement_notes = th.notes()
 
         freqs = []
@@ -377,12 +379,11 @@ class ProbeEddy:
                     freqs.append(s_freq)
                     heights.append(n_z)
                     s_t, s_freq, _ = next(si)
-                
-                # move on to the next note range
         except StopIteration:
             pass
 
         data_file.close()
+        gcmd.respond_info(f"Wrote {len(samples)} samples to /tmp/eddy-samples.csv")
 
 #        for s_t, s_freq, _ in samples:
 #            logging.info(f"calibration: sample: {s_t} {s_freq:.2f}")
@@ -395,7 +396,7 @@ class ProbeEddy:
 #
 #                    logging.info(f"calibration: toolhead: {s_t} {s_freq:.2f} {n_z:.3f}")
 
-        gcmd.respond_info(f"Collected {len(samples)} samples, filtered to {len(freqs)}")
+        gcmd.respond_info(f"Collected {len(samples)} samples, filtered to {len(freqs)} for {len(movement_notes)} steps")
 
         if len(freqs) == 0:
             gcmd.respond_raw("!! No samples collected\n")
@@ -404,19 +405,12 @@ class ProbeEddy:
         # and build a map
         mapping = ProbeEddyFrequencyMap(self)
         r2_fth, r2_htf = mapping.calibrate_from_values(freqs, heights, gcmd)
+        mapping.save_calibration(gcmd)
         self._fmap = mapping
 
         gcmd.respond_info(f"Calibration complete, R^2: freq-to-height={r2_fth:.3f}, height-to-freq={r2_htf:.3f}")
 
-    # Virtual endstop
-    #def setup_pin(self, pin_type, pin_params):
-    #    if pin_type != "endstop" or pin_params["pin"] != "z_virtual_endstop":
-    #        raise pins.error("Probe virtual endstop only useful as endstop pin")
-    #    if pin_params["invert"] or pin_params["pullup"]:
-    #        raise pins.error("Can not pullup/invert probe virtual endstop")
-    #    return self._endstop_wrapper
-
-    # forward to the map
+    # helpers to forward to the map
     def height_to_freq(self, height: float, temp: float = None) -> float:
         return self._fmap.height_to_freq(height, temp)
     
@@ -442,7 +436,6 @@ class ProbeEddy:
             z_offset = self.get_offsets()[2]
             raise NotImplementedError("scan and rapid_scan not implemented")
             #return EddyScanningProbe(self.printer, self.sensor_helper, self.calibration, z_offset, gcmd)
-
         return self._probe_session.start_probe_session(gcmd)
     
     def get_status(self, eventtime):
@@ -781,60 +774,67 @@ class ProbeEddyEndstopWrapper:
         logging.info(f"EDDY probe_prepare ....................................")
         self.probe_to_start_position()
 
+    # This function attempts to raise the toolhead to HOME_PHYSICAL_HEIGHT_PROBE_START
+    # based on the sensor reading, if it's not already above that.
     def probe_to_start_position(self):
         logging.info(f"EDDY probe_to_start_position")
         if self._gather is None:
             raise Exception("probe_prepare called without multi_probe_begin")
 
+        # wait for the toolhead to finish any in-progress moves -- for example,
+        # there may already be a homing z-hop    
         toolhead = self.eddy._printer.lookup_object('toolhead')
         toolhead.wait_moves()
 
         logging.info(f"EDDY gather started: {self._gather._started}")
 
+        # Wait for some new samples to show up. We might get all error samples,
+        # which is OK; assume those are too-high out of range
+        # TODO: only track appropriate amplitude too low errors
         if not self._gather.wait_for_new_samples(max_wait_time=1.0):
             if self._gather.get_error_count() == 0:
                 raise self.eddy._printer.command_error("Waited for new samples and got no samples");
 
-        last_height = self._gather.get_last_height()
-        logging.info(f"EDDY probe_to_start_position: last_height {last_height:.3f}")
-        # we're going to assume if it's "None" that means all the samples were in error
+        # grab the last probed height. we don't need a highly accurate value,
+        # so just the last one will do
+        height = self._gather.get_last_height()
+
+        logging.info(f"EDDY probe_to_start_position: height {height:.3f}")
+        # if last_height is None, 
         # and we can just assume it's "high enough"
-        if last_height is None:
+        if height is None:
             logging.info(f"EDDY probe_to_start_position: last_height is None, error count should be >0: {self._gather.get_error_count()}")
             return
 
-        z_increase = HOME_PHYSICAL_HEIGHT_PROBE_START - last_height
+        z_increase = HOME_PHYSICAL_HEIGHT_PROBE_START - height
         if z_increase <= 0:
             # we don't need to increase z, we're already above our physical start height
             return
 
-        logging.info("#"*80)
-        curtime = self.eddy._printer.get_reactor().monotonic()
-        self.eddy._printer.get_reactor().pause(curtime + 10.000)
-
+        curtime = self._reactor.monotonic()
         th_pos = toolhead.get_position()
         kin_status = toolhead.get_kinematics().get_status(curtime)
         z_homed = 'z' in kin_status['homed_axes']
 
         logging.info(f"EDDY toolhead z_homed: {z_homed}, cur toolhead z: {th_pos[2]:.3f} z_increase: {z_increase:.3f}")
-        if not z_homed:
-            logging.info(f"EDDY Z not homed, assuming someone already hopped")
-            return
+        raise self.eddy._printer.command_error("Probe too low to home; implement a z-hop before homing")
+        ##if not z_homed:
+            ##logging.info(f"EDDY Z not homed, assuming someone already hopped")
+            ##return
 
-        # I don't know if I'm allowed to manipulate the toolhead position here,
-        # but I know I want it to be "z_increase" higher
+        ### I don't know if I'm allowed to manipulate the toolhead position here,
+        ### but I know I want it to be "z_increase" higher
 
-        # tell the toolhead it's "z_increase" lower, minus a bit to make sure
-        # we can raise to the coordinate
-        new_th_pos = [th_pos[0], th_pos[1], th_pos[2] - z_increase - 0.025, th_pos[3]]
-        logging.info(f"Setting new_th_pos {new_th_pos}")
-        toolhead.set_position(new_th_pos, homing_axes=(2,))
+        ### tell the toolhead it's "z_increase" lower, minus a bit to make sure
+        ### we can raise to the coordinate
+        ##new_th_pos = [th_pos[0], th_pos[1], th_pos[2] - z_increase - 0.025, th_pos[3]]
+        ##logging.info(f"Setting new_th_pos {new_th_pos}")
+        ##toolhead.set_position(new_th_pos, homing_axes=(2,))
 
-        # then move up to the original coordinate
-        toolhead.manual_move([None, None, th_pos[2] - 0.025], 5.0)
-        toolhead.wait_moves()
-        logging.info(f"done probe_to_start_position")
-
+        ### then move up to the original coordinate
+        ##toolhead.manual_move([None, None, th_pos[2] - 0.025], 5.0)
+        ##toolhead.wait_moves()
+        ##logging.info(f"done probe_to_start_position")
 
     def probe_finish(self, hmove):
         logging.info(f"EDDY probe_finish ....................................")
