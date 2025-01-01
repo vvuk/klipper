@@ -766,37 +766,19 @@ class ProbeEddyEndstopWrapper:
         logging.info(f"EDDY performing phoming.probing_move: {pos} {speed}")
         phoming = self.eddy._printer.lookup_object('homing')
         trigger_position = phoming.probing_move(self, pos, speed)
-        # if we don't have a trigger time, just return the position. Otherwise we can
-        # do better, and pull the height from the time
-        logging.info(f"EDDY probing_move finished: trigger_position {trigger_position} trigger_time {self._trigger_time}")
 
+        logging.info(f"EDDY probing_move finished: trigger_position {trigger_position} trigger_time {self._trigger_time}")
         if not self._trigger_time:
             raise self.eddy._printer.command_error("Somehow finished probing_move without a trigger_time?")
 
-        return trigger_position
+        # We know we should have triggered at exactly height=2.0 (home_trigger_height),
+        # but because of the averaging that we do on the probe, we probably overshot it
+        # a little bit. But we have the raw data, so we can figure out by how much, and
+        # adjust the trigger position here.
 
-        toolhead = self.eddy._printer.lookup_object('toolhead')
-        toolhead_pos = toolhead.get_position()
-        toolhead_z_at_trigger = get_toolhead_kin_z(toolhead, at=self._trigger_time)
-
-        logging.info(f"EDDY probing_move after: toolhead_pos {toolhead_pos[2]:.3f} " + \
-                     f"toolhead_z_at_trigger_time {toolhead_z_at_trigger:.3f}")
-
-        toolhead_pos[2] = toolhead_z_at_trigger
-        return toolhead_pos
-
-        # probing_move is just to get us to the ballpark.
-        # expectation is to probe the static position and then set Z from that.
-        # TODO: just do that here?
-
-        # the probe says that it triggered at trigger_time, but it has a
-        # settle time -- so start averaging slightly before that point
-        # and a few settle points after that to try to find the toolhead height
-        # TODO -- actually measure and quantify this somehow
         start_time = self._trigger_time - LDC1612_SETTLETIME
-        end_time = self._trigger_time + LDC1612_SETTLETIME*10
-
-        wait_success = self._gather.wait_for_sample_at_time(end_time, max_wait_time=1.000)
+        end_time = self._trigger_time + LDC1612_SETTLETIME*3
+        wait_success = self._gather.wait_for_sample_at_time(end_time, max_wait_time=0.250)
         if not wait_success:
             raise self.eddy._printer.command_error("Waited for probe trigger end time in samples, but didn't find it within timeout!")
 
@@ -804,23 +786,12 @@ class ProbeEddyEndstopWrapper:
         if height is None:
             raise self.eddy._printer.command_error("Probe trigger time not found in samples! (Shoudn't happen)")
 
-        hstart = self._gather.find_closest_height_at_time(start_time)
-        hend = self._gather.find_closest_height_at_time(end_time)
-
-        logging.info(f"EDDY probing_move: found height {height:.3f} in time range [{start_time:.3f}-{end_time:.3f}] (height range [{hstart:.3f}-{hend:.3f}])")
-
-        if abs(height - toolhead_at_trigger) > 1.150:
-            raise self.eddy._printer.command_error(f"Probe trigger height {height:.3f} differs from toolhead height {toolhead_pos[2]:.3f} by significant amount")
-
-        # probe_eddy_current has this logic, that I don't understand. We have
-        # an accurate probe height at the trigger time.
-        ### Callers expect position relative to z_offset, so recalculate
-        ###bed_deviation = toolhead_at_trigger[2] - height
-        ###toolhead_at_trigger[2] -= bed_deviation
-        ###logging.info(f"EDDY bed_deviation: {bed_deviation:.3f}, final toolhead_pos: {toolhead_pos[2]:.3f}")
-
-        toolhead_pos[2] = height
-        return toolhead_pos
+        # We claim that trigger_position[2] is truly height = 2.0,
+        # but instead it's the offset above higher; adjust.
+        trigger_offset = self._home_trigger_height - height
+        trigger_position[2] += trigger_offset
+        logging.info(f"EDDY: pulled trigger height {height:.3f} (offset {trigger_offset:.3f}): new z: {trigger_position[2]:.3f}")
+        return trigger_position
 
     def probe_prepare(self, hmove):
         logging.info(f"EDDY probe_prepare ....................................")
