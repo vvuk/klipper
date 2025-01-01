@@ -131,6 +131,12 @@ class ProbeEddy:
         gcode.register_command("PROBE_EDDY_QUERY", self.cmd_QUERY)
         gcode.register_command("PROBE_EDDY_CALIBRATE", self.cmd_CALIBRATE)
         gcode.register_command("PROBE_EDDY_PROBE_STATIC", self.cmd_PROBE_STATIC)
+        gcode.register_command("PROBE_EDDY_TAP", self.cmd_TAP)
+
+        # some handy aliases while I'm debugging things to save my fingers
+        gcode.register_command("PEPS", self.cmd_PROBE_STATIC)
+        gcode.register_command("PEQUERY", self.cmd_QUERY)
+        gcode.register_command("PETAP", self.cmd_TAP)
 
     # helpers to forward to the map
     def height_to_freq(self, height: float, temp: float = None) -> float:
@@ -370,8 +376,8 @@ class ProbeEddy:
         method = gcmd.get('METHOD', 'automatic').lower()
         if method in ('scan', 'rapid_scan'):
             #z_offset = self.get_offsets()[2]
-            session = ProbeEddyScanningProbe(self)
-            session.start()
+            session = ProbeEddyScanningProbe(self, gcmd)
+            session.start_session()
             return session
 
         return self._probe_session.start_probe_session(gcmd)
@@ -382,6 +388,9 @@ class ProbeEddy:
         return status
     
     # Tap move
+    def cmd_TAP(self, gcmd: GCodeCommand):
+        pass
+
     def tapping_move(self, gcmd: GCodeCommand):
         TAP_MOVE_SPEED=10.0
         th = self._printer.lookup_object('toolhead')
@@ -452,6 +461,16 @@ class ProbeEddy:
         if len(errors) > 0:
             raise self._printer.command_error(f"Error during tapping move: {', '.join(errors)}")
 
+        gather.finish()
+        samples = gather.get_samples()
+
+        with open("/tmp/tap-samples.csv", "w") as data_file:
+            data_file.write(f"time,frequency,z\n")
+            for s_t, s_freq, s_z in samples:
+                data_file.write(f"{s_t},{s_freq},{s_z}\n")
+        
+        gcmd.respond_info(f"Wrote {len(samples)} samples to /tmp/tap-samples.csv")
+
 
 
 #
@@ -507,6 +526,10 @@ class ProbeEddyScanningProbe:
             # Flush lookahead (so all lookahead callbacks are invoked)
             self._toolhead.get_last_move_time()
 
+        # make sure we get the sample for the final move
+        self._gather.wait_for_sample_at_time(self._notes[-1][0] + self._sample_time)
+        self._gather.finish()
+
         # the results of this pull_probed are an array of full toolhead positions,
         # one for each sample time range
         results = []
@@ -522,7 +545,7 @@ class ProbeEddyScanningProbe:
 
         # Allow axis_twist_compensation to update results
         for epos in results:
-            self._printer.send_event("probe:update_results", epos)
+            self.eddy._printer.send_event("probe:update_results", epos)
         return results
 
     def end_probe_session(self):
@@ -759,7 +782,7 @@ class ProbeEddyEndstopWrapper:
 # Helper to gather samples and convert them to probe positions
 @final
 class ProbeEddySampler:
-    def __init__(self, eddy: ProbeEddy):
+    def __init__(self, eddy: ProbeEddy, trace=False):
         self.eddy = eddy
         self._sensor = eddy._sensor
         self._reactor = self.eddy._printer.get_reactor()
@@ -770,6 +793,7 @@ class ProbeEddySampler:
         self._stopped = False
         self._started = False
         self._errors = 0
+        self._trace = trace
 
         # this will hold samples with a height filled in
         self._samples = None
@@ -889,12 +913,14 @@ class ProbeEddySampler:
 
         self._update_samples()
 
-        logging.info(f"find_height_at_time: searching between {start_time:.3f} and {end_time:.3f}")
+        if self._trace:
+            logging.info(f"find_height_at_time: searching between {start_time:.3f} and {end_time:.3f}")
         if len(self._samples) == 0:
             logging.info(f"    zero samples!")
             return None
 
-        logging.info(f"find_height_at_time: {len(self._samples)} samples, time range {self._samples[0][0]:.3f} to {self._samples[-1][0]:.3f}")
+        if self._trace:
+            logging.info(f"find_height_at_time: {len(self._samples)} samples, time range {self._samples[0][0]:.3f} to {self._samples[-1][0]:.3f}")
 
         # find the first sample that is >= start_time
         start_idx = bisect.bisect_left([t for t, _, _ in self._samples], start_time)
@@ -913,7 +939,8 @@ class ProbeEddySampler:
         hmin, hmax = np.min(heights), np.max(heights)
         mean = np.mean(heights)
         median = np.median(heights)
-        logging.info(f"find_height_at_time: {len(heights)} samples, mean: {mean:.3f} median: {median:.3f} (range {hmin:.3f}-{hmax:.3f})")
+        if self._trace:
+            logging.info(f"find_height_at_time: {len(heights)} samples, mean: {mean:.3f} median: {median:.3f} (range {hmin:.3f}-{hmax:.3f})")
 
         return float(median)
 
