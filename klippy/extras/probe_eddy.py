@@ -30,7 +30,6 @@ from .ldc1612 import SETTLETIME as LDC1612_SETTLETIME
 # How many seconds from the start of probing must we be below the
 # trigger start frequency (above the start homing height)
 HOME_TRIGGER_START_TIME_OFFSET = 0.200
-HOME_PHYSICAL_HEIGHT_PROBE_START = 5.000
 
 @final
 class ProbeEddyFrequencyMap:
@@ -164,9 +163,9 @@ class ProbeEddy:
             'backlash_comp': 0.5,
 
             # what height to trigger homing at
-            'home_trigger_z': 2.0,
-            # What height above home_trigger_z to allow homing to start
-            'home_trigger_z_start_offset': 1.5,
+            'home_trigger_height': 2.0,
+            # What height above home_trigger_height to allow homing to start
+            'home_trigger_height_start_offset': 1.5,
             'trigger_freq_slop': 0.006,
 
             'calibration_z_max': 5.0,
@@ -179,6 +178,11 @@ class ProbeEddy:
             else:
                 self.params[k] = config.getfloat(k, self.params[k])
 
+        self._validate_params()
+
+        # at what minimum physical height to start homing
+        self._home_start_height = self.params['calibration_z_max']
+
         # physical offsets between probe and nozzle
         self.offset = {
             "x": config.getfloat("x_offset", 0.0),
@@ -190,20 +194,38 @@ class ProbeEddy:
 
         self._endstop_wrapper = ProbeEddyEndstopWrapper(self)
 
-        # the virtual z endstop pin
-        #self._printer.lookup_object('pins').register_chip('probe', self)
-
         # We are a "PrinterProbe". We use some existing helpers.
         # ProbeSessionHelper creates a HomingViaProbeHelper which registers the probe
-        # z endstop pin. They all connect to _endstop_wrapper, which is the "mcu_probe"
+        # z endstop pin. They all connect to _endstop_wrapper, which is the "mcu_probe".
         self._probe_session = probe.ProbeSessionHelper(config, self._endstop_wrapper)
+        logging.info(f"EDDY probe_session: {self._probe_session}")
         self._printer.add_object('probe', self)
 
+        # update some local param copies. We need to do this after creating a ProbeSessionHelper,
+        # because it pulls some things from the probe_params
+        self._endstop_wrapper.pull_params()
+
+        # define PROBE, PROBE_ACCURACY, etc.
         self._cmd_helper = probe.ProbeCommandHelper(config, self, self._endstop_wrapper.query_endstop)
 
+        # define our own commands
         gcode = self._printer.lookup_object('gcode')
         self.define_commands(gcode)
-    
+
+    def _validate_params(self):
+        home_trigger_height = self.params['home_trigger_height']
+        home_trigger_height_start_offset = self.params['home_trigger_height_start_offset']
+        calibration_z_max = self.params['calibration_z_max']
+
+        # verify a few things
+        if home_trigger_height < 0.0:
+            raise self._printer.config_error("home_trigger_height must be >= 0 (and really should be > 1)")
+        if home_trigger_height_start_offset < 0.5:
+            raise self._printer.config_error("home_trigger_height_start_offset must be >= 0.5")
+        req_cal_z_max = home_trigger_height_start_offset + 2*home_trigger_height_start_offset
+        if calibration_z_max < req_cal_z_max:
+            raise self._printer.config_error(f"calibration_z_max must be at least 2*home_trigger_height_start_offset+home_trigger_height (2*{home_trigger_height_start_offset:.3f}+{home_trigger_height_start_offset:.3f}={req_cal_z_max:.3f})")
+
     def define_commands(self, gcode):
         gcode.register_command("PROBE_EDDY_QUERY", self.cmd_QUERY)
         gcode.register_command("PROBE_EDDY_CALIBRATE", self.cmd_CALIBRATE)
@@ -305,13 +327,14 @@ class ProbeEddy:
             th.set_absolute_position(*kin_pos)
 
             # away from bed, over nozzle position, then back to bed
-            #th.move(0, 0, 5.0)
-            #th.move(-self.offset['x'], -self.offset['y'], 0)
 
             #  FIXME FIXME FIXME -- PUT THIS BACK! -- FIXME FIXME FIXME
             # move the probe to where the nozzle was (i.e. where we set nozzle zero)
             # TODO -- this might not actually matter. We're going to do tap,
             # so we just need a "good enough"
+            #th.move(0, 0, 5.0)
+            #th.move(-self.offset['x'], -self.offset['y'], 0)
+            # or in one go:
             #th.move_by(-self.offset['x'], -self.offset['y'], 5.0)
             th.move_by(0, 0, 5.0)
             th.dwell(0.5)
@@ -425,10 +448,16 @@ class ProbeEddy:
     # it's not clear at all to me what the relationships are between all of these.
     # PrinterProbe is what `probe` typically is, so we're instead emulating it here.
     def get_offsets(self):
-        return self.offset["x"], self.offset["y"], self.params['home_trigger_z']
+        return self.offset["x"], self.offset["y"], self.params['home_trigger_height']
     
     def get_probe_params(self, gcmd=None):
-        return self._probe_session.get_probe_params(gcmd)
+        probe_params = self._probe_session.get_probe_params(gcmd)
+        sample_retract_dist = probe_params['sample_retract_dist']
+        # retract to at least the home start height
+        if sample_retract_dist + self.params['home_trigger_height'] < self._home_start_height:
+            # 0.100 to give ourselves a bit of room to make sure we hit it, due to stepper precision
+            probe_params['sample_retract_dist'] = self._home_start_height - sample_retract_dist + 0.100
+        return probe_params
 
     def start_probe_session(self, gcmd):
         method = gcmd.get('METHOD', 'automatic').lower()
@@ -440,7 +469,7 @@ class ProbeEddy:
     
     def get_status(self, eventtime):
         status = self._cmd_helper.get_status(eventtime)
-        status.update({ 'name': self._full_name, 'home_trigger_z': self.params['home_trigger_z'] })
+        status.update({ 'name': self._full_name, 'home_trigger_height': self.params['home_trigger_height'] })
         return status
 
 
@@ -611,7 +640,12 @@ class ProbeEddyEndstopWrapper:
         self._dispatch = mcu.TriggerDispatch(self._mcu)
         self._trigger_time = 0.
 
-        self._home_trigger_z = eddy.params['home_trigger_z']
+    def pull_params(self):
+        self._home_trigger_height = self.eddy.params['home_trigger_height']
+        self._home_trigger_height_start_offset = self.eddy.params['home_trigger_height_start_offset']
+        self._home_start_height = self.eddy._home_start_height
+        self._probe_speed = self.eddy.get_probe_params()['probe_speed']
+        self._lift_speed = self.eddy.get_probe_params()['lift_speed']
 
     # these are the "MCU Probe" methods
     def get_mcu(self):
@@ -629,10 +663,8 @@ class ProbeEddyEndstopWrapper:
         ## XXX FIXME -- +2.0 for debugging so I don't crash the toolhead
         debug_offset = 0.0
 
-        trigger_height = self.eddy.params['home_trigger_z'] + debug_offset
-        trigger_start_offset = self.eddy.params['home_trigger_z_start_offset']
-
-        start_height = trigger_height + trigger_start_offset
+        trigger_height = self._home_trigger_height + debug_offset
+        start_height = trigger_height + self._home_trigger_height_start_offset
 
         trigger_freq = self.eddy.height_to_freq(trigger_height)
         start_freq = self.eddy.height_to_freq(start_height)
@@ -649,15 +681,13 @@ class ProbeEddyEndstopWrapper:
         return trigger_completion
 
     def get_position_endstop(self):
-        return self._home_trigger_z
+        return self._home_trigger_height
 
     def home_wait(self, home_end_time):
         #logging.info(f"EDDY home_wait {home_end_time} cur {curtime} ept {est_print_time} ehe {est_he_time}")
         self._dispatch.wait_end(home_end_time)
 
-        #logging.info(f"EDDY calling clear_home")
-
-        # reset homing setup
+        # make sure homing is stopped, and grab the trigger_time from the mcu
         trigger_time = self._sensor.clear_home()
         logging.info(f"EDDY clear_home trigger_time {trigger_time} (mcu: {self._mcu.print_time_to_clock(trigger_time)})")
 
@@ -689,7 +719,7 @@ class ProbeEddyEndstopWrapper:
             return True
 
         _, height = self.eddy.read_current_freq_and_height()
-        return height < self._home_trigger_z
+        return height < self._home_trigger_height
 
     # these are the ProbeEndstopWrapper methods
 
@@ -707,17 +737,17 @@ class ProbeEddyEndstopWrapper:
     # Return the full toolhead position where the probe triggered....
     # ... or where the toolhead is now?
     def probing_move(self, pos, speed):
-        logging.info(f"EDDY probing_move: {pos} {speed}")
+        logging.info(f"EDDY performing phoming.probing_move: {pos} {speed}")
         phoming = self.eddy._printer.lookup_object('homing')
         trigger_position = phoming.probing_move(self, pos, speed)
         # if we don't have a trigger time, just return the position. Otherwise we can
         # do better, and pull the height from the time
-        logging.info(f"EDDY probing_move: trigger_position {trigger_position} trigger_time {self._trigger_time}")
+        logging.info(f"EDDY probing_move finished: trigger_position {trigger_position} trigger_time {self._trigger_time}")
         if not self._trigger_time:
-            return trigger_position
+            raise self.eddy._printer.command_error("Somehow finished probing_move without a trigger_time?")
 
         # probing_move is just to get us to the ballpark.
-        # expectation is to probe the static position and then set Z position.
+        # expectation is to probe the static position and then set Z from that.
         # TODO: just do that here?
         return trigger_position
 
@@ -749,7 +779,7 @@ class ProbeEddyEndstopWrapper:
         logging.info(f"EDDY probe_prepare ....................................")
         self.probe_to_start_position()
 
-    # This function attempts to raise the toolhead to HOME_PHYSICAL_HEIGHT_PROBE_START
+    # This function attempts to raise the toolhead to self.eddy._home_start_height
     # based on the sensor reading, if it's not already above that.
     def probe_to_start_position(self):
         logging.info(f"EDDY probe_to_start_position")
@@ -773,43 +803,39 @@ class ProbeEddyEndstopWrapper:
         # grab the last probed height. we don't need a highly accurate value,
         # so just the last one will do
         height = self._gather.get_last_height()
-
-        logging.info(f"EDDY probe_to_start_position: height {height:.3f}")
-        # if last_height is None, 
-        # and we can just assume it's "high enough"
         if height is None:
+            # if last_height is None, we got some errors and we can just assume we're "high enough"
+            # TODO -- I don't love this. There is a chance this would crash the toolhead if we had some
+            # other kind of errors, and we'd still start a probing move. However, the homing hardware
+            # implementation will at least only ignore over-amplitude errors.
             logging.info(f"EDDY probe_to_start_position: last_height is None, error count should be >0: {self._gather.get_error_count()}")
             return
 
-        z_increase = HOME_PHYSICAL_HEIGHT_PROBE_START - height
+        logging.info(f"EDDY probe_to_start_position: current height {height:.3f}")
+        z_increase = self.eddy._home_start_height - height
         if z_increase <= 0:
             # we don't need to increase z, we're already above our physical start height
             return
 
+        # We need to move up by z_increase.
         curtime = self._reactor.monotonic()
         th_pos = toolhead.get_position()
+        toolhead_kin = toolhead.get_kinematics()
         kin_status = toolhead.get_kinematics().get_status(curtime)
         z_homed = 'z' in kin_status['homed_axes']
+        axis_max_z = kin_status['axis_maximum'].z
 
-        logging.info(f"EDDY toolhead z_homed: {z_homed}, cur toolhead z: {th_pos[2]:.3f} z_increase: {z_increase:.3f}")
-        raise self.eddy._printer.command_error("Probe too low to home; implement a z-hop before homing")
-        ##if not z_homed:
-            ##logging.info(f"EDDY Z not homed, assuming someone already hopped")
-            ##return
+        logging.info(f"EDDY toolhead z_homed: {z_homed}, cur toolhead z: {th_pos[2]:.3f} z_increase: {z_increase:.3f} max_z {axis_max_z:.3f}")
 
-        ### I don't know if I'm allowed to manipulate the toolhead position here,
-        ### but I know I want it to be "z_increase" higher
+        # if we're not z-homed, then ask the user to add a z-hop to their homing sequence.
+        # TODO -- we could just hop here.
+        if not z_homed or th_pos[2] >= axis_max_z:
+            raise self.eddy._printer.command_error("Z not homed and probe too low to home; implement a z-hop before homing")
 
-        ### tell the toolhead it's "z_increase" lower, minus a bit to make sure
-        ### we can raise to the coordinate
-        ##new_th_pos = [th_pos[0], th_pos[1], th_pos[2] - z_increase - 0.025, th_pos[3]]
-        ##logging.info(f"Setting new_th_pos {new_th_pos}")
-        ##toolhead.set_position(new_th_pos, homing_axes=(2,))
-
-        ### then move up to the original coordinate
-        ##toolhead.manual_move([None, None, th_pos[2] - 0.025], 5.0)
-        ##toolhead.wait_moves()
-        ##logging.info(f"done probe_to_start_position")
+        th_pos[2] += z_increase
+        toolhead.manual_move(th_pos, self.eddy.params['probe_speed'])
+        toolhead.wait_moves()
+        logging.info(f"EDDY probe_to_start_position: moved toolhead up by {z_increase:.3f} to {th_pos[2]:.3f}")
 
     def probe_finish(self, hmove):
         logging.info(f"EDDY probe_finish ....................................")
