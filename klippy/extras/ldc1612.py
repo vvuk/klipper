@@ -91,7 +91,8 @@ class LDC1612:
         self.printer = config.get_printer()
         self.calibration = calibration
         self.dccal = DriveCurrentCalibrate(config, self)
-        self.data_rate = 250
+        self.data_rate = config.getint("samples_per_second", 250, minval=50)
+        self._ema_weight = config.getfloat("exp_moving_average_weight", HOMING_AVERAGE_WEIGHT, minval=0.0, maxval=1.0)
         self._start_count = 0
         # Setup mcu sensor_ldc1612 bulk query code
         self.i2c = bus.MCU_I2C_from_config(config,
@@ -112,12 +113,12 @@ class LDC1612:
         else:
             mcu.add_config_cmd("config_ldc1612 oid=%d i2c_oid=%d"
                                % (oid, self.i2c.get_oid()))
-        factor = int((1. - HOMING_AVERAGE_WEIGHT) * EMA_BASE + 0.5)
-        factor = min(EMA_BASE - 1, max(0, factor))
-        mcu.add_config_cmd("ldc1612_setup_averaging oid=%d factor=%d"
-                           % (oid, factor))
-        mcu.add_config_cmd("ldc1612_start_stop oid=%d rest_ticks=0"
-                           % (oid,), on_restart=True)
+        factor = 0
+        if self._ema_weight > 0.0:
+            factor = int((1. - self._ema_weight) * EMA_BASE + 0.5)
+            factor = min(EMA_BASE - 1, max(0, factor))
+        mcu.add_config_cmd("ldc1612_setup_averaging oid=%d factor=%d" % (oid, factor))
+        mcu.add_config_cmd("ldc1612_start_stop oid=%d rest_ticks=0" % (oid,), on_restart=True)
         mcu.register_config_callback(self._build_config)
         # Bulk sample message reading
         chip_smooth = self.data_rate * BATCH_UPDATES * 2
@@ -218,7 +219,7 @@ class LDC1612:
         t_freqvl = self.to_ldc_freqval(trigger_freq)
         s_freqval = self.to_ldc_freqval(start_freq)
         start_time_mcu = self.mcu.print_time_to_clock(start_time)
-        logging.info(f"LD1612 setup_home2: trigger: {trigger_freq:.2f} ({hex(t_freqvl)}) start: {start_freq:.2f} ({hex(s_freqval)}) @ {start_time:.2f} trsync: {trsync_oid} {hit_reason} {reason_base}")
+        logging.info(f"LD1612 setup_home2: trigger: {trigger_freq:.2f} ({t_freqvl}) start: {start_freq:.2f} ({s_freqval}) @ {start_time:.2f} trsync: {trsync_oid} {hit_reason} {reason_base}")
         self.ldc1612_setup_home2_cmd.send([self.oid, trsync_oid, hit_reason,
                                            reason_base, t_freqvl, s_freqval, start_time_mcu])
 

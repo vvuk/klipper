@@ -108,7 +108,6 @@ class HomingMove:
         move_end_print_time = self.toolhead.get_last_move_time()
         for mcu_endstop, name in self.endstops:
             try:
-                logging.info(f"HOMING: home_wait {move_end_print_time}")
                 trigger_time = mcu_endstop.home_wait(move_end_print_time)
             except self.printer.command_error as e:
                 if error is None:

@@ -33,6 +33,15 @@ enum {
 
 #define SAMPLE_ERROR(data) ((data) >> 28)
 
+// match data_rate in ldc1612.py
+// at 250, this is 4ms per sample: at 5mm/sec probe speed, probe could move 0.02mm in between samples
+// at 1000, (1ms/sample) this is 0.0025mm movement per sample; much better. 
+//#define SAMPLES_PER_SEC 1000
+
+// how many values to use for a simple average. Must be less than 16, because that's how many bits we
+// have left to avoid 64-bit math
+#define SIMPLE_AVG_VALUE_COUNT 16
+
 struct ldc1612 {
     struct timer timer;
     uint32_t rest_ticks;
@@ -65,6 +74,10 @@ struct ldc1612 {
     int32_t hadj[HCOUNT];
 
     // homing2
+    uint32_t last_values[SIMPLE_AVG_VALUE_COUNT];
+    uint32_t last_values_next_i;
+    uint32_t simple_average;
+
     uint32_t homing_start_freq; // if below this, we will ignore homing
     uint32_t homing_trigger_freq; // trigger frequency
     uint32_t homing_start_time; // we need to hit homing_start_freq at or after this time
@@ -104,8 +117,10 @@ command_config_ldc1612(uint32_t *args)
 {
     struct ldc1612 *ld = oid_alloc(args[0], command_config_ldc1612
                                    , sizeof(*ld));
+
     ld->timer.func = ldc1612_event;
     ld->i2c = i2cdev_oid_lookup(args[1]);
+    ld->ema_factor = 0;
 }
 DECL_COMMAND(command_config_ldc1612, "config_ldc1612 oid=%c i2c_oid=%c");
 
@@ -146,6 +161,9 @@ command_ldc1612_setup_home2(uint32_t *args)
     ld->homing_start_freq = start_freq;
     ld->homing_trigger_freq = trigger_freq;
     ld->homing_start_time = start_time;
+
+    memset(ld->last_values, 0, sizeof(ld->last_values));
+    ld->last_values_next_i = 0;
 
     ld->homing_flags = LH_HOME2 | LH_AWAIT_HOMING | LH_CAN_TRIGGER;
     dprint("ZZZ home2 sf=%u tf=%u", start_freq, trigger_freq);
@@ -263,6 +281,19 @@ notify_trigger(struct ldc1612 *ld, uint32_t time, uint8_t reason)
 static void
 update_sensor_average(struct ldc1612 *ld, uint32_t data)
 {
+    // Update simple average
+    uint32_t *last_values = ld->last_values;
+    last_values[ld->last_values_next_i++] = data;
+    if (ld->last_values_next_i == SIMPLE_AVG_VALUE_COUNT)
+        ld->last_values_next_i = 0;
+
+    uint32_t simple_avg = 0;
+    for (int i = 0; i < SIMPLE_AVG_VALUE_COUNT; i++)
+        simple_avg += last_values[i];
+
+    ld->simple_average = DIV_ROUND_CLOSEST(simple_avg, SIMPLE_AVG_VALUE_COUNT);
+
+    // update EMA
     uint32_t ema_factor = ld->ema_factor;
 
     if (ema_factor == 0) {
@@ -315,8 +346,14 @@ check_home2(struct ldc1612* ld, uint32_t data)
     uint32_t avg = ld->sensor_average;
 
     //dprint("data=%u avg %u", data, avg);
-    if (avg > ld->homing_trigger_freq)
+    if (avg > ld->homing_trigger_freq) {
         notify_trigger(ld, time, ld->trigger_reason);
+        dprint("ZZZ trig t=%u f=%u d=%u q=%u", time, avg, data, ld->simple_average);
+        uint32_t* lv = ld->last_values;
+        uint32_t li = ld->last_values_next_i;
+        dprint("ZZZ %u %u %u %u", lv[(li+0)&0xf], lv[(li+1)&0xf], lv[(li+2)&0xf], lv[(li+3)&0xf]);
+        dprint("ZZZ %u %u %u %u", lv[(li+4)&0xf], lv[(li+5)&0xf], lv[(li+6)&0xf], lv[(li+7)&0xf]);
+    }
 }
 
 // Check if a sample should trigger a homing event
