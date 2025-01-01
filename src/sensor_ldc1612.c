@@ -351,8 +351,10 @@ check_home2(struct ldc1612* ld, uint32_t data)
         dprint("ZZZ trig t=%u f=%u d=%u q=%u", time, avg, data, ld->simple_average);
         uint32_t* lv = ld->last_values;
         uint32_t li = ld->last_values_next_i;
-        dprint("ZZZ %u %u %u %u", lv[(li+0)&0xf], lv[(li+1)&0xf], lv[(li+2)&0xf], lv[(li+3)&0xf]);
-        dprint("ZZZ %u %u %u %u", lv[(li+4)&0xf], lv[(li+5)&0xf], lv[(li+6)&0xf], lv[(li+7)&0xf]);
+        //for (int q = 0; q < 4; q++) {
+            int off = 12; //q*4;
+            dprint("ZZZ %u %u %u %u", lv[(li+off)&0xf], lv[(li+off+1)&0xf], lv[(li+off+2)&0xf], lv[(li+off+3)&0xf]);
+        //}
     }
 }
 

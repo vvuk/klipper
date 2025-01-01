@@ -448,6 +448,8 @@ class ProbeEddy:
     # it's not clear at all to me what the relationships are between all of these.
     # PrinterProbe is what `probe` typically is, so we're instead emulating it here.
     def get_offsets(self):
+        # the z offset is the trigger height, because the probe will trigger
+        # at z=trigger_height (not at z=0)
         return self.offset["x"], self.offset["y"], self.params['home_trigger_height']
     
     def get_probe_params(self, gcmd=None):
@@ -560,8 +562,8 @@ class ProbeEddySampler:
         if sample_print_time > wait_start_time:
             max_wait_time = max_wait_time + (sample_print_time - wait_start_time)
 
-        logging.info(f"ProbeEddyFrequencySampler: waiting for sample at {sample_print_time:.3f}")
-        while len(self._samples) == 0 or self._samples[-1][0] < sample_print_time:
+        logging.info(f"ProbeEddyFrequencySampler: waiting for sample at {sample_print_time:.3f} (now: {wait_start_time:.3f}, max_wait_time: {max_wait_time:.3f})")
+        while len(self._raw_samples) == 0 or self._raw_samples[-1][0] < sample_print_time:
             now = self._mcu.estimated_print_time(self._reactor.monotonic())
             if now - wait_start_time > max_wait_time:
                 return False
@@ -590,6 +592,14 @@ class ProbeEddySampler:
         
         return True
 
+    def find_closest_height_at_time(self, time):
+        self._update_samples()
+        if len(self._samples) == 0:
+            return None
+        # find the closest sample to the given time
+        idx = np.argmin([abs(t - time) for t, _, _ in self._samples])
+        return self._samples[idx][2]
+
     def find_height_at_time(self, start_time, end_time):
         if end_time < start_time:
             raise ValueError("find_height_at_time: end_time is before start_time")
@@ -600,7 +610,8 @@ class ProbeEddySampler:
         if len(self._samples) == 0:
             logging.info(f"    zero samples!")
             return None
-        logging.info(f"find_height_at_time: {len(self._samples)} samples, range {self._samples[0][0]:.3f} to {samples[-1][0]:.3f}")
+
+        logging.info(f"find_height_at_time: {len(self._samples)} samples, time range {self._samples[0][0]:.3f} to {self._samples[-1][0]:.3f}")
 
         # find the first sample that is >= start_time
         start_idx = bisect.bisect_left([t for t, _, _ in self._samples], start_time)
@@ -659,7 +670,21 @@ class ProbeEddyEndstopWrapper:
     def get_steppers(self):
         return self._dispatch.get_steppers()
 
+    def get_position_endstop(self):
+        return self._home_trigger_height
+
+    # The Z homing sequence is:
+    #   - multi_probe_begin
+    #   - probe_prepare
+    #   - home_start
+    #   - home_wait
+    #   - probe_finish
+    #   - multi_probe_end
+
     def home_start(self, print_time, sample_time, sample_count, rest_time, triggered=True):
+        if not self._gather._started:
+            raise self.eddy._printer.command_error("home_start called without a sampler active")
+
         self._trigger_time = 0.
 
         ## XXX FIXME -- +2.0 for debugging so I don't crash the toolhead
@@ -682,9 +707,6 @@ class ProbeEddyEndstopWrapper:
 
         return trigger_completion
 
-    def get_position_endstop(self):
-        return self._home_trigger_height
-
     def home_wait(self, home_end_time):
         #logging.info(f"EDDY home_wait {home_end_time} cur {curtime} ept {est_print_time} ehe {est_he_time}")
         self._dispatch.wait_end(home_end_time)
@@ -697,8 +719,9 @@ class ProbeEddyEndstopWrapper:
         # and will only return those results. Fine for us since we only have one trsync,
         # but annoying in general.
         res = self._dispatch.stop()
+
+        # success?
         if res == mcu.MCU_trsync.REASON_ENDSTOP_HIT:
-            # success
             self._trigger_time = trigger_time
             return trigger_time
 
@@ -735,6 +758,7 @@ class ProbeEddyEndstopWrapper:
         logging.info("EDDY multi_probe_end <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<")
         self._gather.finish()
         self._gather = None
+
     # Perform a move to pos at speed, stopping when the probe triggers.
     # Return the full toolhead position where the probe triggered....
     # ... or where the toolhead is now?
@@ -745,13 +769,25 @@ class ProbeEddyEndstopWrapper:
         # if we don't have a trigger time, just return the position. Otherwise we can
         # do better, and pull the height from the time
         logging.info(f"EDDY probing_move finished: trigger_position {trigger_position} trigger_time {self._trigger_time}")
+
         if not self._trigger_time:
             raise self.eddy._printer.command_error("Somehow finished probing_move without a trigger_time?")
+
+        return trigger_position
+
+        toolhead = self.eddy._printer.lookup_object('toolhead')
+        toolhead_pos = toolhead.get_position()
+        toolhead_z_at_trigger = get_toolhead_kin_z(toolhead, at=self._trigger_time)
+
+        logging.info(f"EDDY probing_move after: toolhead_pos {toolhead_pos[2]:.3f} " + \
+                     f"toolhead_z_at_trigger_time {toolhead_z_at_trigger:.3f}")
+
+        toolhead_pos[2] = toolhead_z_at_trigger
+        return toolhead_pos
 
         # probing_move is just to get us to the ballpark.
         # expectation is to probe the static position and then set Z from that.
         # TODO: just do that here?
-        return trigger_position
 
         # the probe says that it triggered at trigger_time, but it has a
         # settle time -- so start averaging slightly before that point
@@ -760,7 +796,7 @@ class ProbeEddyEndstopWrapper:
         start_time = self._trigger_time - LDC1612_SETTLETIME
         end_time = self._trigger_time + LDC1612_SETTLETIME*10
 
-        wait_success = self._gather.wait_for_sample_at_time(end_time)
+        wait_success = self._gather.wait_for_sample_at_time(end_time, max_wait_time=1.000)
         if not wait_success:
             raise self.eddy._printer.command_error("Waited for probe trigger end time in samples, but didn't find it within timeout!")
 
@@ -768,13 +804,22 @@ class ProbeEddyEndstopWrapper:
         if height is None:
             raise self.eddy._printer.command_error("Probe trigger time not found in samples! (Shoudn't happen)")
 
-        logging.info(f"EDDY probing_move: result height {height:.3f} between {start_time:.3f} and {end_time:.3f}")
+        hstart = self._gather.find_closest_height_at_time(start_time)
+        hend = self._gather.find_closest_height_at_time(end_time)
 
-        toolhead = self.eddy._printer.lookup_object('toolhead')
-        toolhead_pos = toolhead.get_position()
-        logging.info(f"EDDY probing_move before adjustments toolhead_pos {toolhead_pos}")
+        logging.info(f"EDDY probing_move: found height {height:.3f} in time range [{start_time:.3f}-{end_time:.3f}] (height range [{hstart:.3f}-{hend:.3f}])")
+
+        if abs(height - toolhead_at_trigger) > 1.150:
+            raise self.eddy._printer.command_error(f"Probe trigger height {height:.3f} differs from toolhead height {toolhead_pos[2]:.3f} by significant amount")
+
+        # probe_eddy_current has this logic, that I don't understand. We have
+        # an accurate probe height at the trigger time.
+        ### Callers expect position relative to z_offset, so recalculate
+        ###bed_deviation = toolhead_at_trigger[2] - height
+        ###toolhead_at_trigger[2] -= bed_deviation
+        ###logging.info(f"EDDY bed_deviation: {bed_deviation:.3f}, final toolhead_pos: {toolhead_pos[2]:.3f}")
+
         toolhead_pos[2] = height
-        logging.info(f"EDDY probing_move new toolhead_pos {toolhead_pos}")
         return toolhead_pos
 
     def probe_prepare(self, hmove):
@@ -920,16 +965,20 @@ class ToolheadMovementHelper:
     def notes(self):
         return self._notes
 
-    def get_kin_z(self, at = None):
-        self._toolhead.flush_step_generation()
-        if at is None:
-            kin_spos = {s.get_name(): s.get_commanded_position()
-                        for s in self._toolhead_kin.get_steppers()}
-        else:
-            kin_spos = {s.get_name(): s.mcu_to_commanded_position(s.get_past_mcu_position(at))
-                        for s in self._toolhead_kin.get_steppers()}
-        return self._toolhead_kin.calc_position(kin_spos)[2]
+    def get_kin_z(self, at=None):
+        return get_toolhead_kin_z(self._toolhead, at=at)
 
+
+def get_toolhead_kin_z(toolhead, at=None):
+    toolhead_kin = toolhead.get_kinematics()
+    toolhead.flush_step_generation()
+    if at is None:
+        kin_spos = {s.get_name(): s.get_commanded_position()
+                    for s in toolhead_kin.get_steppers()}
+    else:
+        kin_spos = {s.get_name(): s.mcu_to_commanded_position(s.get_past_mcu_position(at))
+                    for s in toolhead_kin.get_steppers()}
+    return toolhead_kin.calc_position(kin_spos)[2]
 
 def load_config_prefix(config: ConfigWrapper):
     return ProbeEddy(config)
