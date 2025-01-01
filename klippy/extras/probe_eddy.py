@@ -39,114 +39,6 @@ from .ldc1612 import SETTLETIME as LDC1612_SETTLETIME
 HOME_TRIGGER_START_TIME_OFFSET = 0.200
 
 @final
-class ProbeEddyFrequencyMap:
-    def __init__(self, eddy: ProbeEddy):
-        self._eddy = eddy
-        self._sensor = eddy._sensor
-        self._temp_sensor = eddy._temp_sensor
-
-    def load_from_config(self, config: ConfigWrapper):
-        ftoh = config.getfloatlist("freq_to_height_p", default=None)
-        htof = config.getfloatlist("height_to_freq_p", default=None)
-
-        if ftoh and htof:
-            self._freq_to_height = npp.Polynomial(ftoh)
-            self._height_to_freq = npp.Polynomial(htof)
-            logging.info(f"Loaded polynomial freq-to-height: {self._coefs(self._freq_to_height)}\n" + \
-                f"                  height-to-freq: {self._coefs(self._height_to_freq)}")
-        else:
-            self._freq_to_height = None
-            self._height_to_freq = None
-
-    # helper. numpy.Polynomial .coef returns coefficients with domain/range mapping baked in.
-    # until we store those, those are no good for round-tripping. convert() gives us
-    # the unscaled values.
-    def _coefs(self, p):
-        return p.convert().coef.tolist()
-
-    def calibrate_from_values(self, raw_freqs: List[float], raw_heights: List[float], gcmd: Optional[GCodeCommand] = None):
-        if len(raw_freqs) != len(raw_heights):
-            raise ValueError("freqs and heights must be the same length")
-        raw_freqs = np.array(raw_freqs)
-        raw_heights = np.array(raw_heights)
-
-        # Group frequencies by heights and compute the median for each height
-        heights = np.unique(raw_heights)
-        freqs = np.array([np.median(raw_freqs[raw_heights == h]) for h in heights])
-
-        def r2(p, x, y):
-            y_hat = p(x)
-            ss_res = np.sum((y - y_hat)**2)
-            ss_tot = np.sum((y - np.mean(y))**2)
-            return 1 - (ss_res / ss_tot)
-
-        r2_tolerance = 0.95
-
-        # empirically, freq-to-position results need a 3D polynomial to hit R^2=1
-        # where position-to-frequency fits cleanly with a 2D polynomial. But find
-        # the best r^2
-        for i in range(3, 9):
-            self._freq_to_height = npp.Polynomial.fit(freqs, heights, i)
-            r2_fth = r2(self._freq_to_height, freqs, heights)
-            if r2_fth >= r2_tolerance:
-                break
-
-        for i in range(3, 9):
-            self._height_to_freq = npp.Polynomial.fit(heights, freqs, i)
-            r2_htf = r2(self._height_to_freq, heights, freqs)
-            if r2_htf >= r2_tolerance:
-                break
-
-        msg = f"Calibrated polynomial freq-to-height (R^2={r2_fth:.3f}): {self._coefs(self._freq_to_height)}\n" + \
-              f"                      height-to-freq (R^2={r2_htf:.3f}): {self._coefs(self._height_to_freq)}"
-        logging.info(msg)
-        if gcmd:
-            gcmd.respond_info(msg, gcmd)
-            if r2_htf < r2_tolerance or r2_fth < r2_tolerance:
-                gcmd.respond_raw("!! R^2 values are below tolerance; calibration may not be accurate.\n")
-
-        return (r2_fth, r2_htf)
-
-
-    def save_calibration(self, gcmd: Optional[GCodeCommand] = None):
-        if not self._freq_to_height or not self._height_to_freq:
-            return
-
-        ftohs = str(self._coefs(self._freq_to_height)).replace("[","").replace("]","")
-        htofs = str(self._coefs(self._height_to_freq)).replace("[","").replace("]","")
-
-        configfile = self._eddy._printer.lookup_object('configfile')
-        # why is there a floatarray getter, but not a setter?
-        configfile.set(self._eddy._full_name, "freq_to_height_p", ftohs)
-        configfile.set(self._eddy._full_name, "height_to_freq_p", htofs)
-
-        if gcmd:
-            gcmd.respond_info("Calibration saved. Issue a SAVE_CONFIG to write the values to your config file and restart Klipper.")
-
-    def raw_freqval_to_height(self, raw_freq: int, temp: float = None) -> float:
-        if raw_freq > 0x0fffffff:
-            return -math.inf #error bits set
-        return self.freq_to_height(self._sensor.from_ldc_freqval(raw_freq))
-
-    def height_to_raw_freqval(self, height: float, temp: float = None) -> int:
-        if self._height_to_freq is None:
-            return 0
-        return self._sensor.to_ldc_freqval(self._height_to_freq(height))
-
-    def freq_to_height(self, freq: float, temp: float = None) -> float:
-        if self._freq_to_height is None:
-            return math.inf
-        return float(self._freq_to_height(freq))
-
-    def height_to_freq(self, height: float, temp: float = None) -> float:
-        if self._height_to_freq is None:
-            return math.inf
-        return float(self._height_to_freq(height))
-
-    def calibrated(self) -> bool:
-        return self._freq_to_height is not None and self._height_to_freq is not None
-
-@final
 class ProbeEddy:
     def __init__(self, config: ConfigWrapper):
         logging.info("Hello from ProbeEddy")
@@ -240,6 +132,16 @@ class ProbeEddy:
         gcode.register_command("PROBE_EDDY_CALIBRATE", self.cmd_CALIBRATE)
         gcode.register_command("PROBE_EDDY_PROBE_STATIC", self.cmd_PROBE_STATIC)
 
+    # helpers to forward to the map
+    def height_to_freq(self, height: float, temp: float = None) -> float:
+        return self._fmap.height_to_freq(height, temp)
+
+    def freq_to_height(self, freq: float, temp: float = None) -> float:
+        return self._fmap.freq_to_height(freq, temp)
+
+    def calibrated(self) -> bool:
+        return self._fmap.calibrated()
+
     def cmd_QUERY(self, gcmd: GCodeCommand):
         reactor = self._printer.get_reactor()
 
@@ -252,7 +154,7 @@ class ProbeEddy:
         height = self._fmap.freq_to_height(freq)
         gcmd.respond_info(f"Last coil value: {freq:.2f} ({height:.3f}mm) (raw: {hex(freqval)} {self._sensor.status_to_str(status)} {hex(status)})")
 
-    # TODO: use below in above
+    # TODO: use this in implementing cmd_QUERY in above
     def read_current_freq_and_height(self):
         self._sensor._start_measurements()
         status, freqval, freq = self._sensor.read_one_value()
@@ -443,16 +345,6 @@ class ProbeEddy:
 
         gcmd.respond_info(f"Calibration complete, R^2: freq-to-height={r2_fth:.3f}, height-to-freq={r2_htf:.3f}")
 
-    # helpers to forward to the map
-    def height_to_freq(self, height: float, temp: float = None) -> float:
-        return self._fmap.height_to_freq(height, temp)
-
-    def freq_to_height(self, freq: float, temp: float = None) -> float:
-        return self._fmap.freq_to_height(freq, temp)
-
-    def calibrated(self) -> bool:
-        return self._fmap.calibrated()
-
     # PrinterProbe interface
     # I am seriously lost with PrinterProbe, ProbeEndstopWrapper, ProbeSessionWrapper, etc.
     # it's not clear at all to me what the relationships are between all of these.
@@ -488,169 +380,83 @@ class ProbeEddy:
         status = self._cmd_helper.get_status(eventtime)
         status.update({ 'name': self._full_name, 'home_trigger_height': self.params['home_trigger_height'] })
         return status
+    
+    # Tap move
+    def tapping_move(self, gcmd: GCodeCommand):
+        TAP_MOVE_SPEED=10.0
+        th = self._printer.lookup_object('toolhead')
+
+        kin = th.get_kinematics()
+        curtime = self._reactor.monotonic()
+        kin_status = kin.get_status(self._reactor.monotonic())
+        z_homed = 'z' in kin_status['homed_axes']
+
+        if not z_homed:
+            raise self._printer.command_error("Z axis must be homed before tapping")
+
+        # Make sure toolhead isn't moving
+        th.dwell(0.100)
+        th.wait_moves()
+
+        gather = ProbeEddySampler(self)
+        gather.start()
+
+        def get_kin_pos():
+            return {s.get_name(): s.get_commanded_position() for s in kin.get_steppers()}
+        
+        kin_start_pos = get_kin_pos()
+
+        dispatch = mcu.TriggerDispatch(self._mcu)
+
+        print_time = self.toolhead.get_last_move_time()
+
+        # we need to hit start_freq after start_time, and then pass through trigger_freq
+        # on the way to a tap
+        start_time = print_time + HOME_TRIGGER_START_TIME_OFFSET
+        start_freq = self.eddy.height_to_freq(self._home_trigger_height + self._home_trigger_height_start_offset)
+        trigger_freq = self.eddy.height_to_freq(self._home_trigger_height)
+
+        tap_completion = dispatch.start(print_time)
+
+        # run the tap
+        #self._sensor.run_tap2(dispatch.get_oid(),
+        self._sensor.setup_home2(dispatch.get_oid(),
+                                 mcu.MCU_trsync.REASON_ENDSTOP_HIT, self.REASON_BASE,
+                                 trigger_freq, start_freq, print_time + HOME_TRIGGER_START_TIME_OFFSET)
+        
+        # A fake tapping move (don't hit the bed!)
+        tap_target_pos = th.get_position()
+        tap_target_pos[2] = 1.0
+
+        errors = []
+        try:
+            th.drip_move(tap_target_pos, TAP_MOVE_SPEED, tap_completion)
+        #except self.printer.command_error as e:
+        except Exception as e:
+            logging.info(f"Error during drip move: {e}")
+            errors.append(str(e))
+
+        try:
+            move_end_time = th.get_last_move_time()
+            dispatch.wait_end(move_end_time)
+        except Exception as e:
+            logging.info(f"Error dispatch wait: {e}")
+            errors.append(str(e))
+        
+        trigger_time = self._sensor.clear_home()
+        reason = dispatch.stop()
+
+        if reason != mcu.MCU_trsync.REASON_ENDSTOP_HIT:
+            errors.append(f"Trigger not hit: {reason}")
+
+        if len(errors) > 0:
+            raise self._printer.command_error(f"Error during tapping move: {', '.join(errors)}")
 
 
-# Helper to gather samples and convert them to probe positions
-@final
-class ProbeEddySampler:
-    def __init__(self, eddy: ProbeEddy):
-        self.eddy = eddy
-        self._sensor = eddy._sensor
-        self._reactor = self.eddy._printer.get_reactor()
-        self._mcu = self._sensor.get_mcu()
-        # this will hold the raw samples coming in from the sensor,
-        # with an empty 3rd (height) value
-        self._raw_samples = None
-        self._stopped = False
-        self._started = False
-        self._errors = 0
 
-        # this will hold samples with a height filled in
-        self._samples = None
-
-    def __enter__(self):
-        self.start()
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        self.finish()
-
-    # bulk sample callback for when new data arrives
-    # from the probe
-    def _add_hw_measurement(self, msg):
-        if self._stopped:
-            return False
-
-        self._errors += msg['errors']
-        self._raw_samples.extend(msg['data'])
-        return True
-
-    def start(self):
-        if not self._started:
-            self._raw_samples = []
-            self._sensor.add_client(self._add_hw_measurement)
-            self._started = True
-
-    def finish(self):
-        if not self._started:
-            raise self.eddy._printer.command_error("ProbeEddySampler.finish() called without start()")
-        self._stopped = True
-
-    def _update_samples(self):
-        if self._samples is None:
-            self._samples = []
-        start_idx = len(self._samples)
-        new_samples = [(t, f, self.eddy.freq_to_height(f)) for t, f, _ in self._raw_samples[start_idx:]]
-        self._samples.extend(new_samples)
-
-    def get_raw_samples(self):
-        return self._raw_samples.copy()
-
-    def get_samples(self):
-        self._update_samples()
-        return self._samples.copy()
-
-    def get_error_count(self):
-        return self._errors
-
-    # get the last sampled height
-    def get_last_height(self):
-        self._update_samples()
-        if len(self._samples) == 0:
-            return None
-        return self._samples[-1][2]
-
-   # Wait until a sample for the given time arrives
-    def wait_for_sample_at_time(self, sample_print_time, max_wait_time=0.250, raise_error=True) -> bool:
-        def report_no_samples():
-            if raise_error:
-                raise self.eddy._printer.command_error(f"No samples received for time {sample_print_time:.3f} (waited for {max_wait_time:.3f}")
-            return False
-
-        if self._stopped:
-            # if we're not getting any more samples, we can check directly
-            if len(self._raw_samples) == 0:
-                return report_no_samples()
-            return self._raw_samples[-1][0] >= sample_print_time
-
-        wait_start_time = self._mcu.estimated_print_time(self._reactor.monotonic())
-
-        # if sample_print_time is in the future, make sure to wait max_wait_time
-        # past the expected time
-        if sample_print_time > wait_start_time:
-            max_wait_time = max_wait_time + (sample_print_time - wait_start_time)
-
-        logging.info(f"ProbeEddyFrequencySampler: waiting for sample at {sample_print_time:.3f} (now: {wait_start_time:.3f}, max_wait_time: {max_wait_time:.3f})")
-        while len(self._raw_samples) == 0 or self._raw_samples[-1][0] < sample_print_time:
-            now = self._mcu.estimated_print_time(self._reactor.monotonic())
-            if now - wait_start_time > max_wait_time:
-                return report_no_samples()
-            self._reactor.pause(now + 0.010)
-
-        return True
-
-    # Wait for some samples to be collected, even if errors
-    def wait_for_samples(self, max_wait_time=0.250, count_errors=False, min_samples=1, new_only=False, raise_error=True):
-        # Make sure enough samples have been collected
-        wait_start_time = self._mcu.estimated_print_time(self._reactor.monotonic())
-
-        if new_only:
-            start_count = len(self._raw_samples) + (self._errors if count_errors else 0)
-        else:
-            start_count = 0
-
-        while (len(self._raw_samples) + (self._errors if count_errors else 0)) - start_count < min_samples:
-            now = self._mcu.estimated_print_time(self._reactor.monotonic())
-            if now - wait_start_time > max_wait_time:
-                if raise_error:
-                    raise self.eddy._printer.command_error(f"possible probe_eddy sensor outage; no samples for {max_wait_time:.2f}s")
-                return False
-            self._reactor.pause(now + 0.010)
-
-        return True
-
-    def find_closest_height_at_time(self, time):
-        self._update_samples()
-        if len(self._samples) == 0:
-            return None
-        # find the closest sample to the given time
-        idx = np.argmin([abs(t - time) for t, _, _ in self._samples])
-        return self._samples[idx][2]
-
-    def find_height_at_time(self, start_time, end_time):
-        if end_time < start_time:
-            raise ValueError("find_height_at_time: end_time is before start_time")
-
-        self._update_samples()
-
-        logging.info(f"find_height_at_time: searching between {start_time:.3f} and {end_time:.3f}")
-        if len(self._samples) == 0:
-            logging.info(f"    zero samples!")
-            return None
-
-        logging.info(f"find_height_at_time: {len(self._samples)} samples, time range {self._samples[0][0]:.3f} to {self._samples[-1][0]:.3f}")
-
-        # find the first sample that is >= start_time
-        start_idx = bisect.bisect_left([t for t, _, _ in self._samples], start_time)
-        if start_idx >= len(self._samples):
-            logging.info(f"    nothing after start_time!")
-            # nothing in range
-            return None
-
-        # find the last sample that is <= end_time
-        end_idx = bisect.bisect_right([t for t, _, _ in self._samples], end_time)
-        if end_idx == 0:
-            raise ValueError("found something at start_time, but not before end_time?")
-
-        # average the heights of the samples in the range
-        heights = [h for _, _, h in self._samples[start_idx:end_idx]]
-        hmin, hmax = np.min(heights), np.max(heights)
-        mean = np.mean(heights)
-        median = np.median(heights)
-        logging.info(f"find_height_at_time: {len(heights)} samples, mean: {mean:.3f} median: {median:.3f} (range {hmin:.3f}-{hmax:.3f})")
-
-        return float(median)
-
+#
+# Bed scan specific probe session interface
+#
 @final
 class ProbeEddyScanningProbe:
     def __init__(self, eddy: ProbeEddy, gcmd: GCodeCommand):
@@ -769,6 +575,9 @@ class ProbeEddyEndstopWrapper:
     #   - home_wait
     #   - probe_finish
     #   - multi_probe_end
+    #
+    # Note no probing_move during homing! `HomingMove.homing_move` drives the above sequence.
+    # probing_move is only used during actual probe operations. 
 
     def home_start(self, print_time, sample_time, sample_count, rest_time, triggered=True):
         if not self._gather._started:
@@ -947,6 +756,274 @@ class ProbeEddyEndstopWrapper:
     def probe_finish(self, hmove):
         logging.info(f"EDDY probe_finish ....................................")
 
+# Helper to gather samples and convert them to probe positions
+@final
+class ProbeEddySampler:
+    def __init__(self, eddy: ProbeEddy):
+        self.eddy = eddy
+        self._sensor = eddy._sensor
+        self._reactor = self.eddy._printer.get_reactor()
+        self._mcu = self._sensor.get_mcu()
+        # this will hold the raw samples coming in from the sensor,
+        # with an empty 3rd (height) value
+        self._raw_samples = None
+        self._stopped = False
+        self._started = False
+        self._errors = 0
+
+        # this will hold samples with a height filled in
+        self._samples = None
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.finish()
+
+    # bulk sample callback for when new data arrives
+    # from the probe
+    def _add_hw_measurement(self, msg):
+        if self._stopped:
+            return False
+
+        self._errors += msg['errors']
+        self._raw_samples.extend(msg['data'])
+        return True
+
+    def start(self):
+        if not self._started:
+            self._raw_samples = []
+            self._sensor.add_client(self._add_hw_measurement)
+            self._started = True
+
+    def finish(self):
+        if not self._started:
+            raise self.eddy._printer.command_error("ProbeEddySampler.finish() called without start()")
+        self._stopped = True
+
+    def _update_samples(self):
+        if self._samples is None:
+            self._samples = []
+        start_idx = len(self._samples)
+        new_samples = [(t, f, self.eddy.freq_to_height(f)) for t, f, _ in self._raw_samples[start_idx:]]
+        self._samples.extend(new_samples)
+
+    def get_raw_samples(self):
+        return self._raw_samples.copy()
+
+    def get_samples(self):
+        self._update_samples()
+        return self._samples.copy()
+
+    def get_error_count(self):
+        return self._errors
+
+    # get the last sampled height
+    def get_last_height(self):
+        self._update_samples()
+        if len(self._samples) == 0:
+            return None
+        return self._samples[-1][2]
+
+   # Wait until a sample for the given time arrives
+    def wait_for_sample_at_time(self, sample_print_time, max_wait_time=0.250, raise_error=True) -> bool:
+        def report_no_samples():
+            if raise_error:
+                raise self.eddy._printer.command_error(f"No samples received for time {sample_print_time:.3f} (waited for {max_wait_time:.3f}")
+            return False
+
+        if self._stopped:
+            # if we're not getting any more samples, we can check directly
+            if len(self._raw_samples) == 0:
+                return report_no_samples()
+            return self._raw_samples[-1][0] >= sample_print_time
+
+        wait_start_time = self._mcu.estimated_print_time(self._reactor.monotonic())
+
+        # if sample_print_time is in the future, make sure to wait max_wait_time
+        # past the expected time
+        if sample_print_time > wait_start_time:
+            max_wait_time = max_wait_time + (sample_print_time - wait_start_time)
+
+        logging.info(f"ProbeEddyFrequencySampler: waiting for sample at {sample_print_time:.3f} (now: {wait_start_time:.3f}, max_wait_time: {max_wait_time:.3f})")
+        while len(self._raw_samples) == 0 or self._raw_samples[-1][0] < sample_print_time:
+            now = self._mcu.estimated_print_time(self._reactor.monotonic())
+            if now - wait_start_time > max_wait_time:
+                return report_no_samples()
+            self._reactor.pause(now + 0.010)
+
+        return True
+
+    # Wait for some samples to be collected, even if errors
+    def wait_for_samples(self, max_wait_time=0.250, count_errors=False, min_samples=1, new_only=False, raise_error=True):
+        # Make sure enough samples have been collected
+        wait_start_time = self._mcu.estimated_print_time(self._reactor.monotonic())
+
+        if new_only:
+            start_count = len(self._raw_samples) + (self._errors if count_errors else 0)
+        else:
+            start_count = 0
+
+        while (len(self._raw_samples) + (self._errors if count_errors else 0)) - start_count < min_samples:
+            now = self._mcu.estimated_print_time(self._reactor.monotonic())
+            if now - wait_start_time > max_wait_time:
+                if raise_error:
+                    raise self.eddy._printer.command_error(f"possible probe_eddy sensor outage; no samples for {max_wait_time:.2f}s")
+                return False
+            self._reactor.pause(now + 0.010)
+
+        return True
+
+    def find_closest_height_at_time(self, time):
+        self._update_samples()
+        if len(self._samples) == 0:
+            return None
+        # find the closest sample to the given time
+        idx = np.argmin([abs(t - time) for t, _, _ in self._samples])
+        return self._samples[idx][2]
+
+    def find_height_at_time(self, start_time, end_time):
+        if end_time < start_time:
+            raise ValueError("find_height_at_time: end_time is before start_time")
+
+        self._update_samples()
+
+        logging.info(f"find_height_at_time: searching between {start_time:.3f} and {end_time:.3f}")
+        if len(self._samples) == 0:
+            logging.info(f"    zero samples!")
+            return None
+
+        logging.info(f"find_height_at_time: {len(self._samples)} samples, time range {self._samples[0][0]:.3f} to {self._samples[-1][0]:.3f}")
+
+        # find the first sample that is >= start_time
+        start_idx = bisect.bisect_left([t for t, _, _ in self._samples], start_time)
+        if start_idx >= len(self._samples):
+            logging.info(f"    nothing after start_time!")
+            # nothing in range
+            return None
+
+        # find the last sample that is <= end_time
+        end_idx = bisect.bisect_right([t for t, _, _ in self._samples], end_time)
+        if end_idx == 0:
+            raise ValueError("found something at start_time, but not before end_time?")
+
+        # average the heights of the samples in the range
+        heights = [h for _, _, h in self._samples[start_idx:end_idx]]
+        hmin, hmax = np.min(heights), np.max(heights)
+        mean = np.mean(heights)
+        median = np.median(heights)
+        logging.info(f"find_height_at_time: {len(heights)} samples, mean: {mean:.3f} median: {median:.3f} (range {hmin:.3f}-{hmax:.3f})")
+
+        return float(median)
+
+@final
+class ProbeEddyFrequencyMap:
+    def __init__(self, eddy: ProbeEddy):
+        self._eddy = eddy
+        self._sensor = eddy._sensor
+        self._temp_sensor = eddy._temp_sensor
+
+    def load_from_config(self, config: ConfigWrapper):
+        ftoh = config.getfloatlist("freq_to_height_p", default=None)
+        htof = config.getfloatlist("height_to_freq_p", default=None)
+
+        if ftoh and htof:
+            self._freq_to_height = npp.Polynomial(ftoh)
+            self._height_to_freq = npp.Polynomial(htof)
+            logging.info(f"Loaded polynomial freq-to-height: {self._coefs(self._freq_to_height)}\n" + \
+                f"                  height-to-freq: {self._coefs(self._height_to_freq)}")
+        else:
+            self._freq_to_height = None
+            self._height_to_freq = None
+
+    # helper. numpy.Polynomial .coef returns coefficients with domain/range mapping baked in.
+    # until we store those, those are no good for round-tripping. convert() gives us
+    # the unscaled values.
+    def _coefs(self, p):
+        return p.convert().coef.tolist()
+
+    def calibrate_from_values(self, raw_freqs: List[float], raw_heights: List[float], gcmd: Optional[GCodeCommand] = None):
+        if len(raw_freqs) != len(raw_heights):
+            raise ValueError("freqs and heights must be the same length")
+        raw_freqs = np.array(raw_freqs)
+        raw_heights = np.array(raw_heights)
+
+        # Group frequencies by heights and compute the median for each height
+        heights = np.unique(raw_heights)
+        freqs = np.array([np.median(raw_freqs[raw_heights == h]) for h in heights])
+
+        def r2(p, x, y):
+            y_hat = p(x)
+            ss_res = np.sum((y - y_hat)**2)
+            ss_tot = np.sum((y - np.mean(y))**2)
+            return 1 - (ss_res / ss_tot)
+
+        r2_tolerance = 0.95
+
+        # empirically, freq-to-position results need a 3D polynomial to hit R^2=1
+        # where position-to-frequency fits cleanly with a 2D polynomial. But find
+        # the best r^2
+        for i in range(3, 9):
+            self._freq_to_height = npp.Polynomial.fit(freqs, heights, i)
+            r2_fth = r2(self._freq_to_height, freqs, heights)
+            if r2_fth >= r2_tolerance:
+                break
+
+        for i in range(3, 9):
+            self._height_to_freq = npp.Polynomial.fit(heights, freqs, i)
+            r2_htf = r2(self._height_to_freq, heights, freqs)
+            if r2_htf >= r2_tolerance:
+                break
+
+        msg = f"Calibrated polynomial freq-to-height (R^2={r2_fth:.3f}): {self._coefs(self._freq_to_height)}\n" + \
+              f"                      height-to-freq (R^2={r2_htf:.3f}): {self._coefs(self._height_to_freq)}"
+        logging.info(msg)
+        if gcmd:
+            gcmd.respond_info(msg, gcmd)
+            if r2_htf < r2_tolerance or r2_fth < r2_tolerance:
+                gcmd.respond_raw("!! R^2 values are below tolerance; calibration may not be accurate.\n")
+
+        return (r2_fth, r2_htf)
+
+
+    def save_calibration(self, gcmd: Optional[GCodeCommand] = None):
+        if not self._freq_to_height or not self._height_to_freq:
+            return
+
+        ftohs = str(self._coefs(self._freq_to_height)).replace("[","").replace("]","")
+        htofs = str(self._coefs(self._height_to_freq)).replace("[","").replace("]","")
+
+        configfile = self._eddy._printer.lookup_object('configfile')
+        # why is there a floatarray getter, but not a setter?
+        configfile.set(self._eddy._full_name, "freq_to_height_p", ftohs)
+        configfile.set(self._eddy._full_name, "height_to_freq_p", htofs)
+
+        if gcmd:
+            gcmd.respond_info("Calibration saved. Issue a SAVE_CONFIG to write the values to your config file and restart Klipper.")
+
+    def raw_freqval_to_height(self, raw_freq: int, temp: float = None) -> float:
+        if raw_freq > 0x0fffffff:
+            return -math.inf #error bits set
+        return self.freq_to_height(self._sensor.from_ldc_freqval(raw_freq))
+
+    def height_to_raw_freqval(self, height: float, temp: float = None) -> int:
+        if self._height_to_freq is None:
+            return 0
+        return self._sensor.to_ldc_freqval(self._height_to_freq(height))
+
+    def freq_to_height(self, freq: float, temp: float = None) -> float:
+        if self._freq_to_height is None:
+            return math.inf
+        return float(self._freq_to_height(freq))
+
+    def height_to_freq(self, height: float, temp: float = None) -> float:
+        if self._height_to_freq is None:
+            return math.inf
+        return float(self._height_to_freq(height))
+
+    def calibrated(self) -> bool:
+        return self._freq_to_height is not None and self._height_to_freq is not None
 
 @final
 class ToolheadMovementHelper:
