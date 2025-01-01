@@ -231,7 +231,7 @@ class ProbeEddy:
 
         reactor = self._printer.get_reactor()
 
-        with ProbeEddyHeightSampler(self) as sampler:
+        with ProbeEddySampler(self) as sampler:
             sampler.wait_for_samples(max_wait_time=duration*2, min_samples=50)
             sampler.finish()
 
@@ -328,7 +328,7 @@ class ProbeEddy:
             first_sample_time = None
             last_sample_time = None
 
-            with ProbeEddyFrequencySampler(self) as sampler:
+            with ProbeEddySampler(self) as sampler:
                 # move down in steps, taking samples
                 # note: np.arange is exclusive of the stop value; this will _not_ include z=0
                 for z in np.arange(cal_z_max, 0, -self.params['calibration_step']):
@@ -444,143 +444,118 @@ class ProbeEddy:
         return status
 
 
-# Tool to gather samples and convert them to probe positions
+# Helper to gather samples and convert them to probe positions
 @final
-class ProbeEddyFrequencySampler:
+class ProbeEddySampler:
     def __init__(self, eddy: ProbeEddy):
         self.eddy = eddy
         self._sensor = eddy._sensor
-        # Results storage
-        self._samples = None
+        self._reactor = self.eddy._printer.get_reactor()
+        self._mcu = self._sensor.get_mcu()
+        # this will hold the raw samples coming in from the sensor,
+        # with an empty 3rd (height) value
+        self._raw_samples = None
         self._stopped = False
-        self._errors = 0
         self._started = False
+        self._errors = 0
 
+        # this will hold samples with a height filled in
+        self._samples = None
+    
     def __enter__(self):
         self.start()
         return self
     
     def __exit__(self, exc_type, exc_value, traceback):
-        #logging.info("ProbeEddyFrequencySampler: __exit__")
         self.finish()
 
+    # bulk sample callback for when new data arrives
+    # from the probe
     def _add_hw_measurement(self, msg):
         if self._stopped:
-            #logging.info(f"ProbeEddyFrequencySampler: stopping in _add_hw_measurement")
             return False
         
-        #logging.info(f"ProbeEddyFrequencySampler: adding {len(msg['data'])} samples ({msg['errors']} errors)")
         self._errors += msg['errors']
-        self._samples.extend(msg['data'])
+        self._raw_samples.extend(msg['data'])
         return True
 
     def start(self):
         if not self._started:
-            self._samples = []
+            self._raw_samples = []
             self._sensor.add_client(self._add_hw_measurement)
             self._started = True
-
+    
     def finish(self):
         if not self._started:
-            raise Exception("ProbeEddyFrequencySampler.finish() called without start()")
+            raise Exception("ProbeEddySampler.finish() called without start()")
         self._stopped = True
 
-    def get_samples(self):
-        return self._samples.copy()
-    
-    def get_error_count(self):
-        return self._errors
-
-    # Wait until a sample for the given time arrives
-    def wait_for_sample_time(self, sample_print_time, max_wait_time=0.250) -> bool:
-        if self._stopped:
-            # if we're not getting any more samples, we can check directly
-            return self._samples[-1][0] >= sample_print_time
-
-        reactor, mcu = self.eddy._printer.get_reactor(), self._sensor.get_mcu()
-        wait_start_time = mcu.estimated_print_time(reactor.monotonic())
-
-        logging.info(f"ProbeEddyFrequencySampler: waiting for sample at {sample_print_time:.3f}")
-        logging.info(f"samples: {self._samples}")
-        while len(self._samples) == 0 or self._samples[-1][0] < sample_print_time:
-            now = mcu.estimated_print_time(reactor.monotonic())
-            if now - wait_start_time > max_wait_time:
-                return False
-            reactor.pause(now + 0.010)
-        
-        return True
-
-    # Wait for some samples to be collected, even if errors
-    def wait_for_samples(self, max_wait_time=0.250, count_errors=False, min_samples=1):
-        # Make sure enough samples have been collected
-        reactor, mcu = self.eddy._printer.get_reactor(), self._sensor.get_mcu()
-        wait_start_time = mcu.estimated_print_time(reactor.monotonic())
-
-        while len(self._samples) + (self._errors if count_errors else 0) < min_samples:
-            now = mcu.estimated_print_time(reactor.monotonic())
-            if now - wait_start_time > max_wait_time:
-                raise self.eddy._printer.command_error(f"possible probe_eddy sensor outage; no samples for {max_wait_time:.2f}s")
-            reactor.pause(now + 0.010)
-
-@final
-class ProbeEddyHeightSampler:
-    def __init__(self, eddy: ProbeEddy):
-        self.eddy = eddy
-        self._fsampler = ProbeEddyFrequencySampler(eddy)
-        self._started = False
-        self._samples = None
-    
-    def __enter__(self):
-        self.start()
-        return self
-    
-    def __exit__(self, exc_type, exc_value, traceback):
-        self.finish()
-
-    def start(self):
-        if not self._started:
-            self._fsampler.start()
-            self._started = True
-    
-    def finish(self):
-        if not self._started:
-            raise Exception("ProbeEddyHeightSampler.finish() called without start()")
-        self._fsampler.finish()
-
     def _update_samples(self):
-        if self._samples is None or len(self._samples) != len(self._fsampler._samples):
-            # fill in the height value
-            self._samples = [(t, f, self.eddy.freq_to_height(f)) for t, f, _ in self._fsampler._samples]
+        if self._samples is None:
+            self._samples = []
+        start_idx = len(self._samples)
+        new_samples = [(t, f, self.eddy.freq_to_height(f)) for t, f, _ in self._raw_samples[start_idx:]]
+        self._samples.extend(new_samples)
+
+    def get_raw_samples(self):
+        return self._raw_samples.copy()
 
     def get_samples(self):
         self._update_samples()
         return self._samples.copy()
     
+    def get_error_count(self):
+        return self._errors
+
+    # get the last sampled height 
     def get_last_height(self):
         self._update_samples()
         if len(self._samples) == 0:
             return None
         return self._samples[-1][2]
 
-    def get_error_count(self):
-        return self._fsampler.get_error_count()
-    
-    def wait_for_sample_time(self, sample_print_time, max_wait_time=0.250) -> bool:
-        return self._fsampler.wait_for_sample_time(sample_print_time, max_wait_time)
+   # Wait until a sample for the given time arrives
+    def wait_for_sample_at_time(self, sample_print_time, max_wait_time=0.250) -> bool:
+        if self._stopped:
+            # if we're not getting any more samples, we can check directly
+            if len(self._raw_samples) == 0:
+                return False;
+            return self._raw_samples[-1][0] >= sample_print_time
 
-    def wait_for_samples(self, max_wait_time=0.250, count_errors=False, min_samples=1):
-        self._fsampler.wait_for_samples(max_wait_time, count_errors, min_samples)
+        wait_start_time = self._mcu.estimated_print_time(self._reactor.monotonic())
 
-    def wait_for_new_samples(self, count=1, max_wait_time=0.250):
-        reactor, mcu = self.eddy._printer.get_reactor(), self.eddy._sensor.get_mcu()
-        wait_start_time = mcu.estimated_print_time(reactor.monotonic())
+        # if sample_print_time is in the future, make sure to wait max_wait_time
+        # past the expected time
+        if sample_print_time > wait_start_time:
+            max_wait_time = max_wait_time + (sample_print_time - wait_start_time)
 
-        start_count = len(self._fsampler._samples)
-        while len(self._fsampler._samples) - start_count < count:
-            now = mcu.estimated_print_time(reactor.monotonic())
+        logging.info(f"ProbeEddyFrequencySampler: waiting for sample at {sample_print_time:.3f}")
+        while len(self._samples) == 0 or self._samples[-1][0] < sample_print_time:
+            now = self._mcu.estimated_print_time(self._reactor.monotonic())
             if now - wait_start_time > max_wait_time:
                 return False
-            reactor.pause(now + 0.010)
+            self._reactor.pause(now + 0.010)
+        
+        return True
+
+    # Wait for some samples to be collected, even if errors
+    def wait_for_samples(self, max_wait_time=0.250, count_errors=False, min_samples=1, new_only=False, raise_error=True):
+        # Make sure enough samples have been collected
+        wait_start_time = self._mcu.estimated_print_time(self._reactor.monotonic())
+
+        if new_only:
+            start_count = len(self._raw_samples) + (self._errors if count_errors else 0)
+        else:
+            start_count = 0
+
+        while (len(self._raw_samples) + (self._errors if count_errors else 0)) - start_count < min_samples:
+            now = self._mcu.estimated_print_time(self._reactor.monotonic())
+            if now - wait_start_time > max_wait_time:
+                if raise_error:
+                    raise self.eddy._printer.command_error(f"possible probe_eddy sensor outage; no samples for {max_wait_time:.2f}s")
+                else:
+                    return False
+            self._reactor.pause(now + 0.010)
         
         return True
 
@@ -588,28 +563,28 @@ class ProbeEddyHeightSampler:
         if end_time < start_time:
             raise ValueError("find_height_at_time: end_time is before start_time")
 
-        samples = self.get_samples()
+        self._update_samples()
 
         logging.info(f"find_height_at_time: searching between {start_time:.3f} and {end_time:.3f}")
-        if len(samples) == 0:
+        if len(self._samples) == 0:
             logging.info(f"    zero samples!")
             return None
-        logging.info(f"find_height_at_time: {len(samples)} samples, range {samples[0][0]:.3f} to {samples[-1][0]:.3f}")
+        logging.info(f"find_height_at_time: {len(self._samples)} samples, range {self._samples[0][0]:.3f} to {samples[-1][0]:.3f}")
 
         # find the first sample that is >= start_time
-        start_idx = bisect.bisect_left([t for t, _, _ in samples], start_time)
-        if start_idx >= len(samples):
+        start_idx = bisect.bisect_left([t for t, _, _ in self._samples], start_time)
+        if start_idx >= len(self._samples):
             logging.info(f"    nothing after start_time!")
             # nothing in range
             return None
         
         # find the last sample that is <= end_time
-        end_idx = bisect.bisect_right([t for t, _, _ in samples], end_time)
+        end_idx = bisect.bisect_right([t for t, _, _ in self._samples], end_time)
         if end_idx == 0:
             raise ValueError("found something at start_time, but not before end_time?")
         
         # average the heights of the samples in the range
-        heights = [h for _, _, h in samples[start_idx:end_idx]]
+        heights = [h for _, _, h in self._samples[start_idx:end_idx]]
         hmin, hmax = np.min(heights), np.max(heights)
         mean = np.mean(heights)
         median = np.median(heights)
@@ -721,7 +696,7 @@ class ProbeEddyEndstopWrapper:
     # This is called before the start of a series of probe measurements (1 or more)
     def multi_probe_begin(self):
         logging.info("EDDY multi_probe_begin >>>>>>>>>>>>>>>>>>>>>>>>>>>>")
-        self._gather = ProbeEddyHeightSampler(self.eddy)
+        self._gather = ProbeEddySampler(self.eddy)
         self._gather.start()
     # The end of a series of measurements
     def multi_probe_end(self):
@@ -753,7 +728,7 @@ class ProbeEddyEndstopWrapper:
         start_time = self._trigger_time - LDC1612_SETTLETIME
         end_time = self._trigger_time + LDC1612_SETTLETIME*10
 
-        wait_success = self._gather.wait_for_sample_time(end_time)
+        wait_success = self._gather.wait_for_sample_at_time(end_time)
         if not wait_success:
             raise self.eddy._printer.command_error("Waited for probe trigger end time in samples, but didn't find it within timeout!")
 
@@ -791,7 +766,7 @@ class ProbeEddyEndstopWrapper:
         # Wait for some new samples to show up. We might get all error samples,
         # which is OK; assume those are too-high out of range
         # TODO: only track appropriate amplitude too low errors
-        if not self._gather.wait_for_new_samples(max_wait_time=1.0):
+        if not self._gather.wait_for_samples(max_wait_time=1.0, new_only=True, count_errors=True, raise_error=False):
             if self._gather.get_error_count() == 0:
                 raise self.eddy._printer.command_error("Waited for new samples and got no samples");
 
