@@ -209,6 +209,7 @@ class ProbeEddy:
     def define_commands(self, gcode):
         gcode.register_command("PROBE_EDDY_QUERY", self.cmd_QUERY)
         gcode.register_command("PROBE_EDDY_CALIBRATE", self.cmd_CALIBRATE)
+        gcode.register_command("PROBE_EDDY_PROBE_STATIC", self.cmd_PROBE_STATIC)
     
     def cmd_QUERY(self, gcmd: GCodeCommand):
         reactor = self._printer.get_reactor()
@@ -221,6 +222,45 @@ class ProbeEddy:
 
         height = self._fmap.freq_to_height(freq)
         gcmd.respond_info(f"Last coil value: {freq:.2f} ({height:.3f}mm) (raw: {hex(freqval)} {self._sensor.status_to_str(status)} {hex(status)})")
+
+    def cmd_PROBE_STATIC(self, gcmd: GCodeCommand):
+        if not self._fmap.calibrated():
+            gcmd.respond_raw("!! Probe not calibrated\n")
+            return
+
+        duration = gcmd.get_float('DURATION', 0.100, above=0.0)
+        mean_or_median = gcmd.get('METHOD', 'mean').lower()
+
+        reactor = self._printer.get_reactor()
+
+        with ProbeEddyHeightSampler(self) as sampler:
+            sampler.wait_for_samples(max_wait_time=duration*2, min_samples=50)
+            sampler.finish()
+
+            samples = sampler.get_samples()
+            if len(samples) == 0:
+                gcmd.respond_raw("!! No samples collected\n")
+                return
+
+            # skip LDC1612_SETTLETIME samples at start and end by looking
+            # at the time values
+            stime = samples[0][0]
+            etime = samples[-1][0]
+            samples = [s for s in samples if s[0] > stime+LDC1612_SETTLETIME and s[0] < etime-LDC1612_SETTLETIME]
+
+            mean = np.mean([s[2] for s in samples])
+            median = np.median([s[2] for s in samples])
+
+            if mean_or_median == 'mean':
+                height = mean
+            elif mean_or_median == 'median':
+                height = median
+            else:
+                gcmd.respond_raw("!! Invalid METHOD\n")
+                return
+
+            gcmd.respond_info(f"Collected {len(samples)} samples, height: {height:.3f} (mean: {mean:.3f}, median: {median:.3f})")
+            self._cmd_helper.last_z_result = height
 
     def read_current_freq_and_height(self):
         self._sensor._start_measurements()
@@ -406,7 +446,9 @@ class ProbeEddy:
         return self._probe_session.start_probe_session(gcmd)
     
     def get_status(self, eventtime):
-        return { 'name': self._full_name, 'home_trigger_z': self.params['home_trigger_z'] } # XXX
+        status = self._cmd_helper.get_status(eventtime)
+        status.update({ 'name': self._full_name, 'home_trigger_z': self.params['home_trigger_z'] })
+        return status
 
 
 # Tool to gather samples and convert them to probe positions
@@ -417,8 +459,6 @@ class ProbeEddyFrequencySampler:
         self._sensor = eddy._sensor
         # Results storage
         self._samples = None
-        self._probe_times = []
-        self._probe_results = []
         self._stopped = False
         self._errors = 0
         self._started = False
@@ -467,7 +507,9 @@ class ProbeEddyFrequencySampler:
         reactor, mcu = self.eddy._printer.get_reactor(), self._sensor.get_mcu()
         wait_start_time = mcu.estimated_print_time(reactor.monotonic())
 
-        while self._samples[-1][0] < sample_print_time:
+        logging.info(f"ProbeEddyFrequencySampler: waiting for sample at {sample_print_time:.3f}")
+        logging.info(f"samples: {self._samples}")
+        while len(self._samples) == 0 or self._samples[-1][0] < sample_print_time:
             now = mcu.estimated_print_time(reactor.monotonic())
             if now - wait_start_time > max_wait_time:
                 return False
@@ -512,18 +554,19 @@ class ProbeEddyHeightSampler:
             raise Exception("ProbeEddyHeightSampler.finish() called without start()")
         self._fsampler.finish()
 
-    def get_samples(self):
-        # if we haven't calculated heights yet, or the number of samples has changed, recalculate
+    def _update_samples(self):
         if self._samples is None or len(self._samples) != len(self._fsampler._samples):
             # fill in the height value
             self._samples = [(t, f, self.eddy.freq_to_height(f)) for t, f, _ in self._fsampler._samples]
+
+    def get_samples(self):
+        self._update_samples()
         return self._samples.copy()
     
     def get_last_height(self):
-        if self._samples is None:
-            if self._fsampler._samples is None:
-                return None
-            return self.eddy.freq_to_height(self._fsampler._samples[-1][1])
+        self._update_samples()
+        if len(self._samples) == 0:
+            return None
         return self._samples[-1][2]
 
     def get_error_count(self):
@@ -534,6 +577,19 @@ class ProbeEddyHeightSampler:
 
     def wait_for_samples(self, max_wait_time=0.250, count_errors=False, min_samples=1):
         self._fsampler.wait_for_samples(max_wait_time, count_errors, min_samples)
+
+    def wait_for_new_samples(self, count=1, max_wait_time=0.250):
+        reactor, mcu = self.eddy._printer.get_reactor(), self.eddy._sensor.get_mcu()
+        wait_start_time = mcu.estimated_print_time(reactor.monotonic())
+
+        start_count = len(self._fsampler._samples)
+        while len(self._fsampler._samples) - start_count < count:
+            now = mcu.estimated_print_time(reactor.monotonic())
+            if now - wait_start_time > max_wait_time:
+                return False
+            reactor.pause(now + 0.010)
+        
+        return True
 
     def find_height_at_time(self, start_time, end_time):
         if end_time < start_time:
@@ -624,19 +680,18 @@ class ProbeEddyEndstopWrapper:
 
         return trigger_completion
 
-    def home_wait(self, home_end_time):
-        curtime = self._reactor.monotonic()
-        est_print_time = self._mcu.estimated_print_time(curtime)
-        est_he_time = self._mcu.estimated_print_time(home_end_time)
+    def get_position_endstop(self):
+        return self._home_trigger_z
 
-        logging.info(f"EDDY home_wait {home_end_time} cur {curtime} ept {est_print_time} ehe {est_he_time}")
+    def home_wait(self, home_end_time):
+        #logging.info(f"EDDY home_wait {home_end_time} cur {curtime} ept {est_print_time} ehe {est_he_time}")
         self._dispatch.wait_end(home_end_time)
 
-        logging.info(f"EDDY calling clear_home")
+        #logging.info(f"EDDY calling clear_home")
 
         # reset homing setup
         trigger_time = self._sensor.clear_home()
-        logging.info(f"EDDY clear_home trigger_time {trigger_time}")
+        logging.info(f"EDDY clear_home trigger_time {trigger_time} (mcu: {self._mcu.print_time_to_clock(trigger_time)})")
 
         # nb: _dispatch.stop() will treat anything >= REASON_COMMS_TIMEOUT as an error,
         # and will only return those results. Fine for us since we only have one trsync,
@@ -681,15 +736,22 @@ class ProbeEddyEndstopWrapper:
         self._gather.finish()
         self._gather = None
     # Perform a move to pos at speed, stopping when the probe triggers.
-    # Return the full toolhead position where the probe triggered.
+    # Return the full toolhead position where the probe triggered....
+    # ... or where the toolhead is now?
     def probing_move(self, pos, speed):
         logging.info(f"EDDY probing_move: {pos} {speed}")
         phoming = self.eddy._printer.lookup_object('homing')
         trigger_position = phoming.probing_move(self, pos, speed)
         # if we don't have a trigger time, just return the position. Otherwise we can
         # do better, and pull the height from the time
+        logging.info(f"EDDY probing_move: trigger_position {trigger_position} trigger_time {self._trigger_time}")
         if not self._trigger_time:
             return trigger_position
+
+        # probing_move is just to get us to the ballpark.
+        # expectation is to probe the static position and then set Z position.
+        # TODO: just do that here?
+        return trigger_position
 
         # the probe says that it triggered at trigger_time, but it has a
         # settle time -- so start averaging slightly before that point
@@ -710,7 +772,7 @@ class ProbeEddyEndstopWrapper:
 
         toolhead = self.eddy._printer.lookup_object('toolhead')
         toolhead_pos = toolhead.get_position()
-        logging.info(f"EDDY probing_move before adjustments trigger_pos: {trigger_position} toolhead_pos {toolhead_pos}")
+        logging.info(f"EDDY probing_move before adjustments toolhead_pos {toolhead_pos}")
         toolhead_pos[2] = height
         logging.info(f"EDDY probing_move new toolhead_pos {toolhead_pos}")
         return toolhead_pos
@@ -724,9 +786,17 @@ class ProbeEddyEndstopWrapper:
         if self._gather is None:
             raise Exception("probe_prepare called without multi_probe_begin")
 
-        self._gather.wait_for_samples(count_errors=True, min_samples=5)
+        toolhead = self.eddy._printer.lookup_object('toolhead')
+        toolhead.wait_moves()
+
+        logging.info(f"EDDY gather started: {self._gather._started}")
+
+        if not self._gather.wait_for_new_samples(max_wait_time=1.0):
+            if self._gather.get_error_count() == 0:
+                raise self.eddy._printer.command_error("Waited for new samples and got no samples");
 
         last_height = self._gather.get_last_height()
+        logging.info(f"EDDY probe_to_start_position: last_height {last_height:.3f}")
         # we're going to assume if it's "None" that means all the samples were in error
         # and we can just assume it's "high enough"
         if last_height is None:
@@ -735,26 +805,39 @@ class ProbeEddyEndstopWrapper:
 
         z_increase = HOME_PHYSICAL_HEIGHT_PROBE_START - last_height
         if z_increase <= 0:
-            # we don't need to increase z, we're alreday above our physical start height
+            # we don't need to increase z, we're already above our physical start height
             return
 
-        toolhead = self.eddy._printer.lookup_object('toolhead')
+        logging.info("#"*80)
         curtime = self.eddy._printer.get_reactor().monotonic()
+        self.eddy._printer.get_reactor().pause(curtime + 10.000)
+
+        th_pos = toolhead.get_position()
         kin_status = toolhead.get_kinematics().get_status(curtime)
         z_homed = 'z' in kin_status['homed_axes']
 
+        logging.info(f"EDDY toolhead z_homed: {z_homed}, cur toolhead z: {th_pos[2]:.3f} z_increase: {z_increase:.3f}")
         if not z_homed:
             logging.info(f"EDDY Z not homed, assuming someone already hopped")
             return
 
-        toolhead.manual_move([None, None, HOME_PHYSICAL_HEIGHT_PROBE_START], 5.0)
+        # I don't know if I'm allowed to manipulate the toolhead position here,
+        # but I know I want it to be "z_increase" higher
+
+        # tell the toolhead it's "z_increase" lower, minus a bit to make sure
+        # we can raise to the coordinate
+        new_th_pos = [th_pos[0], th_pos[1], th_pos[2] - z_increase - 0.025, th_pos[3]]
+        logging.info(f"Setting new_th_pos {new_th_pos}")
+        toolhead.set_position(new_th_pos, homing_axes=(2,))
+
+        # then move up to the original coordinate
+        toolhead.manual_move([None, None, th_pos[2] - 0.025], 5.0)
         toolhead.wait_moves()
+        logging.info(f"done probe_to_start_position")
+
 
     def probe_finish(self, hmove):
         logging.info(f"EDDY probe_finish ....................................")
-
-    def get_position_endstop(self):
-        return self._home_trigger_z
 
 
 @final
