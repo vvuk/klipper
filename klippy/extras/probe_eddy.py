@@ -252,6 +252,79 @@ class ProbeEddy:
 
         drive_current: int = gcmd.get_int('DRIVE_CURRENT', self.current_drive_current(), minval=0, maxval=31)
 
+
+        with ToolheadMovementHelper(self) as th:
+            # We just did a ManualProbeHelper, so we're going to zero the z-axis
+            # to make the following code easier, so it can assume z=0 is actually real zero.
+            # The Eddy sensor calibration is done to nozzle height (not sensor or trigger height).
+            kin_pos[2] = 0.0
+            th.set_absolute_position(*kin_pos)
+
+            # move to the start of calibration
+            cal_z_max = self.params['calibration_z_max']
+            #th.move_by(-self.offset['x'], -self.offset['y'], cal_z_max)
+            th.move_to_z(cal_z_max)
+
+            mapping = None
+            toolhead_positions = []
+            first_sample_time = None
+            last_sample_time = None
+
+            with ProbeEddySampler(self, calculate_heights=False) as sampler:
+                first_sample_time = th.get_last_move_time()
+                th.move_to_z(0.010)
+                last_sample_time = th.get_last_move_time()
+                sampler.finish()
+
+            # back to a safe spot
+            th.move_to_z(cal_z_max)
+
+        # the samples are a list of [print_time, freq] pairs.
+        # in toolhead_positions, we have a list of [print_time, kin_z] pairs.
+        samples = sampler.get_samples()
+        if len(samples) == 0:
+            gcmd.respond_raw("!! No samples collected\n")
+            return
+
+        freqs = []
+        heights = []
+
+        data_file = open("/tmp/eddy-samples.csv", "w")
+        data_file.write(f"time,frequency,z\n")
+
+        for s_t, s_freq, _ in samples:
+            s_z = th.get_kin_z(at=s_t)
+            data_file.write(f"{s_t},{s_freq},{s_z}\n")
+            # we write everything for debugging, but only use the samples in our
+            # time range
+            if (s_t - first_sample_time) > 0.050 and (last_sample_time - s_t) > 0:
+                freqs.append(s_freq)
+                heights.append(s_z)
+        
+        data_file.close()
+        gcmd.respond_info(f"Wrote {len(samples)} samples to /tmp/eddy-samples.csv")
+
+        # smooth out the data; a simple average does the job
+        weights_for_avg = np.ones(16) / 16.
+        freqs = np.convolve(freqs, weights_for_avg, mode='same')
+        heights = np.convolve(heights, weights_for_avg, mode='same')
+
+
+        # and build a map
+        mapping = ProbeEddyFrequencyMap(self)
+        r2_fth, r2_htf = mapping.calibrate_from_values(drive_current, freqs, heights, gcmd)
+        self._dc_to_fmap[drive_current] = mapping
+        self.save_config(gcmd)
+
+        gcmd.respond_info(f"Calibration complete, R^2: freq-to-height={r2_fth:.3f}, height-to-freq={r2_htf:.3f}")
+
+
+    def cmd_CALIBRATE_next_old(self, gcmd: GCodeCommand, kin_pos: List[float]):
+        if kin_pos is None:
+            return
+
+        drive_current: int = gcmd.get_int('DRIVE_CURRENT', self.current_drive_current(), minval=0, maxval=31)
+
         # We just did a ManualProbeHelper; so we want to tell the printer
         # the current position is actually zero.
         kin_pos[2] = 0.0
@@ -271,7 +344,6 @@ class ProbeEddy:
 
             # away from bed, over nozzle position, then back to bed
 
-            #  FIXME FIXME FIXME -- PUT THIS BACK! -- FIXME FIXME FIXME
             # move the probe to where the nozzle was (i.e. where we set nozzle zero)
             # TODO -- this might not actually matter. We're going to do tap,
             # so we just need a "good enough"
@@ -352,19 +424,7 @@ class ProbeEddy:
 
         data_file.close()
         gcmd.respond_info(f"Wrote {len(samples)} samples to /tmp/eddy-samples.csv")
-
-#        for s_t, s_freq, _ in samples:
-#            logging.info(f"calibration: sample: {s_t} {s_freq:.2f}")
-#            # TODO: make this more elegant
-#            for n_start, n_end, n_z in movement_notes:
-#                if (n_start+sample_pad) <= s_t <= (n_end-sample_pad):
-#                    freqs.append(s_freq)
-#                    heights.append(n_z)
-#                    data_file.write(f"{s_t},{s_freq},{n_z}\n")
-#
-#                    logging.info(f"calibration: toolhead: {s_t} {s_freq:.2f} {n_z:.3f}")
-
-        gcmd.respond_info(f"Collected {len(samples)} samples, filtered to {len(freqs)} for {len(movement_notes)} steps")
+        gcmd.respond_info(f"Using {len(freqs)} samples for {len(movement_notes)} steps")
 
         if len(freqs) == 0:
             gcmd.respond_raw("!! No samples collected\n")
@@ -385,10 +445,12 @@ class ProbeEddy:
         configfile = self._printer.lookup_object('configfile')
         configfile.set(self._full_name, f"calibrated_drive_currents", str.join(', ', [str(dc) for dc in self._dc_to_fmap.keys()]))
 
+        if gcmd:
+            gcmd.respond_info("Calibration saved. Issue a SAVE_CONFIG to write the values to your config file and restart Klipper.")
+
+    #
     # PrinterProbe interface
-    # I am seriously lost with PrinterProbe, ProbeEndstopWrapper, ProbeSessionWrapper, etc.
-    # it's not clear at all to me what the relationships are between all of these.
-    # PrinterProbe is what `probe` typically is, so we're instead emulating it here.
+    #
 
     def get_offsets(self):
         # the z offset is the trigger height, because the probe will trigger
@@ -420,14 +482,17 @@ class ProbeEddy:
         status = self._cmd_helper.get_status(eventtime)
         status.update({ 'name': self._full_name, 'home_trigger_height': self.params['home_trigger_height'] })
         return status
-    
-    # Tap move
+
+    # 
+    # Tap probe
+    #
     def cmd_TAP(self, gcmd: GCodeCommand):
         self.tapping_move(gcmd)
 
     def tapping_move(self, gcmd: GCodeCommand):
-        TAP_MOVE_SPEED=2.0
-        Z=0.5
+        TAP_MOVE_SPEED=3.0
+        TAP_RETRACT_SPEED=5.0
+        Z=0.25
 
         TAP_MOVE_SPEED = gcmd.get_float('SPEED', TAP_MOVE_SPEED, above=0.0)
         Z = gcmd.get_float('Z', Z)
@@ -448,7 +513,7 @@ class ProbeEddy:
 
         # Tap start position
         tap_start = 3.8
-        th.manual_move([None, None, tap_start], 5.0) #TAP_MOVE_SPEED)
+        th.manual_move([None, None, tap_start], TAP_RETRACT_SPEED)
         th.dwell(0.100)
         th.wait_moves()
 
@@ -457,8 +522,8 @@ class ProbeEddy:
 
         def get_kin_pos():
             return {s.get_name(): s.get_commanded_position() for s in kin.get_steppers()}
-        
-        # A fake tapping move (don't hit the bed!)
+
+        # go through the full motion 
         tap_target_pos = th.get_position()
         tap_target_pos[2] = Z
 
@@ -507,7 +572,8 @@ class ProbeEddy:
                 errors.append(f"Trigger not hit: {reason}")
         else:
             th.manual_move(tap_target_pos, TAP_MOVE_SPEED)
-            th.dwell(2.000)
+            th.dwell(0.500)
+            th.manual_move([None, None, tap_start], TAP_RETRACT_SPEED)
             th.wait_moves()
 
         gather.finish()
@@ -1081,9 +1147,17 @@ class ProbeEddyFrequencyMap:
         raw_freqs = np.array(raw_freqs)
         raw_heights = np.array(raw_heights)
 
-        # Group frequencies by heights and compute the median for each height
-        heights = np.unique(raw_heights)
-        freqs = np.array([np.median(raw_freqs[raw_heights == h]) for h in heights])
+        ## Group frequencies by heights and compute the median for each height
+        #heights = np.unique(raw_heights)
+        #freqs = np.array([np.median(raw_freqs[raw_heights == h]) for h in heights])
+
+        SAMPLE_TARGET = 200
+        R2_TOLERANCE = 0.95
+
+        indices = np.unique(raw_freqs, return_index=True)[1]
+        decimate = int(round(len(indices) / SAMPLE_TARGET))
+        freqs = raw_freqs[indices][::decimate]
+        heights = raw_heights[indices][::decimate]
 
         def r2(p, x, y):
             y_hat = p(x)
@@ -1091,35 +1165,40 @@ class ProbeEddyFrequencyMap:
             ss_tot = np.sum((y - np.mean(y))**2)
             return 1 - (ss_res / ss_tot)
 
-        r2_tolerance = 0.95
+        def best_fit(x, y):
+            best_r2 = 0
+            best_p = None
+            for i in range(3, 9):
+                p = npp.Polynomial.fit(x, y, i)
+                r2_val = r2(p, x, y)
+                if r2_val > best_r2:
+                    best_r2 = r2_val
+                    if r2_val > R2_TOLERANCE:
+                        best_p = p
+            return best_p, best_r2
 
-        # empirically, freq-to-position results need a 3D polynomial to hit R^2=1
-        # where position-to-frequency fits cleanly with a 2D polynomial. But find
-        # the best r^2
-        for i in range(3, 9):
-            self._freq_to_height = npp.Polynomial.fit(freqs, heights, i)
-            r2_fth = r2(self._freq_to_height, freqs, heights)
-            if r2_fth >= r2_tolerance:
-                break
+        fth, r2_fth = best_fit(freqs, heights)
+        htf, r2_htf = best_fit(heights, freqs)
 
-        for i in range(3, 9):
-            self._height_to_freq = npp.Polynomial.fit(heights, freqs, i)
-            r2_htf = r2(self._height_to_freq, heights, freqs)
-            if r2_htf >= r2_tolerance:
-                break
+        if fth is None or htf is None:
+            msg = "Calibration failed; unable to find a good fit. (R^2 {r2_fth:.3f}, {r2_htf:.3f})"
+            if gcmd:
+                gcmd.respond_raw(f"!! {msg}\n")
+                return
+            raise self._eddy._printer.command_error(msg)
 
         msg = f"Calibrated eddy current polynomials for drive current {drive_current}:\n" + \
-             f"   freq-to-height (R^2={r2_fth:.3f}): {self._coefs(self._freq_to_height)}\n" + \
-             f"        domain: {self._freq_to_height.domain} window: {self._freq_to_height.window}\n" + \
-             f"   height-to-freq (R^2={r2_htf:.3f}): {self._coefs(self._height_to_freq)}\n" + \
-             f"        domain: {self._height_to_freq.domain} window: {self._height_to_freq.window}\n"
+             f"   freq-to-height (R^2={r2_fth:.3f}): {self._coefs(fth)}\n" + \
+             f"        domain: {fth.domain}\n" + \
+             f"   height-to-freq (R^2={r2_htf:.3f}): {self._coefs(htf)}\n" + \
+             f"        domain: {htf.domain}\n"
 
         logging.info(msg)
         if gcmd:
             gcmd.respond_info(msg, gcmd)
-            if r2_htf < r2_tolerance or r2_fth < r2_tolerance:
-                gcmd.respond_raw("!! R^2 values are below tolerance; calibration may not be accurate.\n")
 
+        self._freq_to_height = fth
+        self._height_to_freq = htf
         self.drive_current = drive_current
 
         return (r2_fth, r2_htf)
@@ -1139,9 +1218,6 @@ class ProbeEddyFrequencyMap:
         # why is there a floatarray getter, but not a setter?
         configfile.set(self._eddy._full_name, f"freq_to_height_p_{self.drive_current}", floatlist_to_str(ftoh_coefs))
         configfile.set(self._eddy._full_name, f"height_to_freq_p_{self.drive_current}", floatlist_to_str(htof_coefs))
-
-        if gcmd:
-            gcmd.respond_info("Calibration saved. Issue a SAVE_CONFIG to write the values to your config file and restart Klipper.")
 
     def raw_freqval_to_height(self, raw_freq: int, temp: float = None) -> float:
         if raw_freq > 0x0fffffff:
