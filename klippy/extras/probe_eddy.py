@@ -426,11 +426,11 @@ class ProbeEddy:
         self.tapping_move(gcmd)
 
     def tapping_move(self, gcmd: GCodeCommand):
-        TAP_MOVE_SPEED=5.0
-        Z=2.0
+        TAP_MOVE_SPEED=2.0
+        Z=0.5
 
         TAP_MOVE_SPEED = gcmd.get_float('SPEED', TAP_MOVE_SPEED, above=0.0)
-        Z = gcmd.get_float('Z', Z, above=0.0)
+        Z = gcmd.get_float('Z', Z)
 
         reactor = self._printer.get_reactor()
         th = self._printer.lookup_object('toolhead')
@@ -447,7 +447,8 @@ class ProbeEddy:
             raise self._printer.command_error("Z axis must be homed before tapping")
 
         # Tap start position
-        th.manual_move([None, None, 5.0], TAP_MOVE_SPEED)
+        tap_start = 3.8
+        th.manual_move([None, None, tap_start], 5.0) #TAP_MOVE_SPEED)
         th.dwell(0.100)
         th.wait_moves()
 
