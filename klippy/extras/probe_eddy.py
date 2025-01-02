@@ -223,7 +223,7 @@ class ProbeEddy:
         manual_probe.ManualProbeHelper(self._printer, gcmd,
                                        lambda kin_pos: self.cmd_CALIBRATE_next(gcmd, kin_pos))
 
-    def cmd_CALIBRATE_next(self, gcmd: GCodeCommand, kin_pos: float):
+    def cmd_CALIBRATE_next(self, gcmd: GCodeCommand, kin_pos: List[float]):
         if kin_pos is None:
             return
 
@@ -389,21 +389,31 @@ class ProbeEddy:
     
     # Tap move
     def cmd_TAP(self, gcmd: GCodeCommand):
-        pass
+        self.tapping_move(gcmd)
 
     def tapping_move(self, gcmd: GCodeCommand):
-        TAP_MOVE_SPEED=10.0
-        th = self._printer.lookup_object('toolhead')
+        TAP_MOVE_SPEED=5.0
+        Z=2.0
 
+        TAP_MOVE_SPEED = gcmd.get_float('SPEED', TAP_MOVE_SPEED, above=0.0)
+        Z = gcmd.get_float('Z', Z, above=0.0)
+
+        reactor = self._printer.get_reactor()
+        th = self._printer.lookup_object('toolhead')
         kin = th.get_kinematics()
-        curtime = self._reactor.monotonic()
-        kin_status = kin.get_status(self._reactor.monotonic())
+
+        home_trigger_height = self.params['home_trigger_height']
+        home_trigger_height_start_offset = self.params['home_trigger_height_start_offset']
+
+        curtime_r = reactor.monotonic()
+        kin_status = kin.get_status(curtime_r)
         z_homed = 'z' in kin_status['homed_axes']
 
         if not z_homed:
             raise self._printer.command_error("Z axis must be homed before tapping")
 
-        # Make sure toolhead isn't moving
+        # Tap start position
+        th.manual_move([None, None, 5.0], TAP_MOVE_SPEED)
         th.dwell(0.100)
         th.wait_moves()
 
@@ -413,53 +423,57 @@ class ProbeEddy:
         def get_kin_pos():
             return {s.get_name(): s.get_commanded_position() for s in kin.get_steppers()}
         
-        kin_start_pos = get_kin_pos()
-
-        dispatch = mcu.TriggerDispatch(self._mcu)
-
-        print_time = self.toolhead.get_last_move_time()
-
-        # we need to hit start_freq after start_time, and then pass through trigger_freq
-        # on the way to a tap
-        start_time = print_time + HOME_TRIGGER_START_TIME_OFFSET
-        start_freq = self.eddy.height_to_freq(self._home_trigger_height + self._home_trigger_height_start_offset)
-        trigger_freq = self.eddy.height_to_freq(self._home_trigger_height)
-
-        tap_completion = dispatch.start(print_time)
-
-        # run the tap
-        #self._sensor.run_tap2(dispatch.get_oid(),
-        self._sensor.setup_home2(dispatch.get_oid(),
-                                 mcu.MCU_trsync.REASON_ENDSTOP_HIT, self.REASON_BASE,
-                                 trigger_freq, start_freq, print_time + HOME_TRIGGER_START_TIME_OFFSET)
-        
         # A fake tapping move (don't hit the bed!)
         tap_target_pos = th.get_position()
-        tap_target_pos[2] = 1.0
+        tap_target_pos[2] = Z
 
         errors = []
-        try:
-            th.drip_move(tap_target_pos, TAP_MOVE_SPEED, tap_completion)
-        #except self.printer.command_error as e:
-        except Exception as e:
-            logging.info(f"Error during drip move: {e}")
-            errors.append(str(e))
 
-        try:
-            move_end_time = th.get_last_move_time()
-            dispatch.wait_end(move_end_time)
-        except Exception as e:
-            logging.info(f"Error dispatch wait: {e}")
-            errors.append(str(e))
-        
-        trigger_time = self._sensor.clear_home()
-        reason = dispatch.stop()
+        as_dispatch = False
+        if as_dispatch:
+            # borrow this dispatch
+            dispatch = self._endstop_wrapper._dispatch
 
-        if reason != mcu.MCU_trsync.REASON_ENDSTOP_HIT:
-            errors.append(f"Trigger not hit: {reason}")
+            print_time = th.get_last_move_time()
 
-        if len(errors) > 0:
-            raise self._printer.command_error(f"Error during tapping move: {', '.join(errors)}")
+            # we need to hit start_freq after start_time, and then pass through trigger_freq
+            # on the way to a tap
+            start_time = print_time + HOME_TRIGGER_START_TIME_OFFSET
+            start_freq = self.height_to_freq(home_trigger_height + home_trigger_height_start_offset)
+            trigger_freq = self.height_to_freq(home_trigger_height)
+
+            tap_completion = dispatch.start(print_time)
+
+            # run the tap
+            #self._sensor.run_tap2(dispatch.get_oid(),
+            REASON_BASE = mcu.MCU_trsync.REASON_COMMS_TIMEOUT + 1
+            self._sensor.setup_home2(dispatch.get_oid(),
+                                    mcu.MCU_trsync.REASON_ENDSTOP_HIT, REASON_BASE,
+                                    trigger_freq, start_freq, print_time + HOME_TRIGGER_START_TIME_OFFSET)
+            
+            try:
+                th.drip_move(tap_target_pos, TAP_MOVE_SPEED, tap_completion)
+            #except self.printer.command_error as e:
+            except Exception as e:
+                logging.info(f"Error during drip move: {e}")
+                errors.append(str(e))
+
+            try:
+                move_end_time = th.get_last_move_time()
+                dispatch.wait_end(move_end_time+3.0)
+            except Exception as e:
+                logging.info(f"Error dispatch wait: {e}")
+                errors.append(str(e))
+            
+            trigger_time = self._sensor.clear_home()
+            reason = dispatch.stop()
+
+            if reason != mcu.MCU_trsync.REASON_ENDSTOP_HIT:
+                errors.append(f"Trigger not hit: {reason}")
+        else:
+            th.manual_move(tap_target_pos, TAP_MOVE_SPEED)
+            th.dwell(2.000)
+            th.wait_moves()
 
         gather.finish()
         samples = gather.get_samples()
@@ -471,7 +485,8 @@ class ProbeEddy:
         
         gcmd.respond_info(f"Wrote {len(samples)} samples to /tmp/tap-samples.csv")
 
-
+        if len(errors) > 0:
+            raise self._printer.command_error(f"Error during tapping move: {', '.join(errors)}")
 
 #
 # Bed scan specific probe session interface
@@ -868,6 +883,7 @@ class ProbeEddySampler:
     def finish(self):
         if not self._started:
             raise self.eddy._printer.command_error("ProbeEddySampler.finish() called without start()")
+        self.eddy._sensor.clear_home()
         self._stopped = True
 
     def _update_samples(self):
