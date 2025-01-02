@@ -263,6 +263,23 @@ class LDC1612:
             return
 
         self._verify_chip()
+
+        ldc_fref = 12_000_000
+
+        # samples/sec
+        data_rate = self.data_rate
+        # TODO: use freq_max to pick deglitch
+        freq_max = 3_200_000
+        deglitch = DEGLITCH_3_3MHZ
+        # this is the settle time for the initial conversion (and initial conversion only),
+        # there's no reason for this to be small
+        settle_time = SETTLETIME
+
+
+        val_settle_count = 0xffff # int(SETTLETIME * freq / 16. + .5)
+
+
+        # This is the TI-recommended register configuration order
         # Setup chip in requested query rate
         rcount0 = LDC1612_FREQ / (16. * (self.data_rate - 4))
         self.set_reg(REG_RCOUNT0, int(rcount0 + 0.5))

@@ -25,6 +25,8 @@ enum {
     LH_V2 = 1<<5,
 };
 
+#define BYTES_PER_SAMPLE 4
+
 #define REASON_ERROR_SENSOR 0
 #define REASON_ERROR_PROBE_TOO_LOW 1
 #define REASON_TOUCH 5
@@ -100,6 +102,10 @@ struct ldc1612 {
     struct sensor_bulk sb;
     struct gpio_in intb_pin;
     uint16_t prev_status;
+
+    // Samples per second (configured 
+    uint32_t data_rate;
+    uint32_t 
 
     uint32_t last_read_value;
 
@@ -295,8 +301,6 @@ read_reg_status(struct ldc1612 *ld)
     ld->prev_status = (data_status[0] << 8) | data_status[1];
     return ld->prev_status;
 }
-
-#define BYTES_PER_SAMPLE 4
 
 // Query ldc1612 data
 static void
