@@ -15,10 +15,14 @@ LDC1612_ADDR = 0x2a
 LDC1612_FREQ = 12000000
 SETTLETIME = 0.005
 DRIVECUR = 15
-DEGLITCH = 0x05 # 10 Mhz
 
-EMA_BASE = 16
-HOMING_AVERAGE_WEIGHT = 0.25
+# TODO: configure these as part of calibration
+DEGLITCH_1_0MHZ = 0x01
+DEGLITCH_3_3MHZ = 0x04
+DEGLITCH_10MHZ = 0x05
+DEGLITCH_33MHZ = 0x07
+
+DEGLITCH = DEGLITCH_10MHZ
 
 LDC1612_MANUF_ID = 0x5449
 LDC1612_DEV_ID = 0x3055
@@ -91,8 +95,8 @@ class LDC1612:
         self.printer = config.get_printer()
         self.calibration = calibration
         self.dccal = DriveCurrentCalibrate(config, self)
+        self._drive_current = self.dccal.get_drive_current()
         self.data_rate = config.getint("samples_per_second", 250, minval=50)
-        self._ema_weight = config.getfloat("exp_moving_average_weight", HOMING_AVERAGE_WEIGHT, minval=0.0, maxval=1.0)
         self._start_count = 0
         # Setup mcu sensor_ldc1612 bulk query code
         self.i2c = bus.MCU_I2C_from_config(config,
@@ -113,11 +117,9 @@ class LDC1612:
         else:
             mcu.add_config_cmd("config_ldc1612 oid=%d i2c_oid=%d"
                                % (oid, self.i2c.get_oid()))
-        factor = 0
-        if self._ema_weight > 0.0:
-            factor = int((1. - self._ema_weight) * EMA_BASE + 0.5)
-            factor = min(EMA_BASE - 1, max(0, factor))
-        mcu.add_config_cmd("ldc1612_setup_averaging oid=%d factor=%d" % (oid, factor))
+
+        # TODO setup averaging for ldc2
+        #mcu.add_config_cmd("ldc1612_setup_averaging oid=%d factor=%d" % (oid, factor))
         mcu.add_config_cmd("ldc1612_start_stop oid=%d rest_ticks=0" % (oid,), on_restart=True)
         mcu.register_config_callback(self._build_config)
         # Bulk sample message reading
@@ -142,13 +144,11 @@ class LDC1612:
                                           oid=self.oid, cq=cmdqueue)
         self.ldc1612_setup_home_cmd = self.mcu.lookup_command(
             "ldc1612_setup_home oid=%c clock=%u threshold=%u"
-            " trsync_oid=%c trigger_reason=%c error_reason=%c"
-            " tap_threshold=%i tap_adjust_factor=%u tap_clock=%u"
-            " pretap_reason=%c", cq=cmdqueue)
+            " trsync_oid=%c trigger_reason=%c error_reason=%c", cq=cmdqueue)
         self.ldc1612_setup_home2_cmd = self.mcu.lookup_command(
              "ldc1612_setup_home2 oid=%c"
              " trsync_oid=%c trigger_reason=%c other_reason_base=%c"
-             " trigger_freq=%u start_freq=%u start_time=%u", cq=cmdqueue);
+             " trigger_freq=%u start_freq=%u start_time=%u tap_threshold=%i", cq=cmdqueue);
         self.query_ldc1612_home_state_cmd = self.mcu.lookup_query_command(
             "query_ldc1612_home_state oid=%c",
             "ldc1612_home_state oid=%c homing=%c trigger_clock=%u",
@@ -156,10 +156,6 @@ class LDC1612:
         self.query_ldc1612_latched_status_cmd = self.mcu.lookup_query_command(
             "query_ldc1612_latched_status oid=%c",
             "ldc1612_latched_status oid=%c status=%u lastval=%u",
-            oid=self.oid, cq=cmdqueue)
-        self.query_ldc1612_hack_cmd = self.mcu.lookup_query_command(
-            "query_ldc1612_hack oid=%c",
-            "ldc1612_hack oid=%c time=%u avg=%i cavg=%i adj=%i",
             oid=self.oid, cq=cmdqueue)
         self.mcu.register_response(self._handle_debug_print, "debug_print")
     def _handle_debug_print(self, params):
@@ -178,9 +174,11 @@ class LDC1612:
     def latched_status(self):
         response = self.query_ldc1612_latched_status_cmd.send([self.oid])
         return response['status']
+
     def latched_status_str(self):
         s = self.latched_status()
         return self.status_to_str(s)
+
     def status_to_str(self, s: int):
         result = []
         if (s & (1<<15)) != 0: result.append('ERR_CH1')
@@ -193,6 +191,7 @@ class LDC1612:
         if (s & (1<<6)) != 0: result.append('DRDY')
         if (s & (1<<3)) != 0: result.append('UNREADCONV1')
         return str.join(' ', result)
+
     def read_one_value(self):
         self._init_chip()
         res = self.query_ldc1612_latched_status_cmd.send([self.oid])
@@ -215,34 +214,14 @@ class LDC1612:
              0, 0, 0, 0])
 
     def setup_home2(self, trsync_oid, hit_reason, reason_base,
-                    trigger_freq, start_freq, start_time):
+                    trigger_freq, start_freq, start_time, tap_threshold=0):
         t_freqvl = self.to_ldc_freqval(trigger_freq)
         s_freqval = self.to_ldc_freqval(start_freq)
         start_time_mcu = self.mcu.print_time_to_clock(start_time)
-        logging.info(f"LD1612 setup_home2: trigger: {trigger_freq:.2f} ({t_freqvl}) start: {start_freq:.2f} ({s_freqval}) @ {start_time:.2f} trsync: {trsync_oid} {hit_reason} {reason_base}")
+        logging.info(f"LD1612 setup_home2: trigger: {trigger_freq:.2f} ({t_freqvl}) start: {start_freq:.2f} ({s_freqval}) @ {start_time:.2f} trsync: {trsync_oid} {hit_reason} {reason_base} TAP: {tap_threshold}")
         self.ldc1612_setup_home2_cmd.send([self.oid, trsync_oid, hit_reason,
-                                           reason_base, t_freqvl, s_freqval, start_time_mcu])
+                                           reason_base, t_freqvl, s_freqval, start_time_mcu, tap_threshold])
 
-    def setup_tap(self, print_time, tap_time, pretap_freq,
-                  trsync_oid, hit_reason, err_reason,
-                  tap_threshold, tap_factor):
-        clock = self.mcu.print_time_to_clock(print_time)
-        tap_clock = self.mcu.print_time_to_clock(tap_time)
-        if tap_clock - clock >= 1<<31:
-            raise self.printer.command_error(
-                "ldc1612 tap time too far in future")
-        ptfreq = self.to_ldc_freqval(pretap_freq) #int(pretap_freq * (1<<28) / float(LDC1612_FREQ) + 0.5)
-        # vv: spread tap_factor into a per-sample adjustment factor
-        adj_factor = tap_factor / self.data_rate # data_rate = 250
-        tapfreq = -self.to_ldc_freqval(tap_threshold * adj_factor) # -int(tap_threshold * adj_factor * (1<<28) / float(LDC1612_FREQ) + 0.5)
-        # vv: then broadcast that per-sample adjustment factor (which.. must be between 0 and 1?) 
-        # into the range 0..2^32 so that we can do integer math on the other side
-        tfactor = int(adj_factor * (1<<32) + 0.5)
-        logging.info("TAP: pretap_freq=%f/%d tap_threshold=%f/%d tap_factor=%f/%d", pretap_freq, ptfreq,
-                     tap_threshold, tapfreq, tap_factor, tfactor)
-        self.ldc1612_setup_home_cmd.send(
-            [self.oid, clock, ptfreq, trsync_oid, hit_reason, err_reason,
-             tapfreq, tfactor, tap_clock, err_reason + 1])
     def clear_home(self):
         self.ldc1612_setup_home_cmd.send([self.oid, 0, 0, 0, 0, 0, 0, 0, 0, 0])
         if self.mcu.is_fileoutput():
@@ -250,15 +229,7 @@ class LDC1612:
         params = self.query_ldc1612_home_state_cmd.send([self.oid])
         tclock = self.mcu.clock32_to_clock64(params['trigger_clock'])
         return self.mcu.clock_to_print_time(tclock)
-    def query_hack(self):
-        freq_conv = float(LDC1612_FREQ) / (1<<28)
-        logging.info("TAP: LDC DUMP:")
-        for i in range(64):
-            res = self.query_ldc1612_hack_cmd.send([self.oid])
-            if res['time'] > 0:
-                avg_ldc = res['avg']
-                avg = round(avg_ldc * freq_conv, 3)
-                logging.info(f"TAP: {i} {res['time']} {avg} / {res['avg']} {res['cavg']} {res['adj']}")
+
     # Measurement decoding
     def _convert_samples(self, samples):
         freq_conv = float(LDC1612_FREQ) / (1<<28)
@@ -298,16 +269,20 @@ class LDC1612:
         self.set_reg(REG_OFFSET0, 0)
         self.set_reg(REG_SETTLECOUNT0, int(SETTLETIME*LDC1612_FREQ/16. + .5))
         self.set_reg(REG_CLOCK_DIVIDERS0, (1 << 12) | 1)
-        self.set_reg(REG_ERROR_CONFIG, (0x1f << 11) | 0b11001)
+        self.set_reg(REG_ERROR_CONFIG, 0b1111_1100_1111_1001) # report everything to STATUS and INTB except ZC
         self.set_reg(REG_MUX_CONFIG, 0x0208 | DEGLITCH)
         # RP_OVERRIDE_EN | AUTO_AMP_DIS | REF_CLK_SRC=clkin | reserved
         self.set_reg(REG_CONFIG, (1<<12) | (1<<10) | (1<<9) | 0x001)
-        self.set_reg(REG_DRIVE_CURRENT0, self.dccal.get_drive_current() << 11)
+        self.set_reg(REG_DRIVE_CURRENT0, self._drive_current << 11)
         self._initialized = True
+
+    def get_drive_current(self) -> int:
+        return self._drive_current
 
     def set_drive_current(self, cval: int):
         if cval < 0 or cval > 31:
             raise self.printer.command_error("Drive current must be between 0 and 31")
+        self._drive_current = cval
         self.set_reg(REG_DRIVE_CURRENT0, cval << 11)
 
     # Start, stop, and process message batches

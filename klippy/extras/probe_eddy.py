@@ -9,7 +9,7 @@ import pins
 
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Callable, List, Optional, TypedDict, final
+from typing import Callable, Dict, List, Optional, TypedDict, final
 
 from clocksync import SecondarySync
 from configfile import ConfigWrapper
@@ -89,8 +89,13 @@ class ProbeEddy:
             "y": config.getfloat("y_offset", 0.0),
         }
 
-        self._fmap = ProbeEddyFrequencyMap(self)
-        self._fmap.load_from_config(config)
+        # drive current to frequency map
+        self._dc_to_fmap: Dict[int, ProbeEddyFrequencyMap] = {}
+        calibrated_drive_currents = config.getintlist('calibrated_drive_currents', [])
+
+        for dc in calibrated_drive_currents:
+            self._dc_to_fmap[dc] = ProbeEddyFrequencyMap(self)
+            self._dc_to_fmap[dc].load_from_config(config, dc)
 
         # Our virtual endstop and all-around "do things" class. The majority
         # of probing functionality happens here.
@@ -138,27 +143,45 @@ class ProbeEddy:
         gcode.register_command("PEQUERY", self.cmd_QUERY)
         gcode.register_command("PETAP", self.cmd_TAP)
 
+    def current_drive_current(self) -> int:
+        return self._sensor.get_drive_current()
+
+    def map_for_drive_current(self, dc: int = None) -> ProbeEddyFrequencyMap:
+        if dc is None:
+            dc = self.current_drive_current()
+        if dc not in self._dc_to_fmap:
+            raise self._printer.command_error(f"Drive current {dc} not calibrated")
+        return self._dc_to_fmap[dc]
+
     # helpers to forward to the map
-    def height_to_freq(self, height: float, temp: float = None) -> float:
-        return self._fmap.height_to_freq(height, temp)
+    def height_to_freq(self, height: float, drive_current: int = None, temp: float = None) -> float:
+        if drive_current is None:
+            drive_current = self.current_drive_current()
+        return self.map_for_drive_current(drive_current).height_to_freq(height, temp)
 
-    def freq_to_height(self, freq: float, temp: float = None) -> float:
-        return self._fmap.freq_to_height(freq, temp)
+    def freq_to_height(self, freq: float, drive_current: int = None, temp: float = None) -> float:
+        if drive_current is None:
+            drive_current = self.current_drive_current()
+        return self.map_for_drive_current(drive_current).freq_to_height(freq, temp)
 
-    def calibrated(self) -> bool:
-        return self._fmap.calibrated()
+    def calibrated(self, drive_current: int = None) -> bool:
+        if drive_current is None:
+            drive_current = self.current_drive_current()
+        return drive_current in self._dc_to_fmap and self._dc_to_fmap[drive_current].calibrated()
 
     def cmd_QUERY(self, gcmd: GCodeCommand):
-        reactor = self._printer.get_reactor()
-
-        self._sensor._start_measurements()
-        systime = reactor.monotonic()
-        reactor.pause(systime + 0.050)
         status, freqval, freq = self._sensor.read_one_value()
-        self._sensor._finish_measurements()
+        height = self.freq_to_height(freq) if self.calibrated() else -math.inf
 
-        height = self._fmap.freq_to_height(freq)
-        gcmd.respond_info(f"Last coil value: {freq:.2f} ({height:.3f}mm) (raw: {hex(freqval)} {self._sensor.status_to_str(status)} {hex(status)})")
+        err = ""
+        if freqval > 0x0fffffff:
+            height = -math.inf
+            freq = 0.0
+            err = f"ERROR: {bin(freqval >> 28)} "
+        if not self.calibrated():
+            err += "(Not calibrated) "
+
+        gcmd.respond_info(f"Last coil value: {freq:.2f} ({height:.3f}mm) raw: {hex(freqval)} {err}status: {hex(status)} {self._sensor.status_to_str(status)}")
 
     # TODO: use this in implementing cmd_QUERY in above
     def read_current_freq_and_height(self):
@@ -170,11 +193,11 @@ class ProbeEddy:
         if freqval > 0x0fffffff:
             return None, -math.inf
 
-        height = self._fmap.freq_to_height(freq)
+        height = self.freq_to_height(freq)
         return freq, height
 
     def cmd_PROBE_STATIC(self, gcmd: GCodeCommand):
-        if not self._fmap.calibrated():
+        if not self.calibrated():
             gcmd.respond_raw("!! Probe not calibrated\n")
             return
 
@@ -227,6 +250,8 @@ class ProbeEddy:
         if kin_pos is None:
             return
 
+        drive_current: int = gcmd.get_int('DRIVE_CURRENT', self.current_drive_current(), minval=0, maxval=31)
+
         # We just did a ManualProbeHelper; so we want to tell the printer
         # the current position is actually zero.
         kin_pos[2] = 0.0
@@ -269,9 +294,11 @@ class ProbeEddy:
             first_sample_time = None
             last_sample_time = None
 
-            with ProbeEddySampler(self) as sampler:
+            with ProbeEddySampler(self, calculate_heights=False) as sampler:
                 # move down in steps, taking samples
                 # note: np.arange is exclusive of the stop value; this will _not_ include z=0
+
+                # TODO omg this is awful, we can do this in one slow smooth motion and get more samples!
                 for z in np.arange(cal_z_max, 0, -self.params['calibration_step']):
                     # hop up, then move downward to z to reduce backlash
                     #th.move_to_z(z + 1.000)
@@ -345,11 +372,18 @@ class ProbeEddy:
 
         # and build a map
         mapping = ProbeEddyFrequencyMap(self)
-        r2_fth, r2_htf = mapping.calibrate_from_values(freqs, heights, gcmd)
-        mapping.save_calibration(gcmd)
-        self._fmap = mapping
+        r2_fth, r2_htf = mapping.calibrate_from_values(drive_current, freqs, heights, gcmd)
+        self._dc_to_fmap[drive_current] = mapping
+        self.save_config(gcmd)
 
         gcmd.respond_info(f"Calibration complete, R^2: freq-to-height={r2_fth:.3f}, height-to-freq={r2_htf:.3f}")
+
+    def save_config(self, gcmd: GCodeCommand):
+        for _, fmap in self._dc_to_fmap.items():
+            fmap.save_calibration(gcmd)
+
+        configfile = self._printer.lookup_object('configfile')
+        configfile.set(self._full_name, f"calibrated_drive_currents", str.join(', ', [str(dc) for dc in self._dc_to_fmap.keys()]))
 
     # PrinterProbe interface
     # I am seriously lost with PrinterProbe, ProbeEndstopWrapper, ProbeSessionWrapper, etc.
@@ -825,6 +859,7 @@ class ProbeEddyEndstopWrapper:
 
         logging.info(f"EDDY toolhead z_homed: {z_homed}, cur toolhead z: {th_pos[2]:.3f} z_increase: {z_increase:.3f} max_z {axis_max_z:.3f}")
 
+        # We may be too low or too high.
         # if we're not z-homed, then ask the user to add a z-hop to their homing sequence.
         # TODO -- we could just hop here.
         if not z_homed or th_pos[2] >= axis_max_z:
@@ -841,21 +876,22 @@ class ProbeEddyEndstopWrapper:
 # Helper to gather samples and convert them to probe positions
 @final
 class ProbeEddySampler:
-    def __init__(self, eddy: ProbeEddy, trace=False):
+    def __init__(self, eddy: ProbeEddy, calculate_heights: bool = True, trace: bool = False):
         self.eddy = eddy
         self._sensor = eddy._sensor
         self._reactor = self.eddy._printer.get_reactor()
         self._mcu = self._sensor.get_mcu()
-        # this will hold the raw samples coming in from the sensor,
-        # with an empty 3rd (height) value
-        self._raw_samples = None
         self._stopped = False
         self._started = False
         self._errors = 0
         self._trace = trace
+        self._fmap = eddy.map_for_drive_current() if calculate_heights else None
 
-        # this will hold samples with a height filled in
-        self._samples = None
+        # this will hold the raw samples coming in from the sensor,
+        # with an empty 3rd (height) value
+        self._raw_samples = []
+        # this will hold samples with a height filled in (if we're doing that)
+        self._samples = []
 
     def __enter__(self):
         self.start()
@@ -887,11 +923,15 @@ class ProbeEddySampler:
         self._stopped = True
 
     def _update_samples(self):
-        if self._samples is None:
-            self._samples = []
+        if len(self._samples) == len(self._raw_samples):
+            return
+
         start_idx = len(self._samples)
-        new_samples = [(t, f, self.eddy.freq_to_height(f)) for t, f, _ in self._raw_samples[start_idx:]]
-        self._samples.extend(new_samples)
+        if self._fmap is not None:
+            new_samples = [(t, f, self._fmap.freq_to_height(f)) for t, f, _ in self._raw_samples[start_idx:]]
+            self._samples.extend(new_samples)
+        else:
+            self._samples.extend(self._raw_samples[start_idx:])
 
     def get_raw_samples(self):
         return self._raw_samples.copy()
@@ -1008,16 +1048,23 @@ class ProbeEddyFrequencyMap:
         self._sensor = eddy._sensor
         self._temp_sensor = eddy._temp_sensor
 
-    def load_from_config(self, config: ConfigWrapper):
-        ftoh = config.getfloatlist("freq_to_height_p", default=None)
-        htof = config.getfloatlist("height_to_freq_p", default=None)
+        self.drive_current = 0
+        self._freq_to_height: Optional[npp.Polynomial] = None
+        self._height_to_freq: Optional[npp.Polynomial] = None
+
+    def load_from_config(self, config: ConfigWrapper, drive_current: int):
+        ftoh = config.getfloatlist(f"freq_to_height_p_{drive_current}", default=None)
+        htof = config.getfloatlist(f"height_to_freq_p_{drive_current}", default=None)
 
         if ftoh and htof:
+            self.drive_current = drive_current
             self._freq_to_height = npp.Polynomial(ftoh)
             self._height_to_freq = npp.Polynomial(htof)
-            logging.info(f"Loaded polynomial freq-to-height: {self._coefs(self._freq_to_height)}\n" + \
-                f"                  height-to-freq: {self._coefs(self._height_to_freq)}")
+            logging.info(f"Loaded polynomials for drive current {drive_current}:" + \
+                         f"   freq-to-height: {self._coefs(self._freq_to_height)}\n" + \
+                         f"   height-to-freq: {self._coefs(self._height_to_freq)}")
         else:
+            self.drive_current = 0
             self._freq_to_height = None
             self._height_to_freq = None
 
@@ -1027,7 +1074,7 @@ class ProbeEddyFrequencyMap:
     def _coefs(self, p):
         return p.convert().coef.tolist()
 
-    def calibrate_from_values(self, raw_freqs: List[float], raw_heights: List[float], gcmd: Optional[GCodeCommand] = None):
+    def calibrate_from_values(self, drive_current: int, raw_freqs: List[float], raw_heights: List[float], gcmd: Optional[GCodeCommand] = None):
         if len(raw_freqs) != len(raw_heights):
             raise ValueError("freqs and heights must be the same length")
         raw_freqs = np.array(raw_freqs)
@@ -1060,13 +1107,19 @@ class ProbeEddyFrequencyMap:
             if r2_htf >= r2_tolerance:
                 break
 
-        msg = f"Calibrated polynomial freq-to-height (R^2={r2_fth:.3f}): {self._coefs(self._freq_to_height)}\n" + \
-              f"                      height-to-freq (R^2={r2_htf:.3f}): {self._coefs(self._height_to_freq)}"
+        msg = f"Calibrated eddy current polynomials for drive current {drive_current}:\n" + \
+             f"   freq-to-height (R^2={r2_fth:.3f}): {self._coefs(self._freq_to_height)}\n" + \
+             f"        domain: {self._freq_to_height.domain} window: {self._freq_to_height.window}\n" + \
+             f"   height-to-freq (R^2={r2_htf:.3f}): {self._coefs(self._height_to_freq)}\n" + \
+             f"        domain: {self._height_to_freq.domain} window: {self._height_to_freq.window}\n"
+
         logging.info(msg)
         if gcmd:
             gcmd.respond_info(msg, gcmd)
             if r2_htf < r2_tolerance or r2_fth < r2_tolerance:
                 gcmd.respond_raw("!! R^2 values are below tolerance; calibration may not be accurate.\n")
+
+        self.drive_current = drive_current
 
         return (r2_fth, r2_htf)
 
@@ -1075,13 +1128,16 @@ class ProbeEddyFrequencyMap:
         if not self._freq_to_height or not self._height_to_freq:
             return
 
-        ftohs = str(self._coefs(self._freq_to_height)).replace("[","").replace("]","")
-        htofs = str(self._coefs(self._height_to_freq)).replace("[","").replace("]","")
+        def floatlist_to_str(vals):
+            return str.join(', ', [str(v) for v in vals])
+
+        ftoh_coefs = self._coefs(self._freq_to_height)
+        htof_coefs = self._coefs(self._height_to_freq)
 
         configfile = self._eddy._printer.lookup_object('configfile')
         # why is there a floatarray getter, but not a setter?
-        configfile.set(self._eddy._full_name, "freq_to_height_p", ftohs)
-        configfile.set(self._eddy._full_name, "height_to_freq_p", htofs)
+        configfile.set(self._eddy._full_name, f"freq_to_height_p_{self.drive_current}", floatlist_to_str(ftoh_coefs))
+        configfile.set(self._eddy._full_name, f"height_to_freq_p_{self.drive_current}", floatlist_to_str(htof_coefs))
 
         if gcmd:
             gcmd.respond_info("Calibration saved. Issue a SAVE_CONFIG to write the values to your config file and restart Klipper.")

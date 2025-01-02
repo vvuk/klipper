@@ -570,9 +570,6 @@ class PrinterEddyProbe:
         self.probe_session = probe.ProbeSessionHelper(config, self.mcu_probe)
         self.probe_session2 = probe.ProbeSessionHelper(config, self.mcu_probe_tap, '2')
         self.printer.add_object('probe', self)
-
-        gcode = self.printer.lookup_object('gcode')
-        gcode.register_command('PROBE_TAP', self.cmd_PROBE_TAP)
     def add_client(self, cb):
         self.sensor_helper.add_client(cb)
     def get_probe_params(self, gcmd=None):
@@ -590,15 +587,6 @@ class PrinterEddyProbe:
         return self.probe_session.start_probe_session(gcmd)
     def register_drift_compensation(self, comp):
         self.calibration.register_drift_compensation(comp)
-    def cmd_PROBE_TAP(self, gcmd):
-        try:
-            probe_session = self.probe_session2.start_probe_session(gcmd)
-            probe_session.run_probe(gcmd)
-            pos = probe_session.pull_probed_results()[0]
-            probe_session.end_probe_session()
-            gcmd.respond_info("Result is z=%.6f" % (pos[2],))
-        finally:
-            self.sensor_helper.query_hack()
 
 class DummyDriftCompensation:
     def get_temperature(self):
