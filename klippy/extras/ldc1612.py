@@ -218,7 +218,7 @@ class LDC1612:
         t_freqvl = self.to_ldc_freqval(trigger_freq)
         s_freqval = self.to_ldc_freqval(start_freq)
         start_time_mcu = self.mcu.print_time_to_clock(start_time)
-        logging.info(f"LD1612 setup_home2: trigger: {trigger_freq:.2f} ({t_freqvl}) start: {start_freq:.2f} ({s_freqval}) @ {start_time:.2f} trsync: {trsync_oid} {hit_reason} {reason_base} TAP: {tap_threshold}")
+        logging.info(f"LD1612 setup_home2: trigger: {trigger_freq:.2f} ({t_freqvl}) safe: {start_freq:.2f} ({s_freqval}) @ {start_time:.2f} ({start_time_mcu}) trsync: {trsync_oid} {hit_reason} {reason_base} TAP: {tap_threshold}")
         self.ldc1612_setup_home2_cmd.send([self.oid, trsync_oid, hit_reason,
                                            reason_base, t_freqvl, s_freqval, start_time_mcu, tap_threshold])
 
@@ -299,6 +299,9 @@ class LDC1612:
     def set_drive_current(self, cval: int):
         if cval < 0 or cval > 31:
             raise self.printer.command_error("Drive current must be between 0 and 31")
+        if self._drive_current == cval:
+            return
+
         self._drive_current = cval
         self.set_reg(REG_DRIVE_CURRENT0, cval << 11)
 
@@ -308,6 +311,7 @@ class LDC1612:
         self._start_count += 1
 
         if self._start_count > 1:
+            logging.info("LDC1612 start count: %d", self._start_count)
             return
 
         # Start bulk reading
@@ -321,6 +325,7 @@ class LDC1612:
         self._start_count -= 1
 
         if self._start_count > 0:
+            logging.info("LDC1612 stop, start count now: %d", self._start_count)
             return
 
         # Halt bulk reading

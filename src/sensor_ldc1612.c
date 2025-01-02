@@ -73,6 +73,7 @@ struct ldc1612_v2 {
 
     uint32_t wma_sum; // sum of the freq_buffer
     uint32_t wma; // last computed weighted moving average
+    uint32_t wma_d_wma; // last wma of the wma_d
 
     // frequency we must pass through to have a valid home/tap
     uint32_t safe_start_freq;
@@ -83,7 +84,14 @@ struct ldc1612_v2 {
     // the second threshold before we start looking for a tap
     uint32_t homing_trigger_freq;
 
+    // the tap detection threshold: specifically, the total downward
+    // change in the frequency derivative before we see a direction
+    // reveral (the windowed moving average of the derivative of the wmd
+    // to be exact)
     uint32_t tap_threshold;
+
+    // where we keep track
+    uint32_t tap_accum;
 
     // current index in freq/deriv buffers
     uint8_t freq_i;
@@ -105,7 +113,6 @@ struct ldc1612 {
 
     // Samples per second (configured 
     uint32_t data_rate;
-    uint32_t 
 
     uint32_t last_read_value;
 
@@ -450,8 +457,10 @@ command_ldc1612_setup_home2(uint32_t *args)
     memset(ld->deriv_buffer, 0, sizeof(ld->deriv_buffer));
     ld->wma_sum = 0;
     ld->wma = 0;
+    ld->wma_d_wma = 0;
     ld->freq_i = 0;
     ld->deriv_i = 0;
+    ld->tap_accum = 0;
 
     ld1->ts = trsync_oid_lookup(trsync_oid);
     ld1->homing_flags = LH_V2 | LH_AWAIT_HOMING | LH_CAN_TRIGGER;
@@ -544,6 +553,14 @@ check_home2(struct ldc1612* ld1, uint32_t data)
     }
 
     int32_t wma_d_wma = (uint32_t)(wma_numerator / s_deriv_weight_sum);
+    if (ld->wma_d_wma > wma_d_wma) {
+        // derivative is decreasing; track it
+        ld->tap_accum += ld->wma_d_wma - wma_d_wma;
+    } else {
+        // derivative is increasing; reset the accumulator
+        ld->tap_accum = 0;
+    }
+    ld->wma_d_wma = wma_d_wma;
 
     // Safety threshold check
     // We need to pass through this frequency threshold to be a valid dive.
@@ -572,11 +589,20 @@ check_home2(struct ldc1612* ld1, uint32_t data)
         // Ok, we've passed all the safety thresholds. Values from this point on
         // will be considered for homing/tapping
         ld1->homing_flags = homing_flags = homing_flags & ~LH_AWAIT_HOMING;
+        ld->tap_accum = 0;
     }
 
     //dprint("data=%u avg %u", data, avg);
-    if (wma > ld->homing_trigger_freq) {
-        notify_trigger(ld1, time, ld->success_reason);
-        dprint("ZZZ trig t=%u a=%u (d=%u)", time, wma, data);
+
+    if (!is_tap) {
+        if (wma > ld->homing_trigger_freq) {
+            notify_trigger(ld1, time, ld->success_reason);
+            dprint("ZZZ trig t=%u a=%u (d=%u)", time, wma, data);
+        }
+    } else {
+        if (ld->tap_accum > ld->tap_threshold) {
+            notify_trigger(ld1, time, ld->success_reason);
+            dprint("ZZZ tap t=%u a=%u (d=%u)", time, wma, data);
+        }
     }
 }

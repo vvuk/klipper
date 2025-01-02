@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import logging, math, bisect
-import mcu
 import numpy as np
 import numpy.polynomial as npp
+import traceback
 
+import mcu
 import pins
 
 from dataclasses import dataclass
@@ -38,6 +39,10 @@ from .ldc1612 import SETTLETIME as LDC1612_SETTLETIME
 # trigger start frequency (above the start homing height)
 HOME_TRIGGER_START_TIME_OFFSET = 0.200
 
+def log_traceback(limit=None):
+    for line in traceback.format_stack(limit=limit):
+        logging.info(line.strip())
+
 @final
 class ProbeEddy:
     def __init__(self, config: ConfigWrapper):
@@ -70,6 +75,9 @@ class ProbeEddy:
 
             'calibration_z_max': 5.0,
             'calibration_step': 0.040,
+
+            'reg_drive_current': 0,
+            'tap_drive_current': 0,
         }
 
         for k in self.params:
@@ -123,6 +131,12 @@ class ProbeEddy:
         home_trigger_height_start_offset = self.params['home_trigger_height_start_offset']
         calibration_z_max = self.params['calibration_z_max']
 
+        if self.params['tap_drive_current'] == 0:
+            self.params['tap_drive_current'] = self.params['reg_drive_current']
+        
+        self.params['tap_drive_current'] = int(self.params['tap_drive_current'])
+        self.params['reg_drive_current'] = int(self.params['reg_drive_current'])
+
         # verify a few things
         if home_trigger_height < 0.0:
             raise self._printer.config_error("home_trigger_height must be >= 0 (and really should be > 1)")
@@ -140,7 +154,7 @@ class ProbeEddy:
 
         # some handy aliases while I'm debugging things to save my fingers
         gcode.register_command("PEPS", self.cmd_PROBE_STATIC)
-        gcode.register_command("PEQUERY", self.cmd_QUERY)
+        gcode.register_command("PEQ", self.cmd_QUERY)
         gcode.register_command("PETAP", self.cmd_TAP)
 
     def current_drive_current(self) -> int:
@@ -205,10 +219,12 @@ class ProbeEddy:
         mean_or_median = gcmd.get('METHOD', 'mean').lower()
 
         reactor = self._printer.get_reactor()
+        now = self._mcu.estimated_print_time(reactor.monotonic())
 
         with ProbeEddySampler(self) as sampler:
-            sampler.wait_for_samples(max_wait_time=duration*2, min_samples=50)
+            sampler.wait_for_sample_at_time(now + duration)
             sampler.finish()
+            cend = self._mcu.estimated_print_time(reactor.monotonic())
 
             samples = sampler.get_samples()
             if len(samples) == 0:
@@ -219,6 +235,7 @@ class ProbeEddy:
             # at the time values
             stime = samples[0][0]
             etime = samples[-1][0]
+            orig_samplecount = len(samples)
             samples = [s for s in samples if s[0] > stime+LDC1612_SETTLETIME and s[0] < etime-LDC1612_SETTLETIME]
 
             mean = np.mean([s[2] for s in samples])
@@ -232,7 +249,9 @@ class ProbeEddy:
                 gcmd.respond_raw("!! Invalid METHOD\n")
                 return
 
-            gcmd.respond_info(f"Collected {len(samples)} samples, height: {height:.3f} (mean: {mean:.3f}, median: {median:.3f})")
+            gcmd.respond_info(f"Collected {orig_samplecount} samples, height: {height:.3f} (mean: {mean:.3f}, median: {median:.3f}) over {etime-stime:.3f} seconds")
+            gcmd.respond_info(f"Collection started at {now:.3f}, sample time range {stime:.3f} - {etime:.3f}, finished at {cend:.3f}")
+
             self._cmd_helper.last_z_result = height
 
     def cmd_CALIBRATE(self, gcmd: GCodeCommand):
@@ -487,14 +506,25 @@ class ProbeEddy:
     # Tap probe
     #
     def cmd_TAP(self, gcmd: GCodeCommand):
-        self.tapping_move(gcmd)
+        drive_current = self._sensor.get_drive_current()
+        try:
+            self.tapping_move(gcmd)
+        finally:
+            self._sensor.set_drive_current(drive_current)
 
     def tapping_move(self, gcmd: GCodeCommand):
+        tap_drive_current = self.params['tap_drive_current']
+
+        self._sensor.set_drive_current(tap_drive_current)
+
         TAP_MOVE_SPEED=3.0
         TAP_RETRACT_SPEED=5.0
         Z=0.25
+        TAP_THRESHOLD=550
 
         TAP_MOVE_SPEED = gcmd.get_float('SPEED', TAP_MOVE_SPEED, above=0.0)
+        TAP_THRESHOLD= gcmd.get_int('TTAP', TAP_THRESHOLD, minval=0)
+
         Z = gcmd.get_float('Z', Z)
 
         reactor = self._printer.get_reactor()
@@ -527,9 +557,11 @@ class ProbeEddy:
         tap_target_pos = th.get_position()
         tap_target_pos[2] = Z
 
+        gcmd.respond_info(f"Tap target position: {tap_target_pos}")
+
         errors = []
 
-        as_dispatch = False
+        as_dispatch = True
         if as_dispatch:
             # borrow this dispatch
             dispatch = self._endstop_wrapper._dispatch
@@ -538,7 +570,7 @@ class ProbeEddy:
 
             # we need to hit start_freq after start_time, and then pass through trigger_freq
             # on the way to a tap
-            start_time = print_time + HOME_TRIGGER_START_TIME_OFFSET
+            start_time = print_time + 0.050 # HOME_TRIGGER_START_TIME_OFFSET is too large at higher velocity and at a lower starting height for tap
             start_freq = self.height_to_freq(home_trigger_height + home_trigger_height_start_offset)
             trigger_freq = self.height_to_freq(home_trigger_height)
 
@@ -549,7 +581,8 @@ class ProbeEddy:
             REASON_BASE = mcu.MCU_trsync.REASON_COMMS_TIMEOUT + 1
             self._sensor.setup_home2(dispatch.get_oid(),
                                     mcu.MCU_trsync.REASON_ENDSTOP_HIT, REASON_BASE,
-                                    trigger_freq, start_freq, print_time + HOME_TRIGGER_START_TIME_OFFSET)
+                                    trigger_freq, start_freq, start_time,
+                                    tap_threshold=TAP_THRESHOLD)
             
             try:
                 th.drip_move(tap_target_pos, TAP_MOVE_SPEED, tap_completion)
@@ -570,19 +603,38 @@ class ProbeEddy:
 
             if reason != mcu.MCU_trsync.REASON_ENDSTOP_HIT:
                 errors.append(f"Trigger not hit: {reason}")
+                gather.finish()
+            else:
+                gather.wait_for_sample_at_time(trigger_time)
+                gather.finish()
+
+                #trig_pos = get_toolhead_kin_z(th, at=trigger_time)
+                #now_pos = get_toolhead_kin_z(th)
+                trig_pos, _ = get_past_toolhead_z(self._printer, at=trigger_time)
+                now_pos = get_toolhead_kin_z(th)
+
+                gcmd.respond_info(f"Triggered at {trigger_time:.4f}, at kinz {trig_pos:.3f} now kinz {now_pos:.3f}")
         else:
             th.manual_move(tap_target_pos, TAP_MOVE_SPEED)
             th.dwell(0.500)
-            th.manual_move([None, None, tap_start], TAP_RETRACT_SPEED)
             th.wait_moves()
+            last_move_time = th.get_last_move_time()
+            thpos = th.get_position()
+            thz = get_toolhead_kin_z(th)
+            gcmd.respond_info(f"thz after tap: {thpos[3]:.3f} kin {thz:.3f}")
+            gather.wait_for_sample_at_time(last_move_time)
+            gather.finish()
 
-        gather.finish()
+        th.manual_move([None, None, tap_start], TAP_RETRACT_SPEED)
+
         samples = gather.get_samples()
 
         with open("/tmp/tap-samples.csv", "w") as data_file:
-            data_file.write(f"time,frequency,z\n")
+            data_file.write(f"time,frequency,z,kin_z,kin_v\n")
             for s_t, s_freq, s_z in samples:
-                data_file.write(f"{s_t},{s_freq},{s_z}\n")
+                k_z, past_v = get_past_toolhead_z(self._printer, s_t)
+                #k_z = get_toolhead_kin_z(th, at=s_t)
+                data_file.write(f"{s_t},{s_freq},{s_z},{k_z},{past_v}\n")
         
         gcmd.respond_info(f"Wrote {len(samples)} samples to /tmp/tap-samples.csv")
 
@@ -1021,6 +1073,7 @@ class ProbeEddySampler:
     def wait_for_sample_at_time(self, sample_print_time, max_wait_time=0.250, raise_error=True) -> bool:
         def report_no_samples():
             if raise_error:
+                log_traceback(3)
                 raise self.eddy._printer.command_error(f"No samples received for time {sample_print_time:.3f} (waited for {max_wait_time:.3f}")
             return False
 
@@ -1047,6 +1100,8 @@ class ProbeEddySampler:
         return True
 
     # Wait for some samples to be collected, even if errors
+    # TODO: there's a minimum wait time -- we need to fill up the buffer before data is sent, and that
+    # depends on the data rate
     def wait_for_samples(self, max_wait_time=0.250, count_errors=False, min_samples=1, new_only=False, raise_error=True):
         # Make sure enough samples have been collected
         wait_start_time = self._mcu.estimated_print_time(self._reactor.monotonic())
@@ -1060,6 +1115,7 @@ class ProbeEddySampler:
             now = self._mcu.estimated_print_time(self._reactor.monotonic())
             if now - wait_start_time > max_wait_time:
                 if raise_error:
+                    log_traceback(5)
                     raise self.eddy._printer.command_error(f"possible probe_eddy sensor outage; no samples for {max_wait_time:.2f}s")
                 return False
             self._reactor.pause(now + 0.010)
@@ -1325,6 +1381,7 @@ class ToolheadMovementHelper:
 
 def get_toolhead_kin_z(toolhead, at=None):
     toolhead_kin = toolhead.get_kinematics()
+    # this is blowing up?
     toolhead.flush_step_generation()
     if at is None:
         kin_spos = {s.get_name(): s.get_commanded_position()
@@ -1333,6 +1390,15 @@ def get_toolhead_kin_z(toolhead, at=None):
         kin_spos = {s.get_name(): s.mcu_to_commanded_position(s.get_past_mcu_position(at))
                     for s in toolhead_kin.get_steppers()}
     return toolhead_kin.calc_position(kin_spos)[2]
+
+def get_past_toolhead_z(printer, at):
+    motion_report = printer.lookup_object("motion_report")
+    dump_trapq = motion_report.trapqs.get("toolhead")
+    if dump_trapq is None:
+        raise printer.command_error("No dump trapq for toolhead")
+
+    position, velocity = dump_trapq.get_trapq_position(at)
+    return position[2], velocity
 
 def load_config_prefix(config: ConfigWrapper):
     return ProbeEddy(config)
