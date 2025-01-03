@@ -149,6 +149,7 @@ class ProbeEddy:
     def define_commands(self, gcode):
         gcode.register_command("PROBE_EDDY_QUERY", self.cmd_QUERY)
         gcode.register_command("PROBE_EDDY_CALIBRATE", self.cmd_CALIBRATE)
+        gcode.register_command("PROBE_EDDY_CLEAR_CALIBRATION", self.cmd_CLEAR_CALIBRATION)
         gcode.register_command("PROBE_EDDY_PROBE_STATIC", self.cmd_PROBE_STATIC)
         gcode.register_command("PROBE_EDDY_TAP", self.cmd_TAP)
 
@@ -210,6 +211,11 @@ class ProbeEddy:
         height = self.freq_to_height(freq)
         return freq, height
 
+    def cmd_CLEAR_CALIBRATION(self, gcmd: GCodeCommand):
+        self._dc_to_fmap = {}
+        self.save_config(gcmd)
+        gcmd.respond_info(f"Cleared calibration for all drive currents")
+
     def cmd_PROBE_STATIC(self, gcmd: GCodeCommand):
         if not self.calibrated():
             gcmd.respond_raw("!! Probe not calibrated\n")
@@ -249,8 +255,8 @@ class ProbeEddy:
                 gcmd.respond_raw("!! Invalid METHOD\n")
                 return
 
-            gcmd.respond_info(f"Collected {orig_samplecount} samples, height: {height:.3f} (mean: {mean:.3f}, median: {median:.3f}) over {etime-stime:.3f} seconds")
-            gcmd.respond_info(f"Collection started at {now:.3f}, sample time range {stime:.3f} - {etime:.3f}, finished at {cend:.3f}")
+            gcmd.respond_info(f"Height: {height:.3f} ({orig_samplecount} samples) (mean: {mean:.3f}, median: {median:.3f}) over {etime-stime:.3f} seconds")
+            #gcmd.respond_info(f"Collection started at {now:.3f}, sample time range {stime:.3f} - {etime:.3f}, finished at {cend:.3f}")
 
             self._cmd_helper.last_z_result = height
 
@@ -269,8 +275,11 @@ class ProbeEddy:
         if kin_pos is None:
             return
 
-        drive_current: int = gcmd.get_int('DRIVE_CURRENT', self.current_drive_current(), minval=0, maxval=31)
+        old_drive_current = self.current_drive_current()    
+        drive_current: int = gcmd.get_int('DRIVE_CURRENT', old_drive_current, minval=0, maxval=31)
+        self._sensor.set_drive_current(drive_current)
 
+        Z_TARGET = 0.010
 
         with ToolheadMovementHelper(self) as th:
             # We just did a ManualProbeHelper, so we're going to zero the z-axis
@@ -278,6 +287,7 @@ class ProbeEddy:
             # The Eddy sensor calibration is done to nozzle height (not sensor or trigger height).
             kin_pos[2] = 0.0
             th.set_absolute_position(*kin_pos)
+            th.dwell(0.100)
 
             # move to the start of calibration
             cal_z_max = self.params['calibration_z_max']
@@ -291,12 +301,13 @@ class ProbeEddy:
 
             with ProbeEddySampler(self, calculate_heights=False) as sampler:
                 first_sample_time = th.get_last_move_time()
-                th.move_to_z(0.010)
+                th.move_to_z(Z_TARGET)
                 last_sample_time = th.get_last_move_time()
                 sampler.finish()
 
             # back to a safe spot
             th.move_to_z(cal_z_max)
+            self._sensor.set_drive_current(old_drive_current)
 
         # the samples are a list of [print_time, freq] pairs.
         # in toolhead_positions, we have a list of [print_time, kin_z] pairs.
@@ -309,29 +320,30 @@ class ProbeEddy:
         heights = []
 
         data_file = open("/tmp/eddy-samples.csv", "w")
-        data_file.write(f"time,frequency,z\n")
+        data_file.write(f"time,frequency,z,used\n")
 
         for s_t, s_freq, _ in samples:
             s_z = th.get_kin_z(at=s_t)
-            data_file.write(f"{s_t},{s_freq},{s_z}\n")
-            # we write everything for debugging, but only use the samples in our
-            # time range
-            if (s_t - first_sample_time) > 0.050 and (last_sample_time - s_t) > 0:
+            used = 0
+            if s_t > (first_sample_time + 0.050) and s_t < last_sample_time and s_z > Z_TARGET:
                 freqs.append(s_freq)
                 heights.append(s_z)
+                used = 1
+            data_file.write(f"{s_t},{s_freq},{s_z},{used}\n")
+            # we write everything for debugging, but only use the samples in our
+            # time range
         
         data_file.close()
         gcmd.respond_info(f"Wrote {len(samples)} samples to /tmp/eddy-samples.csv")
 
-        # smooth out the data; a simple average does the job
-        weights_for_avg = np.ones(16) / 16.
-        freqs = np.convolve(freqs, weights_for_avg, mode='same')
-        heights = np.convolve(heights, weights_for_avg, mode='same')
-
-
         # and build a map
         mapping = ProbeEddyFrequencyMap(self)
         r2_fth, r2_htf = mapping.calibrate_from_values(drive_current, freqs, heights, gcmd)
+
+        if r2_fth is None or r2_htf is None:
+            gcmd.respond_raw("!! Calibration failed\n")
+            return
+
         self._dc_to_fmap[drive_current] = mapping
         self.save_config(gcmd)
 
@@ -1200,20 +1212,37 @@ class ProbeEddyFrequencyMap:
     def calibrate_from_values(self, drive_current: int, raw_freqs: List[float], raw_heights: List[float], gcmd: Optional[GCodeCommand] = None):
         if len(raw_freqs) != len(raw_heights):
             raise ValueError("freqs and heights must be the same length")
-        raw_freqs = np.array(raw_freqs)
-        raw_heights = np.array(raw_heights)
 
-        ## Group frequencies by heights and compute the median for each height
-        #heights = np.unique(raw_heights)
-        #freqs = np.array([np.median(raw_freqs[raw_heights == h]) for h in heights])
+        def rolling_mean(data, window, center=True):
+            half_window = (window - 1) // 2 if center else 0
+            result = np.empty(len(data), dtype=float)
+
+            for i in range(len(data)):
+                # Define the start and end of the window
+                start = max(0, i - half_window)
+                end = min(len(data), i + half_window + 1)
+                result[i] = np.mean(data[start:end])  # Mean over the valid window
+   
+            return result
+
+        # smooth out the data; a simple rolling average does the job,
+        # but centered to give more accurate data (since we have the full
+        # data set. The edges just use a smaller window.
+        freqs = rolling_mean(raw_freqs, 16)
+        heights = rolling_mean(raw_heights, 16)
 
         SAMPLE_TARGET = 200
         R2_TOLERANCE = 0.95
 
-        indices = np.unique(raw_freqs, return_index=True)[1]
+        indices = np.unique(freqs, return_index=True)[1]
         decimate = int(round(len(indices) / SAMPLE_TARGET))
-        freqs = raw_freqs[indices][::decimate]
-        heights = raw_heights[indices][::decimate]
+        freqs = freqs[indices][::decimate]
+        heights = heights[indices][::decimate]
+
+        with open("/tmp/fit-cal.csv", "w") as fp:
+            fp.write("freq,height\n")
+            for f, h in zip(freqs, heights):
+                fp.write(f"{f},{h}\n")
 
         def r2(p, x, y):
             y_hat = p(x)
@@ -1221,26 +1250,26 @@ class ProbeEddyFrequencyMap:
             ss_tot = np.sum((y - np.mean(y))**2)
             return 1 - (ss_res / ss_tot)
 
-        def best_fit(x, y):
+        def best_fit(x, y, rawx, rawy):
             best_r2 = 0
             best_p = None
             for i in range(3, 9):
                 p = npp.Polynomial.fit(x, y, i)
-                r2_val = r2(p, x, y)
+                r2_val = r2(p, rawx, rawy)
                 if r2_val > best_r2:
                     best_r2 = r2_val
                     if r2_val > R2_TOLERANCE:
                         best_p = p
             return best_p, best_r2
 
-        fth, r2_fth = best_fit(freqs, heights)
-        htf, r2_htf = best_fit(heights, freqs)
+        fth, r2_fth = best_fit(freqs, heights, raw_freqs, raw_heights)
+        htf, r2_htf = best_fit(heights, freqs, raw_heights, raw_freqs)
 
         if fth is None or htf is None:
-            msg = "Calibration failed; unable to find a good fit. (R^2 {r2_fth:.3f}, {r2_htf:.3f})"
+            msg = f"Calibration failed; unable to find a good fit. (R^2 {r2_fth:.3f}, {r2_htf:.3f})"
             if gcmd:
                 gcmd.respond_raw(f"!! {msg}\n")
-                return
+                return None, None
             raise self._eddy._printer.command_error(msg)
 
         msg = f"Calibrated eddy current polynomials for drive current {drive_current}:\n" + \
