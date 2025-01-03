@@ -68,6 +68,11 @@ struct ldc1612_v2 {
     // homing_flags
     // ts
 
+    // Note: this entire struct is zeroed in setup_home2. 
+    // If this becomes used for persistent config data,
+    // fix that by moving the home-state tracking to its
+    // own struct.
+
     uint32_t freq_buffer[FREQ_WINDOW_SIZE];
     int32_t deriv_buffer[DERIV_WINDOW_SIZE];
 
@@ -92,6 +97,12 @@ struct ldc1612_v2 {
 
     // where we keep track
     uint32_t tap_accum;
+    // the earliest start of this tap
+    uint32_t tap_time;
+
+    // the time we fired a trigger (same as homing_clock in parent struct,
+    // due to code structure)
+    uint32_t trigger_time;
 
     // current index in freq/deriv buffers
     uint8_t freq_i;
@@ -100,6 +111,7 @@ struct ldc1612_v2 {
     // trigger reasons
     uint8_t success_reason;
     uint8_t other_reason_base;
+
 };
 
 struct ldc1612 {
@@ -412,6 +424,19 @@ ldc1612_task(void)
 }
 DECL_TASK(ldc1612_task);
 
+void
+ldc1612_shutdown(void)
+{
+    uint8_t oid;
+    struct ldc1612 *ld;
+    foreach_oid(oid, ld, command_config_ldc1612) {
+        sched_del_timer(&ld->timer);
+        ld->flags &= ~LDC_PENDING;
+        ld->rest_ticks = 0;
+    }
+}
+DECL_SHUTDOWN(ldc1612_shutdown);
+
 void dprint(const char *fmt, ...)
 {
     char buf[60];
@@ -445,6 +470,9 @@ command_ldc1612_setup_home2(uint32_t *args)
         return;
     }
 
+    // Clear the v2 state before setting up
+    memset(ld, 0, sizeof(*ld));
+
     ld->success_reason = trigger_reason;
     ld->other_reason_base = other_reason_base;
 
@@ -452,15 +480,6 @@ command_ldc1612_setup_home2(uint32_t *args)
     ld->safe_start_time = start_time;
     ld->homing_trigger_freq = trigger_freq;
     ld->tap_threshold = tap_threshold;
-
-    memset(ld->freq_buffer, 0, sizeof(ld->freq_buffer));
-    memset(ld->deriv_buffer, 0, sizeof(ld->deriv_buffer));
-    ld->wma_sum = 0;
-    ld->wma = 0;
-    ld->wma_d_wma = 0;
-    ld->freq_i = 0;
-    ld->deriv_i = 0;
-    ld->tap_accum = 0;
 
     ld1->ts = trsync_oid_lookup(trsync_oid);
     ld1->homing_flags = LH_V2 | LH_AWAIT_HOMING | LH_CAN_TRIGGER;
@@ -476,6 +495,36 @@ DECL_COMMAND(command_ldc1612_setup_home2,
              " trsync_oid=%c trigger_reason=%c other_reason_base=%c"
              " trigger_freq=%u start_freq=%u start_time=%u"
              " tap_threshold=%i");
+
+void
+command_query_ldc1612_finish_home2(uint32_t *args)
+{
+    struct ldc1612 *ld1 = oid_lookup(args[0], command_config_ldc1612);
+    struct ldc1612_v2 *ld = &ld1->v2;
+
+    // TODO: what's the purpose of LH_CAN_TRIGGER? All it tells you if we're
+    // between a setup_home and a clear_home. That should be an error in general,
+    // so we should just shutdown if someone tries to setup home without clearing
+    // the previous one.
+    //uint8_t active = (ld1->homing_flags & LH_CAN_TRIGGER) && (ld1->homing_flags & LH_V2);
+
+    uint32_t trigger_time = ld->trigger_time; // note: same as homing_clock in parent struct
+    uint32_t tap_time = ld->tap_time;
+    uint32_t tap_amount = ld->tap_accum;
+
+    ld1->ts = NULL;
+    ld1->homing_flags = 0;
+
+    //sendf("ldc1612_finish_home2_reply oid=%c trigger_clock=%u tap_start_clock=%u tap_amount=%u"
+    //      , args[0], trigger_time, tap_time, tap_amount);
+    sendf("ldc1612_finish_home2 oid=%c tap_start_clock=%u"
+          , args[0], tap_time);
+
+    //dprint("ZZZ home2 finish trig_t=%u tap_t=%u tap=%u", trigger_time, tap_time, tap_amount);
+}
+
+DECL_COMMAND(command_query_ldc1612_finish_home2,
+             "query_ldc1612_finish_home2 oid=%c");
 
 #define WEIGHT_SUM(size) ((size * (size + 1)) / 2)
 
@@ -555,6 +604,8 @@ check_home2(struct ldc1612* ld1, uint32_t data)
     int32_t wma_d_wma = (uint32_t)(wma_numerator / s_deriv_weight_sum);
     if (ld->wma_d_wma > wma_d_wma) {
         // derivative is decreasing; track it
+        if (ld->tap_accum == 0)
+            ld->tap_time = time;
         ld->tap_accum += ld->wma_d_wma - wma_d_wma;
     } else {
         // derivative is increasing; reset the accumulator
@@ -580,7 +631,9 @@ check_home2(struct ldc1612* ld1, uint32_t data)
         dprint("ZZZ safe start");
 
         if (is_tap && ld->homing_trigger_freq != 0) {
-            // If we're tapping, then make the homing trigger freq a second thershold
+            // If we're tapping, then make the homing trigger freq a second thershold.
+            // These would typically be set to something like the 3.0mm freq for the first,
+            // then the 2.0mm homing freq.
             ld->safe_start_freq = ld->homing_trigger_freq;
             ld->homing_trigger_freq = 0;
             return;
@@ -597,12 +650,14 @@ check_home2(struct ldc1612* ld1, uint32_t data)
     if (!is_tap) {
         if (wma > ld->homing_trigger_freq) {
             notify_trigger(ld1, time, ld->success_reason);
-            dprint("ZZZ trig t=%u a=%u (d=%u)", time, wma, data);
+            ld->trigger_time = time;
+            dprint("ZZZ trig t=%u a=%u (f=%u)", time, wma, data);
         }
     } else {
         if (ld->tap_accum > ld->tap_threshold) {
             notify_trigger(ld1, time, ld->success_reason);
-            dprint("ZZZ tap t=%u a=%u (d=%u)", time, wma, data);
+            ld->trigger_time = time;
+            dprint("ZZZ tap t=%u n=%u l=%u (f=%u)", ld->tap_time, time, ld->tap_accum, data);
         }
     }
 }

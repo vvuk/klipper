@@ -255,7 +255,7 @@ class ProbeEddy:
                 gcmd.respond_raw("!! Invalid METHOD\n")
                 return
 
-            gcmd.respond_info(f"Height: {height:.3f} ({orig_samplecount} samples) (mean: {mean:.3f}, median: {median:.3f}) over {etime-stime:.3f} seconds")
+            gcmd.respond_info(f"Height: {height:.3f} (mean: {mean:.3f}, median: {median:.3f}), {orig_samplecount} samples {etime-stime:.3f} sec")
             #gcmd.respond_info(f"Collection started at {now:.3f}, sample time range {stime:.3f} - {etime:.3f}, finished at {cend:.3f}")
 
             self._cmd_helper.last_z_result = height
@@ -536,6 +536,7 @@ class ProbeEddy:
 
         TAP_MOVE_SPEED = gcmd.get_float('SPEED', TAP_MOVE_SPEED, above=0.0)
         TAP_THRESHOLD= gcmd.get_int('TTAP', TAP_THRESHOLD, minval=0)
+        arg_retract = gcmd.get_int('RETRACT', 1)
 
         Z = gcmd.get_float('Z', Z)
 
@@ -559,6 +560,7 @@ class ProbeEddy:
         th.dwell(0.100)
         th.wait_moves()
 
+        # TODO: wrap all this in a 'with'. We need to properly clean up the sampler in all cases
         gather = ProbeEddySampler(self)
         gather.start()
 
@@ -572,6 +574,13 @@ class ProbeEddy:
         gcmd.respond_info(f"Tap target position: {tap_target_pos}")
 
         errors = []
+
+        trig_pos_z = None
+        tap_pos_z = None
+        now_pos_z = None
+        success = False
+        tap_start_time = 0.0
+        trigger_time = 0.0
 
         as_dispatch = True
         if as_dispatch:
@@ -595,7 +604,7 @@ class ProbeEddy:
                                     mcu.MCU_trsync.REASON_ENDSTOP_HIT, REASON_BASE,
                                     trigger_freq, start_freq, start_time,
                                     tap_threshold=TAP_THRESHOLD)
-            
+
             try:
                 th.drip_move(tap_target_pos, TAP_MOVE_SPEED, tap_completion)
             #except self.printer.command_error as e:
@@ -609,24 +618,50 @@ class ProbeEddy:
             except Exception as e:
                 logging.info(f"Error dispatch wait: {e}")
                 errors.append(str(e))
-            
-            trigger_time = self._sensor.clear_home()
+
             reason = dispatch.stop()
+
+            # note at this point the probe is still spamming the host with
+            # status updates, until we gather.finish(). This makes getting replies
+            # to shot commands in a timely manner difficult, and we might timeout
+            gather.finish()
+
+            # the trigger_time is the time the trsync triggered, i.e. after the tap threshold
+            # was met. The tap_start_time is the start of the threshold check, i.e. when the derivative
+            # started decreasing.
+            trigger_time = self._sensor.clear_home()
+            logging.info(f"got clear_home trigger_time: {trigger_time}")
+            trigger_time = self._sensor.clear_home()
+            logging.info(f"got clear_home trigger_time: {trigger_time}")
+            #active, trigger_time, tap_start_time, tap_amount = self._sensor.finish_home2()
+            _, _, tap_start_time, _ = self._sensor.finish_home2()
+            logging.info(f"got tap_start_time: {tap_start_time}")
 
             if reason != mcu.MCU_trsync.REASON_ENDSTOP_HIT:
                 errors.append(f"Trigger not hit: {reason}")
-                gather.finish()
+                #gather.finish()
             else:
-                gather.wait_for_sample_at_time(trigger_time)
-                gather.finish()
+                #gather.wait_for_sample_at_time(trigger_time)
+                #gather.finish()
 
-                #trig_pos = get_toolhead_kin_z(th, at=trigger_time)
-                #now_pos = get_toolhead_kin_z(th)
-                trig_pos, _ = get_past_toolhead_z(self._printer, at=trigger_time)
-                now_pos = get_toolhead_kin_z(th)
+                tap_pos_z = get_past_toolhead_z(self._printer, at=tap_start_time)
+                trig_pos_z, _ = get_past_toolhead_z(self._printer, at=trigger_time)
+                now_pos_z = get_toolhead_kin_z(th)
+                success = True
 
-                gcmd.respond_info(f"Triggered at {trigger_time:.4f}, at kinz {trig_pos:.3f} now kinz {now_pos:.3f}")
+                if tap_start_time > trigger_time:
+                    errors.append(f"Warning: tap time {tap_start_time:.3f} after trigger time {trigger_time:.3f}!")
+
+                # TODO: we really want a "find this exact time, and then take N samples around it"
+                trig_sensor_z = gather.find_height_at_time(trigger_time-0.003, trigger_time+0.003)
+                tap_sensor_z = gather.find_height_at_time(trigger_time-0.003, trigger_time+0.003)
+
+                toolhead_pos = th.get_position()
+                gcmd.respond_info(f"Triggered at z={trig_pos_z:.3f}, tap at z={tap_pos_z:.3f} (@{trigger_time:.4f}s, {tap_start_time:.4f}) (current kin z={now_pos_z:.3f}, " + \
+                                  f"offset {now_pos_z-trig_pos_z:.3f}, sensor trigger z={trig_sensor_z:.3f}, tap z={tap_sensor_z:.3f}, now toolhead z={toolhead_pos[2]:.3f})");
         else:
+            # This is purely for debugging/data analysis. It does the full movement so _will_ crash your toolhead
+            # to whatever you specify as the Z target.
             th.manual_move(tap_target_pos, TAP_MOVE_SPEED)
             th.dwell(0.500)
             th.wait_moves()
@@ -637,16 +672,43 @@ class ProbeEddy:
             gather.wait_for_sample_at_time(last_move_time)
             gather.finish()
 
-        th.manual_move([None, None, tap_start], TAP_RETRACT_SPEED)
+        # The tap triggered at kin_z trig_pos, which means there was physical contact with the build plate then.
+        # the toolhead thinks it's at now_pos, which will be shortly after trig_pos (due to the delay between
+        # the trigger command making its way through the system to get the toolhead to actually stop).
+        # Note that we ignore sensor_z here, we just pull it out for debugging purposes.
+        #
+        # But that's not the correct position; it's actually trig_pos, because the toolhead can't move through
+        # the build plate. I'm not sure how (or even if) to account for any flex here.
+
+        if success:
+            # trig_pos_z is where the toolhead triggered. now_pos_z is where the toolhead thought it was
+            # at the time of the trigger. So this z_offset is the offset between the current z position
+            # and the true z position.
+            z_offset = trig_pos_z - now_pos_z
+            toolhead_pos = th.get_position()
+            toolhead_pos[2] = toolhead_pos[2] + z_offset
+            th.set_position(toolhead_pos, homing_axes=(2,))
+
+            if tap_start < toolhead_pos[2]:
+                # TODO trigger a shutdown here, because something went very wrong and we don't
+                # want to move the toolhead down
+                raise self._printer.command_error(f"Tap start position {tap_start:.3f} is below final position {toolhead_pos[2]:.3f}")
+
+        if arg_retract:
+            th.manual_move([None, None, tap_start], TAP_RETRACT_SPEED)
 
         samples = gather.get_samples()
 
         with open("/tmp/tap-samples.csv", "w") as data_file:
-            data_file.write(f"time,frequency,z,kin_z,kin_v\n")
-            for s_t, s_freq, s_z in samples:
+            data_file.write(f"time,frequency,z,kin_z,kin_v,tap_start_time,trigger_time\n")
+            for i in range(len(samples)):
+                s_t, s_freq, s_z = samples[i]
                 k_z, past_v = get_past_toolhead_z(self._printer, s_t)
                 #k_z = get_toolhead_kin_z(th, at=s_t)
-                data_file.write(f"{s_t},{s_freq},{s_z},{k_z},{past_v}\n")
+                if i == 0:
+                    data_file.write(f"{s_t},{s_freq},{s_z},{k_z},{past_v},{tap_start_time},{trigger_time}\n")
+                else:
+                    data_file.write(f"{s_t},{s_freq},{s_z},{k_z},{past_v}\n")
         
         gcmd.respond_info(f"Wrote {len(samples)} samples to /tmp/tap-samples.csv")
 
@@ -1357,6 +1419,8 @@ class ToolheadMovementHelper:
     def set_absolute_position(self, x: float, y: float, z: float):
         newpos = np.array(self._toolhead.get_position())
         newpos[:3] = [x, y, z]
+        # TODO! this isn't really safe, we didn't home 0 and 1
+        # fix this when we remove ToolheadMovementHelper
         self._toolhead.set_position(newpos, homing_axes=(0, 1, 2))
         curpos = np.array(self._toolhead.get_position())
         # TODO just do the mapping but whatever
