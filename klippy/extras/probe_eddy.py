@@ -1427,6 +1427,8 @@ def get_past_toolhead_z(printer, at):
         raise printer.command_error("No dump trapq for toolhead")
 
     position, velocity = dump_trapq.get_trapq_position(at)
+    if position is None:
+        return None, None
     return position[2], velocity
 
 def load_config_prefix(config: ConfigWrapper):
