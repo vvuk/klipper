@@ -61,7 +61,6 @@ enum {
 
 // Configuration
 #define FREQ_WINDOW_SIZE 16
-#define DERIV_WINDOW_SIZE 8
 
 struct ldc1612_v2 {
     // Used from parent:
@@ -74,12 +73,23 @@ struct ldc1612_v2 {
     // own struct.
 
     uint32_t freq_buffer[FREQ_WINDOW_SIZE];
-    int32_t deriv_buffer[DERIV_WINDOW_SIZE];
-    int32_t debug_last_wmdd[DERIV_WINDOW_SIZE];
+    // current index in freq/deriv buffers
+    uint8_t freq_i;
 
-    uint32_t wma_sum; // sum of the freq_buffer
     uint32_t wma; // last computed weighted moving average
-    int32_t wma_d_wma; // last wma of the wma_d
+    uint32_t wma_d; // last computed wma derivative
+    // where we keep track
+    uint32_t tap_accum;
+    // the earliest start of this tap
+    uint32_t tap_start_time;
+
+    // the time we fired a trigger (same as homing_clock in parent struct,
+    // due to code structure)
+    uint32_t trigger_time;
+
+    //
+    // input parameters
+    //
 
     // frequency we must pass through to have a valid home/tap
     uint32_t safe_start_freq;
@@ -95,19 +105,6 @@ struct ldc1612_v2 {
     // reveral (the windowed moving average of the derivative of the wmd
     // to be exact)
     uint32_t tap_threshold;
-
-    // where we keep track
-    uint32_t tap_accum;
-    // the earliest start of this tap
-    uint32_t tap_start_time;
-
-    // the time we fired a trigger (same as homing_clock in parent struct,
-    // due to code structure)
-    uint32_t trigger_time;
-
-    // current index in freq/deriv buffers
-    uint8_t freq_i;
-    uint8_t deriv_i;
 
     // trigger reasons
     uint8_t success_reason;
@@ -522,7 +519,7 @@ command_ldc1612_finish_home2(uint32_t *args)
           , args[0], active, trigger_time, tap_start_time, tap_amount);
 
     dprint("ZZZ home2 finish trig_t=%u tap_t=%u tap=%u", trigger_time, tap_start_time, tap_amount);
-
+#if false
     uint32_t i = ld->deriv_i;
     for (i = 0; i < DERIV_WINDOW_SIZE; i += 4) {
         int32_t a = ld->debug_last_wmdd[((ld->deriv_i + i) % DERIV_WINDOW_SIZE)];
@@ -532,6 +529,7 @@ command_ldc1612_finish_home2(uint32_t *args)
 
         dprint("ZZZ wmdd %d %d %d %d", a, b, c, d);
     }
+#endif
 }
 
 DECL_COMMAND(command_ldc1612_finish_home2,
@@ -544,7 +542,6 @@ check_home2(struct ldc1612* ld1, uint32_t data)
 {
     // WTB constexpr
     static uint32_t s_freq_weight_sum = WEIGHT_SUM(FREQ_WINDOW_SIZE);
-    static uint32_t s_deriv_weight_sum = WEIGHT_SUM(DERIV_WINDOW_SIZE);
 
     struct ldc1612_v2 *ld = &ld1->v2;
     uint8_t homing_flags = ld1->homing_flags;
@@ -600,22 +597,9 @@ check_home2(struct ldc1612* ld1, uint32_t data)
     uint32_t wma = (uint32_t)(wma_numerator / s_freq_weight_sum);
     int32_t wma_d = (int32_t)wma - (int32_t)ld->wma;
 
-    ld->wma = wma;
-    ld->deriv_buffer[ld->deriv_i] = wma_d;
-    ld->deriv_i = (ld->deriv_i + 1) % DERIV_WINDOW_SIZE;
-
-    // Then WMA of the derivative buffer
-    int64_t wma_numerator2 = 0;
-    for (int i = 0; i < DERIV_WINDOW_SIZE; i++) {
-        int weight = i + 1;
-        int j = (ld->deriv_i + i) % DERIV_WINDOW_SIZE;
-        wma_numerator2 += ((int64_t)ld->deriv_buffer[j]) * weight;
-    }
-
-    int32_t wma_d_wma = (int32_t)(wma_numerator2 / (int32_t)s_deriv_weight_sum);
-    if (wma_d_wma < ld->wma_d_wma) {
+    if (wma_d < ld->wma_d) {
         // derivative is decreasing; track it
-        ld->tap_accum += ld->wma_d_wma - wma_d_wma;
+        ld->tap_accum += ld->wma_d - wma_d;
     } else {
         // derivative is increasing; reset the accumulator,
         // and reset the tap time
@@ -623,9 +607,7 @@ check_home2(struct ldc1612* ld1, uint32_t data)
         ld->tap_start_time = time;
     }
 
-    ld->debug_last_wmdd[(ld->deriv_i - 1) % DERIV_WINDOW_SIZE] = wma_d_wma - ld->wma_d_wma;
-
-    ld->wma_d_wma = wma_d_wma;
+    ld->wma_d = wma_d;
 
     // Safety threshold check
     // We need to pass through this frequency threshold to be a valid dive.
