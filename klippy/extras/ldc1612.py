@@ -159,10 +159,9 @@ class LDC1612:
              " trsync_oid=%c trigger_reason=%c other_reason_base=%c"
              " trigger_freq=%u start_freq=%u start_time=%u tap_threshold=%i", cq=cmdqueue);
         self.ldc1612_finish_home2_cmd = self.mcu.lookup_query_command(
-             "query_ldc1612_finish_home2 oid=%c",
-             #"ldc1612_finish_home2_reply oid=%c trigger_clock=%u tap_start_clock=%u tap_amount=%u",
-             "ldc1612_finish_home2 oid=%c tap_start_clock=%u",
-             cq=cmdqueue)
+             "ldc1612_finish_home2 oid=%c",
+             "ldc1612_finish_home2_reply oid=%c homing=%c trigger_clock=%u tap_start_clock=%u tap_amount=%u",
+             oid=self.oid, cq=cmdqueue)
     def _handle_debug_print(self, params):
         logging.info(params["m"])
     def get_mcu(self):
@@ -229,12 +228,11 @@ class LDC1612:
 
     def finish_home2(self):
         # "ldc1612_finish_home2_reply oid=%c homing=%c trigger_clock=%u tap_start_clock=%u tap_amount=%u",
-        self.ldc1612_setup_home_cmd.send([self.oid, 0, 0, 0, 0, 0, 0, 0, 0, 0])
         reply = self.ldc1612_finish_home2_cmd.send([self.oid])
-        active = False #XXX #reply['homing'] is not 0
-        trigger_time = None #self.mcu.clock32_to_clock64(reply['trigger_clock'])
-        tap_start_time = self.mcu.clock32_to_clock64(reply['tap_start_clock'])
-        tap_amount = 0 #reply['tap_amount']
+        active = reply['homing'] is not 0
+        trigger_time = self.mcu.clock_to_print_time(self.mcu.clock32_to_clock64(reply['trigger_clock']))
+        tap_start_time = self.mcu.clock_to_print_time(self.mcu.clock32_to_clock64(reply['tap_start_clock']))
+        tap_amount = reply['tap_amount']
         return active, trigger_time, tap_start_time, tap_amount
 
     def clear_home(self):

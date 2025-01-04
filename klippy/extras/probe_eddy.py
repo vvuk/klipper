@@ -619,32 +619,22 @@ class ProbeEddy:
                 logging.info(f"Error dispatch wait: {e}")
                 errors.append(str(e))
 
-            reason = dispatch.stop()
-
-            # note at this point the probe is still spamming the host with
-            # status updates, until we gather.finish(). This makes getting replies
-            # to shot commands in a timely manner difficult, and we might timeout
-            gather.finish()
-
             # the trigger_time is the time the trsync triggered, i.e. after the tap threshold
             # was met. The tap_start_time is the start of the threshold check, i.e. when the derivative
             # started decreasing.
-            trigger_time = self._sensor.clear_home()
-            logging.info(f"got clear_home trigger_time: {trigger_time}")
-            trigger_time = self._sensor.clear_home()
-            logging.info(f"got clear_home trigger_time: {trigger_time}")
-            #active, trigger_time, tap_start_time, tap_amount = self._sensor.finish_home2()
-            _, _, tap_start_time, _ = self._sensor.finish_home2()
-            logging.info(f"got tap_start_time: {tap_start_time}")
+            #trigger_time = self._sensor.clear_home()
+            active, trigger_time, tap_start_time, tap_amount = self._sensor.finish_home2()
+            logging.info(f"{active} {trigger_time} {tap_start_time} {tap_amount}")
+            reason = dispatch.stop()
 
             if reason != mcu.MCU_trsync.REASON_ENDSTOP_HIT:
                 errors.append(f"Trigger not hit: {reason}")
-                #gather.finish()
+                gather.finish()
             else:
-                #gather.wait_for_sample_at_time(trigger_time)
-                #gather.finish()
+                gather.wait_for_sample_at_time(trigger_time)
+                gather.finish()
 
-                tap_pos_z = get_past_toolhead_z(self._printer, at=tap_start_time)
+                tap_pos_z, _ = get_past_toolhead_z(self._printer, at=tap_start_time)
                 trig_pos_z, _ = get_past_toolhead_z(self._printer, at=trigger_time)
                 now_pos_z = get_toolhead_kin_z(th)
                 success = True
@@ -656,9 +646,10 @@ class ProbeEddy:
                 trig_sensor_z = gather.find_height_at_time(trigger_time-0.003, trigger_time+0.003)
                 tap_sensor_z = gather.find_height_at_time(trigger_time-0.003, trigger_time+0.003)
 
-                toolhead_pos = th.get_position()
-                gcmd.respond_info(f"Triggered at z={trig_pos_z:.3f}, tap at z={tap_pos_z:.3f} (@{trigger_time:.4f}s, {tap_start_time:.4f}) (current kin z={now_pos_z:.3f}, " + \
-                                  f"offset {now_pos_z-trig_pos_z:.3f}, sensor trigger z={trig_sensor_z:.3f}, tap z={tap_sensor_z:.3f}, now toolhead z={toolhead_pos[2]:.3f})");
+                toolhead_z = th.get_position()[2]
+                gcmd.respond_info(f"Triggered at z={trig_pos_z:.3f}, tap at z={tap_pos_z:.3f} (@{trigger_time:.4f}s, {tap_start_time:.4f}, " + \
+                                  f"amt {tap_amount}) (current kin z={now_pos_z:.3f}, " + \
+                                  f"offset {now_pos_z-trig_pos_z:.3f}, sensor trigger z={trig_sensor_z:.3f}, tap z={tap_sensor_z:.3f}, now toolhead z={toolhead_z:.3f})");
         else:
             # This is purely for debugging/data analysis. It does the full movement so _will_ crash your toolhead
             # to whatever you specify as the Z target.
@@ -1163,6 +1154,11 @@ class ProbeEddySampler:
         # past the expected time
         if sample_print_time > wait_start_time:
             max_wait_time = max_wait_time + (sample_print_time - wait_start_time)
+
+        # this is just a sanity check, there's no reason to ever wait this long
+        if max_wait_time > 5.0:
+            raise self.eddy._printer.command_error(f"ProbeEddyFrequencySampler: max_wait_time {max_wait_time:.3f} is too far into the future")
+
 
         logging.info(f"ProbeEddyFrequencySampler: waiting for sample at {sample_print_time:.3f} (now: {wait_start_time:.3f}, max_wait_time: {max_wait_time:.3f})")
         while len(self._raw_samples) == 0 or self._raw_samples[-1][0] < sample_print_time:

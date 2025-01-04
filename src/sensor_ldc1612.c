@@ -75,6 +75,7 @@ struct ldc1612_v2 {
 
     uint32_t freq_buffer[FREQ_WINDOW_SIZE];
     int32_t deriv_buffer[DERIV_WINDOW_SIZE];
+    int32_t debug_last_wmdd[DERIV_WINDOW_SIZE];
 
     uint32_t wma_sum; // sum of the freq_buffer
     uint32_t wma; // last computed weighted moving average
@@ -98,7 +99,7 @@ struct ldc1612_v2 {
     // where we keep track
     uint32_t tap_accum;
     // the earliest start of this tap
-    uint32_t tap_time;
+    uint32_t tap_start_time;
 
     // the time we fired a trigger (same as homing_clock in parent struct,
     // due to code structure)
@@ -427,6 +428,8 @@ DECL_TASK(ldc1612_task);
 void
 ldc1612_shutdown(void)
 {
+    // make sure we stop measurements on shutdown so we don't
+    // spam host on startup
     uint8_t oid;
     struct ldc1612 *ld;
     foreach_oid(oid, ld, command_config_ldc1612) {
@@ -497,7 +500,7 @@ DECL_COMMAND(command_ldc1612_setup_home2,
              " tap_threshold=%i");
 
 void
-command_query_ldc1612_finish_home2(uint32_t *args)
+command_ldc1612_finish_home2(uint32_t *args)
 {
     struct ldc1612 *ld1 = oid_lookup(args[0], command_config_ldc1612);
     struct ldc1612_v2 *ld = &ld1->v2;
@@ -506,25 +509,33 @@ command_query_ldc1612_finish_home2(uint32_t *args)
     // between a setup_home and a clear_home. That should be an error in general,
     // so we should just shutdown if someone tries to setup home without clearing
     // the previous one.
-    //uint8_t active = (ld1->homing_flags & LH_CAN_TRIGGER) && (ld1->homing_flags & LH_V2);
+    uint8_t active = (ld1->homing_flags & LH_CAN_TRIGGER) && (ld1->homing_flags & LH_V2);
 
     uint32_t trigger_time = ld->trigger_time; // note: same as homing_clock in parent struct
-    uint32_t tap_time = ld->tap_time;
+    uint32_t tap_start_time = ld->tap_start_time;
     uint32_t tap_amount = ld->tap_accum;
 
     ld1->ts = NULL;
     ld1->homing_flags = 0;
 
-    //sendf("ldc1612_finish_home2_reply oid=%c trigger_clock=%u tap_start_clock=%u tap_amount=%u"
-    //      , args[0], trigger_time, tap_time, tap_amount);
-    sendf("ldc1612_finish_home2 oid=%c tap_start_clock=%u"
-          , args[0], tap_time);
+    sendf("ldc1612_finish_home2_reply oid=%c homing=%c trigger_clock=%u tap_start_clock=%u tap_amount=%u"
+          , args[0], active, trigger_time, tap_start_time, tap_amount);
 
-    //dprint("ZZZ home2 finish trig_t=%u tap_t=%u tap=%u", trigger_time, tap_time, tap_amount);
+    dprint("ZZZ home2 finish trig_t=%u tap_t=%u tap=%u", trigger_time, tap_start_time, tap_amount);
+
+    uint32_t i = ld->deriv_i;
+    for (i = 0; i < DERIV_WINDOW_SIZE; i += 4) {
+        int32_t a = ld->debug_last_wmdd[((ld->deriv_i + i) % DERIV_WINDOW_SIZE)];
+        int32_t b = ld->debug_last_wmdd[((ld->deriv_i + i + 1) % DERIV_WINDOW_SIZE)];
+        int32_t c = ld->debug_last_wmdd[((ld->deriv_i + i + 2) % DERIV_WINDOW_SIZE)];
+        int32_t d = ld->debug_last_wmdd[((ld->deriv_i + i + 3) % DERIV_WINDOW_SIZE)];
+
+        dprint("ZZZ wmdd %d %d %d %d", a, b, c, d);
+    }
 }
 
-DECL_COMMAND(command_query_ldc1612_finish_home2,
-             "query_ldc1612_finish_home2 oid=%c");
+DECL_COMMAND(command_ldc1612_finish_home2,
+             "ldc1612_finish_home2 oid=%c");
 
 #define WEIGHT_SUM(size) ((size * (size + 1)) / 2)
 
@@ -602,16 +613,18 @@ check_home2(struct ldc1612* ld1, uint32_t data)
     }
 
     int32_t wma_d_wma = (uint32_t)(wma_numerator / s_deriv_weight_sum);
-    if (ld->wma_d_wma > wma_d_wma) {
+    if (wma_d_wma < ld->wma_d_wma) {
         // derivative is decreasing; track it
-        if (ld->tap_accum == 0)
-            ld->tap_time = time;
         ld->tap_accum += ld->wma_d_wma - wma_d_wma;
     } else {
-        // derivative is increasing; reset the accumulator
+        // derivative is increasing; reset the accumulator,
+        // and reset the tap time
         ld->tap_accum = 0;
+        ld->tap_start_time = time;
     }
     ld->wma_d_wma = wma_d_wma;
+
+    ld->debug_last_wmdd[(ld->deriv_i - 1) % DERIV_WINDOW_SIZE] = wma_d_wma;
 
     // Safety threshold check
     // We need to pass through this frequency threshold to be a valid dive.
@@ -657,7 +670,7 @@ check_home2(struct ldc1612* ld1, uint32_t data)
         if (ld->tap_accum > ld->tap_threshold) {
             notify_trigger(ld1, time, ld->success_reason);
             ld->trigger_time = time;
-            dprint("ZZZ tap t=%u n=%u l=%u (f=%u)", ld->tap_time, time, ld->tap_accum, data);
+            dprint("ZZZ tap t=%u n=%u l=%u (f=%u)", ld->tap_start_time, time, ld->tap_accum, data);
         }
     }
 }
