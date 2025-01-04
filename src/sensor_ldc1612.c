@@ -137,7 +137,7 @@ struct ldc1612 {
     struct ldc1612_v2 v2;
 };
 
-static void check_home2(struct ldc1612* ld, uint32_t data);
+static void check_home2(struct ldc1612* ld, uint32_t data, uint32_t time);
 static void read_reg(struct ldc1612 *ld, uint8_t reg, uint8_t *res);
 static uint16_t read_reg_status(struct ldc1612 *ld);
 
@@ -330,6 +330,8 @@ ldc1612_query(struct ldc1612 *ld, uint8_t oid)
     if (!(status & 0x08)) // UNREADCONV1
         return;
 
+    uint32_t time = timer_read_time();
+
     // Read coil0 frequency
     uint8_t *d = &ld->sb.data[ld->sb.data_count];
     read_reg(ld, REG_DATA0_MSB, &d[0]);
@@ -346,7 +348,7 @@ ldc1612_query(struct ldc1612 *ld, uint8_t oid)
     if (ld->homing_flags & LH_CAN_TRIGGER) {
         // Check for endstop trigger
         if (ld->homing_flags & LH_V2)
-            check_home2(ld, data);
+            check_home2(ld, data, time);
         else
             check_home(ld, data);
     }
@@ -538,16 +540,14 @@ DECL_COMMAND(command_ldc1612_finish_home2,
 #define WEIGHT_SUM(size) ((size * (size + 1)) / 2)
 
 void
-check_home2(struct ldc1612* ld1, uint32_t data)
+check_home2(struct ldc1612* ld1, uint32_t data, uint32_t time)
 {
     // WTB constexpr
-    static uint32_t s_freq_weight_sum = WEIGHT_SUM(FREQ_WINDOW_SIZE);
+    static uint64_t s_freq_weight_sum = WEIGHT_SUM(FREQ_WINDOW_SIZE);
 
     struct ldc1612_v2 *ld = &ld1->v2;
     uint8_t homing_flags = ld1->homing_flags;
     uint8_t is_tap = !!(homing_flags & LH_WANT_TAP);
-
-    uint32_t time = timer_read_time();
 
     if (SAMPLE_ERR(data)) {
         // TODO: test homing from very high up
@@ -588,9 +588,10 @@ check_home2(struct ldc1612* ld1, uint32_t data)
     // for now
     uint64_t wma_numerator = 0;
     for (int i = 0; i < FREQ_WINDOW_SIZE; i++) {
-        int weight = i + 1;
         int j = (ld->freq_i + i) % FREQ_WINDOW_SIZE;
-        wma_numerator += ((uint64_t)ld->freq_buffer[j]) * weight;
+        uint64_t weight = i + 1;
+        uint64_t val = ld->freq_buffer[j];
+        wma_numerator += val * weight;
     }
 
     // WMA and derivative of the WMA
@@ -607,6 +608,7 @@ check_home2(struct ldc1612* ld1, uint32_t data)
         ld->tap_start_time = time;
     }
 
+    ld->wma = wma;
     ld->wma_d = wma_d;
 
     // Safety threshold check
