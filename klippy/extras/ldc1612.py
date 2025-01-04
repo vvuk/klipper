@@ -243,6 +243,9 @@ class LDC1612:
         tclock = self.mcu.clock32_to_clock64(params['trigger_clock'])
         return self.mcu.clock_to_print_time(tclock)
 
+    def conversion_ratio(self):
+        return float(LDC1612_FREQ) / (1<<28)
+
     # Measurement decoding
     def _convert_samples(self, samples):
         freq_conv = float(LDC1612_FREQ) / (1<<28)
@@ -254,7 +257,8 @@ class LDC1612:
                     self.last_err_kind = val >> 28
                 self.last_error_count += 1
             else:
-                samples[count] = (round(ptime, 6), round(freq_conv * val, 3), 999.9)
+                #samples[count] = (round(ptime, 6), round(freq_conv * val, 3), 999.9)
+                samples[count] = (round(ptime, 6), val, 999.9)
                 count += 1
         # remove the error samples
         del samples[count:]

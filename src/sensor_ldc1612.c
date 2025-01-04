@@ -79,7 +79,7 @@ struct ldc1612_v2 {
 
     uint32_t wma_sum; // sum of the freq_buffer
     uint32_t wma; // last computed weighted moving average
-    uint32_t wma_d_wma; // last wma of the wma_d
+    int32_t wma_d_wma; // last wma of the wma_d
 
     // frequency we must pass through to have a valid home/tap
     uint32_t safe_start_freq;
@@ -605,14 +605,14 @@ check_home2(struct ldc1612* ld1, uint32_t data)
     ld->deriv_i = (ld->deriv_i + 1) % DERIV_WINDOW_SIZE;
 
     // Then WMA of the derivative buffer
-    wma_numerator = 0;
+    int64_t wma_numerator2 = 0;
     for (int i = 0; i < DERIV_WINDOW_SIZE; i++) {
         int weight = i + 1;
         int j = (ld->deriv_i + i) % DERIV_WINDOW_SIZE;
-        wma_numerator += ((uint64_t)ld->deriv_buffer[j]) * weight;
+        wma_numerator2 += ((int64_t)ld->deriv_buffer[j]) * weight;
     }
 
-    int32_t wma_d_wma = (uint32_t)(wma_numerator / s_deriv_weight_sum);
+    int32_t wma_d_wma = (int32_t)(wma_numerator2 / (int32_t)s_deriv_weight_sum);
     if (wma_d_wma < ld->wma_d_wma) {
         // derivative is decreasing; track it
         ld->tap_accum += ld->wma_d_wma - wma_d_wma;
@@ -622,9 +622,10 @@ check_home2(struct ldc1612* ld1, uint32_t data)
         ld->tap_accum = 0;
         ld->tap_start_time = time;
     }
-    ld->wma_d_wma = wma_d_wma;
 
-    ld->debug_last_wmdd[(ld->deriv_i - 1) % DERIV_WINDOW_SIZE] = wma_d_wma;
+    ld->debug_last_wmdd[(ld->deriv_i - 1) % DERIV_WINDOW_SIZE] = wma_d_wma - ld->wma_d_wma;
+
+    ld->wma_d_wma = wma_d_wma;
 
     // Safety threshold check
     // We need to pass through this frequency threshold to be a valid dive.

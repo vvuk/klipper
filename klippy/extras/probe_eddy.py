@@ -569,17 +569,19 @@ class ProbeEddy:
             th.manual_move([None, None, tap_start], TAP_RETRACT_SPEED)
 
         samples = gather.get_samples()
+        raw_samples = gather.get_raw_samples()
 
         with open("/tmp/tap-samples.csv", "w") as data_file:
-            data_file.write(f"time,frequency,z,kin_z,kin_v,tap_start_time,trigger_time\n")
+            data_file.write(f"time,frequency,z,kin_z,kin_v,raw_f,tap_start_time,trigger_time\n")
             for i in range(len(samples)):
                 s_t, s_freq, s_z = samples[i]
+                _, raw_f , _= raw_samples[i]
                 k_z, past_v = get_past_toolhead_z(self._printer, s_t)
                 #k_z = get_toolhead_kin_z(th, at=s_t)
                 if i == 0:
-                    data_file.write(f"{s_t},{s_freq},{s_z},{k_z},{past_v},{tap_start_time},{trigger_time}\n")
+                    data_file.write(f"{s_t},{s_freq},{s_z},{k_z},{past_v},{raw_f},{tap_start_time},{trigger_time}\n")
                 else:
-                    data_file.write(f"{s_t},{s_freq},{s_z},{k_z},{past_v}\n")
+                    data_file.write(f"{s_t},{s_freq},{s_z},{k_z},{past_v},{raw_f}\n")
         
         gcmd.respond_info(f"Wrote {len(samples)} samples to /tmp/tap-samples.csv")
 
@@ -991,8 +993,13 @@ class ProbeEddySampler:
             return
 
         start_idx = len(self._samples)
+        conv_ratio = self._sensor.conversion_ratio()
         if self._fmap is not None:
-            new_samples = [(t, f, self._fmap.freq_to_height(f)) for t, f, _ in self._raw_samples[start_idx:]]
+            new_samples = [(
+                t,
+                round(conv_ratio * f, ndigits=3),
+                self._fmap.freq_to_height(round(conv_ratio * f, ndigits=3)))
+                for t, f, _ in self._raw_samples[start_idx:]]
             self._samples.extend(new_samples)
         else:
             self._samples.extend(self._raw_samples[start_idx:])
