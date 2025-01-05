@@ -221,7 +221,7 @@ class LDC1612:
                     trigger_freq, start_freq, start_time, tap_threshold=0):
         t_freqvl = self.to_ldc_freqval(trigger_freq)
         s_freqval = self.to_ldc_freqval(start_freq)
-        start_time_mcu = self.mcu.print_time_to_clock(start_time)
+        start_time_mcu = self.mcu.print_time_to_clock(start_time) if start_time > 0 else 0
         logging.info(f"LD1612 setup_home2: trigger: {trigger_freq:.2f} ({t_freqvl}) safe: {start_freq:.2f} ({s_freqval}) @ {start_time:.2f} ({start_time_mcu}) trsync: {trsync_oid} {hit_reason} {reason_base} TAP: {tap_threshold}")
         self.ldc1612_setup_home2_cmd.send([self.oid, trsync_oid, hit_reason,
                                            reason_base, t_freqvl, s_freqval, start_time_mcu, tap_threshold])

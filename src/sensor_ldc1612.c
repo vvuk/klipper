@@ -29,7 +29,6 @@ enum {
 
 #define REASON_ERROR_SENSOR 0
 #define REASON_ERROR_PROBE_TOO_LOW 1
-#define REASON_TOUCH 5
 
 // Chip registers
 #define REG_DATA0_MSB 0x00
@@ -61,6 +60,7 @@ enum {
 
 // Configuration
 #define FREQ_WINDOW_SIZE 16
+#define WMA_D_WINDOW_SIZE 4
 
 struct ldc1612_v2 {
     // Used from parent:
@@ -72,12 +72,18 @@ struct ldc1612_v2 {
     // fix that by moving the home-state tracking to its
     // own struct.
 
+    // frequencies are always positive, as is their average
+    // the derivative however is signed
+
     uint32_t freq_buffer[FREQ_WINDOW_SIZE];
+    int32_t wma_d_buf[WMA_D_WINDOW_SIZE];
     // current index in freq/deriv buffers
     uint8_t freq_i;
+    uint8_t wma_d_i;
 
     uint32_t wma; // last computed weighted moving average
-    uint32_t wma_d; // last computed wma derivative
+    int32_t wma_d_avg; // last computed wma derivative average
+
     // where we keep track
     uint32_t tap_accum;
     // the earliest start of this tap
@@ -109,6 +115,8 @@ struct ldc1612_v2 {
     // trigger reasons
     uint8_t success_reason;
     uint8_t other_reason_base;
+
+    uint8_t err_count;
 
 };
 
@@ -551,7 +559,11 @@ check_home2(struct ldc1612* ld1, uint32_t data, uint32_t time)
 
     if (SAMPLE_ERR(data)) {
         // TODO: test homing from very high up
-        dprint("ZZZ home2 err=%u", data);
+        dprint("ZZZ home2 err=%u t=%u s=%u", data, time, ld1->prev_status);
+        //ld->err_count++;
+        //if (ld->err_count < 3)
+        //    return;
+
         // ignore amplitude errors (likely probe too far),
         // unless we're tapping, in which case we should consider
         // all errors for safety -- it means the tap wasn't started
@@ -563,6 +575,8 @@ check_home2(struct ldc1612* ld1, uint32_t data, uint32_t time)
         notify_trigger(ld1, 0, ld->other_reason_base + REASON_ERROR_SENSOR);
         return;
     }
+
+    ld->err_count = 0;
 
     //
     // Update the sensor averages and derivatives
@@ -598,9 +612,18 @@ check_home2(struct ldc1612* ld1, uint32_t data, uint32_t time)
     uint32_t wma = (uint32_t)(wma_numerator / s_freq_weight_sum);
     int32_t wma_d = (int32_t)wma - (int32_t)ld->wma;
 
-    if (wma_d < ld->wma_d) {
+    // A simple average of wma_d to smooth it out a bit
+    ld->wma_d_buf[ld->wma_d_i] = wma_d;
+    ld->wma_d_i = (ld->wma_d_i + 1) % WMA_D_WINDOW_SIZE;
+    int32_t wma_d_avg = 0;
+    for (int i = 0; i < WMA_D_WINDOW_SIZE; i++) {
+        wma_d_avg += ld->wma_d_buf[i];
+    }
+    wma_d_avg = wma_d_avg / WMA_D_WINDOW_SIZE;
+
+    if (wma_d_avg < ld->wma_d_avg) {
         // derivative is decreasing; track it
-        ld->tap_accum += ld->wma_d - wma_d;
+        ld->tap_accum += ld->wma_d_avg - wma_d_avg;
     } else {
         // derivative is increasing; reset the accumulator,
         // and reset the tap time
@@ -609,7 +632,7 @@ check_home2(struct ldc1612* ld1, uint32_t data, uint32_t time)
     }
 
     ld->wma = wma;
-    ld->wma_d = wma_d;
+    ld->wma_d_avg = wma_d_avg;
 
     // Safety threshold check
     // We need to pass through this frequency threshold to be a valid dive.
@@ -620,8 +643,8 @@ check_home2(struct ldc1612* ld1, uint32_t data, uint32_t time)
 
         // And we need to do it _after_ this time, to make sure we didn't
         // start below the thershold
-        if (timer_is_before(time, ld->safe_start_time)) {
-            dprint("ZZZ EARLY! time=%u < %u", time, ld->safe_start_time);
+        if (ld->safe_start_time != 0 && timer_is_before(time, ld->safe_start_time)) {
+            dprint("ZZZ EARLY! time=%u > %u", time, ld->safe_start_time);
             notify_trigger(ld1, 0, ld->other_reason_base + REASON_ERROR_PROBE_TOO_LOW);
             return;
         }
@@ -653,7 +676,8 @@ check_home2(struct ldc1612* ld1, uint32_t data, uint32_t time)
         }
     } else {
         if (ld->tap_accum > ld->tap_threshold) {
-            notify_trigger(ld1, time, ld->success_reason);
+            // Note: we notify with the time the tap started, not the current time
+            notify_trigger(ld1, ld->tap_start_time, ld->success_reason);
             ld->trigger_time = time;
             dprint("ZZZ tap t=%u n=%u l=%u (f=%u)", ld->tap_start_time, time, ld->tap_accum, data);
         }
