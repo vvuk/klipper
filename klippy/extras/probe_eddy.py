@@ -78,11 +78,18 @@ class ProbeEddy:
 
             'reg_drive_current': 0,
             'tap_drive_current': 0,
+
+            'tap_start_z': 3.2,
+            'tap_threshold': 1000,
         }
 
         for k in self.params:
             if 'speed' in k:
                 self.params[k] = config.getfloat(k, self.params[k], above=0.0)
+            elif 'threshold' in k:
+                self.params[k] = config.getint(k, self.params[k], minval=100)
+            elif 'drive_current' in k:
+                self.params[k] = config.getint(k, self.params[k], minval=0, maxval=31)
             else:
                 self.params[k] = config.getfloat(k, self.params[k])
 
