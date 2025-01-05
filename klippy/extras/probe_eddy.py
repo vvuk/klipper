@@ -464,8 +464,8 @@ class ProbeEddy:
         if now_z > probe_trigger_z:
             gcmd.respond_raw(f"!! warning: now_z {now_z:.3f} is above probe_z {probe_trigger_z:.3f}\n")
 
-        # How much we overshot the tap start time (which is what probe_trigger_z is based on;
-        # the trigger fires later)
+        # How much we overshot the tap start location (which is what probe_trigger_z is based on;
+        # the actual sync trigger fires at a later time when we complete the tap detection)
         overshoot = probe_trigger_z - now_z
 
         logging.info(f"Probe triggered at: {probe_trigger_z:.4f}, now z: {now_z:.4f}, overshoot: {overshoot:.4f}")
@@ -1046,7 +1046,8 @@ class ProbeEddySampler:
             raise self.eddy._printer.command_error(f"ProbeEddyFrequencySampler: max_wait_time {max_wait_time:.3f} is too far into the future")
 
 
-        logging.info(f"ProbeEddyFrequencySampler: waiting for sample at {sample_print_time:.3f} (now: {wait_start_time:.3f}, max_wait_time: {max_wait_time:.3f})")
+        if self._trace:
+            logging.info(f"ProbeEddyFrequencySampler: waiting for sample at {sample_print_time:.3f} (now: {wait_start_time:.3f}, max_wait_time: {max_wait_time:.3f})")
         while len(self._raw_samples) == 0 or self._raw_samples[-1][0] < sample_print_time:
             now = self._mcu.estimated_print_time(self._reactor.monotonic())
             if now - wait_start_time > max_wait_time:
