@@ -106,6 +106,7 @@ class LDC1612:
         self.oid = oid = mcu.create_oid()
         self.ldc1612_start_stop_cmd = None
         self.ldc1612_setup_home_cmd = self.ldc1612_setup_home2_cmd = self.query_ldc1612_home_state_cmd = None
+        self.samples_keep_as_raw = False # If the owner wants the raw int values directly as read, without conversion
         if config.get('intb_pin', None) is not None:
             ppins = config.get_printer().lookup_object("pins")
             pin_params = ppins.lookup_pin(config.get('intb_pin'))
@@ -160,7 +161,7 @@ class LDC1612:
              " trigger_freq=%u start_freq=%u start_time=%u tap_threshold=%i", cq=cmdqueue);
         self.ldc1612_finish_home2_cmd = self.mcu.lookup_query_command(
              "ldc1612_finish_home2 oid=%c",
-             "ldc1612_finish_home2_reply oid=%c homing=%c trigger_clock=%u tap_start_clock=%u tap_amount=%u",
+             "ldc1612_finish_home2_reply oid=%c homing=%c trigger_clock=%u tap_end_clock=%u tap_amount=%u",
              oid=self.oid, cq=cmdqueue)
     def _handle_debug_print(self, params):
         logging.info(params["m"])
@@ -200,7 +201,7 @@ class LDC1612:
         self._init_chip()
         res = self.query_ldc1612_latched_status_cmd.send([self.oid])
         return (res['status'], res['lastval'], self.from_ldc_freqval(res['lastval'], ignore_err=True))
-    # Homing
+
     def to_ldc_freqval(self, freq):
         return int(freq * (1<<28) / float(LDC1612_FREQ) + 0.5)
     def from_ldc_freqval(self, val, ignore_err = False):
@@ -208,6 +209,7 @@ class LDC1612:
             raise self.printer.command_error(f"LDC1612 frequency value has error bits: {hex(val)}")
         return round(val * (float(LDC1612_FREQ) / (1<<28)), 3)
 
+    # Homing
     def setup_home(self, print_time, trigger_freq,
                    trsync_oid, hit_reason, err_reason):
         clock = self.mcu.print_time_to_clock(print_time)
@@ -227,13 +229,13 @@ class LDC1612:
                                            reason_base, t_freqvl, s_freqval, start_time_mcu, tap_threshold])
 
     def finish_home2(self):
-        # "ldc1612_finish_home2_reply oid=%c homing=%c trigger_clock=%u tap_start_clock=%u tap_amount=%u",
+        # "ldc1612_finish_home2_reply oid=%c homing=%c trigger_clock=%u tap_end_clock=%u tap_amount=%u",
         reply = self.ldc1612_finish_home2_cmd.send([self.oid])
         active = reply['homing'] is not 0
         trigger_time = self.mcu.clock_to_print_time(self.mcu.clock32_to_clock64(reply['trigger_clock']))
-        tap_start_time = self.mcu.clock_to_print_time(self.mcu.clock32_to_clock64(reply['tap_start_clock']))
+        tap_end_time = self.mcu.clock_to_print_time(self.mcu.clock32_to_clock64(reply['tap_end_clock']))
         tap_amount = reply['tap_amount']
-        return active, trigger_time, tap_start_time, tap_amount
+        return active, trigger_time, tap_end_time, tap_amount
 
     def clear_home(self):
         self.ldc1612_setup_home_cmd.send([self.oid, 0, 0, 0, 0, 0, 0, 0, 0, 0])
@@ -248,7 +250,10 @@ class LDC1612:
 
     # Measurement decoding
     def _convert_samples(self, samples):
-        freq_conv = float(LDC1612_FREQ) / (1<<28)
+        freq_conv = self.conversion_ratio()
+        if self.samples_keep_as_raw:
+            freq_conv = 1
+
         count = 0
         for ptime, val in samples:
             if val > 0x0fffffff: # high nibble indicates an error
@@ -257,8 +262,7 @@ class LDC1612:
                     self.last_err_kind = val >> 28
                 self.last_error_count += 1
             else:
-                #samples[count] = (round(ptime, 6), round(freq_conv * val, 3), 999.9)
-                samples[count] = (round(ptime, 6), val, 999.9)
+                samples[count] = (round(ptime, 6), round(freq_conv * val, 3), 999.9)
                 count += 1
         # remove the error samples
         del samples[count:]
@@ -292,9 +296,7 @@ class LDC1612:
         # there's no reason for this to be small
         settle_time = SETTLETIME
 
-
         val_settle_count = 0xffff # int(SETTLETIME * freq / 16. + .5)
-
 
         # This is the TI-recommended register configuration order
         # Setup chip in requested query rate
@@ -332,12 +334,13 @@ class LDC1612:
             return
 
         # Start bulk reading
+        self.last_error_count = 0
         rest_ticks = self.mcu.seconds_to_clock(0.5 / self.data_rate)
         self.ldc1612_start_stop_cmd.send([self.oid, rest_ticks])
         logging.info("LDC1612 starting '%s' measurements", self.name)
         # Initialize clock tracking
         self.ffreader.note_start()
-        self.last_error_count = 0
+
     def _finish_measurements(self):
         self._start_count -= 1
 
@@ -349,6 +352,7 @@ class LDC1612:
         self.ldc1612_start_stop_cmd.send_wait_ack([self.oid, 0])
         self.ffreader.note_end()
         logging.info("LDC1612 finished '%s' measurements", self.name)
+
     def _process_batch(self, eventtime):
         samples = self.ffreader.pull_samples()
         self._convert_samples(samples)

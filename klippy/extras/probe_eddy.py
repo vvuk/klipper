@@ -56,31 +56,30 @@ class ProbeEddy:
         sensor_type = config.getchoice('sensor_type', {s: s for s in sensors})
 
         self._sensor = sensors[sensor_type](config)
+        self._sensor.samples_keep_as_raw = True
         self._mcu = self._sensor.get_mcu()
         self._temp_sensor: TemperatureProbe = config.printer.load_object(config, f'temperature_probe {self._name}')
 
         # these are defaults
         self.params = {
-            # TODO what is speed vs probe_speed
-            'speed': 5.0,
-            'lift_speed': 5.0,
             'probe_speed': 5.0,
+            'lift_speed': 5.0,
             'backlash_comp': 0.5,  #TODO
 
             # what height to trigger homing at
             'home_trigger_height': 2.0,
             # What height above home_trigger_height to allow homing to start
-            'home_trigger_height_start_offset': 1.5,
-            'trigger_freq_slop': 0.006,
+            'home_trigger_safe_start_offset': 1.5,
 
             'calibration_z_max': 5.0,
-            'calibration_step': 0.040,
 
             'reg_drive_current': 0,
             'tap_drive_current': 0,
 
             'tap_start_z': 3.2,
+            'tap_target_z': -0.250,
             'tap_threshold': 1000,
+            'tap_speed': 3.0,
         }
 
         for k in self.params:
@@ -96,7 +95,7 @@ class ProbeEddy:
         self._validate_params()
 
         # at what minimum physical height to start homing
-        self._home_start_height = self.params['calibration_z_max']
+        self._home_start_height = self.params['home_trigger_height'] + self.params['home_trigger_height_start_offset']
 
         # physical offsets between probe and nozzle
         self.offset = {
@@ -191,6 +190,33 @@ class ProbeEddy:
             drive_current = self.current_drive_current()
         return drive_current in self._dc_to_fmap and self._dc_to_fmap[drive_current].calibrated()
 
+    def _z_homed(self):
+        curtime_r = self._printer.get_reactor().monotonic()
+        kin_status = self._printer.lookup_object('toolhead').get_kinematics().kin.get_status(curtime_r)
+        return 'z' in kin_status['homed_axes']
+
+    def _xy_homed(self):
+        curtime_r = self._printer.get_reactor().monotonic()
+        kin_status = self._printer.lookup_object('toolhead').get_kinematics().kin.get_status(curtime_r)
+        return 'x' in kin_status['homed_axes'] and 'y' in kin_status['homed_axes']
+
+    def _z_hop(self, by=5.0):
+        toolhead: ToolHead = self._printer.lookup_object('toolhead')
+        curpos = toolhead.get_position()
+        curpos[2] = curpos[2] + 5
+        toolhead.manual_move(curpos, self.params['probe_speed'])
+
+    def save_config(self, gcmd: GCodeCommand):
+        for _, fmap in self._dc_to_fmap.items():
+            fmap.save_calibration(gcmd)
+
+        configfile = self._printer.lookup_object('configfile')
+        configfile.set(self._full_name, f"calibrated_drive_currents", str.join(', ', [str(dc) for dc in self._dc_to_fmap.keys()]))
+
+        if gcmd:
+            gcmd.respond_info("Calibration saved. Issue a SAVE_CONFIG to write the values to your config file and restart Klipper.")
+
+    cmd_QUERY_help = "Query the last raw coil value and status"
     def cmd_QUERY(self, gcmd: GCodeCommand):
         status, freqval, freq = self._sensor.read_one_value()
         height = self.freq_to_height(freq) if self.calibrated() else -math.inf
@@ -218,11 +244,21 @@ class ProbeEddy:
         height = self.freq_to_height(freq)
         return freq, height
 
+    cmd_CLEAR_CALIBRATION_help = "Clear calibration for all drive currents"
     def cmd_CLEAR_CALIBRATION(self, gcmd: GCodeCommand):
-        self._dc_to_fmap = {}
+        drive_current: int = gcmd.get_int('DRIVE_CURRENT', -1)
+        if drive_current == -1:
+            self._dc_to_fmap = {}
+            gcmd.respond_info(f"Cleared calibration for all drive currents")
+        else:
+            if drive_current not in self._dc_to_fmap:
+                raise self._printer.command_error(f"Drive current {drive_current} not calibrated")
+            del self._dc_to_fmap[drive_current]
+            gcmd.respond_info(f"Cleared calibration for drive current {drive_current}")
         self.save_config(gcmd)
-        gcmd.respond_info(f"Cleared calibration for all drive currents")
 
+    cmd_PROBE_STATIC_help = "Probe the current height using the eddy current sensor without moving the toolhead. " + \
+        "Specify DURATION to indicate how long in seconds to read samples (default 0.100)."
     def cmd_PROBE_STATIC(self, gcmd: GCodeCommand):
         if not self.calibrated():
             gcmd.respond_raw("!! Probe not calibrated\n")
@@ -267,58 +303,66 @@ class ProbeEddy:
 
             self._cmd_helper.last_z_result = height
 
+    cmd_CALIBRATE_help = "Calibrate the eddy current sensor. Specify DRIVE_CURRENT to calibrate for a different drive current " + \
+        "than the default. Specify Z_MAX to set a different calibration start point."
     def cmd_CALIBRATE(self, gcmd: GCodeCommand):
         # z-hop so that manual probe helper doesn't complain if we're already
         # at the right place
-        toolhead: ToolHead = self._printer.lookup_object('toolhead')
-        curpos = toolhead.get_position()
-        curpos[2] = curpos[2] + 5
-        toolhead.manual_move(curpos, self.params['probe_speed'])
+        self._z_hop()
 
         manual_probe.ManualProbeHelper(self._printer, gcmd,
                                        lambda kin_pos: self.cmd_CALIBRATE_next(gcmd, kin_pos))
 
     def cmd_CALIBRATE_next(self, gcmd: GCodeCommand, kin_pos: List[float]):
         if kin_pos is None:
+            # User cancelled ManualProbeHelper
             return
 
         old_drive_current = self.current_drive_current()    
         drive_current: int = gcmd.get_int('DRIVE_CURRENT', old_drive_current, minval=0, maxval=31)
-        self._sensor.set_drive_current(drive_current)
+        cal_z_max: float = gcmd.get_float('Z_MAX', self.params['calibration_z_max'], above=2.0)
+        z_target: float = gcmd.get_float('Z_TARGET', 0.010)
 
-        Z_TARGET = 0.010
+        probe_speed = gcmd.get_float('SPEED', self.params['probe_speed'], above=0.0)
+        lift_speed = gcmd.get_float('LIFT_SPEED', self.params['lift_speed'], above=0.0)
 
-        with ToolheadMovementHelper(self) as th:
-            # We just did a ManualProbeHelper, so we're going to zero the z-axis
-            # to make the following code easier, so it can assume z=0 is actually real zero.
-            # The Eddy sensor calibration is done to nozzle height (not sensor or trigger height).
-            kin_pos[2] = 0.0
-            th.set_absolute_position(*kin_pos)
-            th.dwell(0.100)
+        th = self._printer.lookup_object('toolhead')
 
-            # move to the start of calibration
-            cal_z_max = self.params['calibration_z_max']
-            #th.move_by(-self.offset['x'], -self.offset['y'], cal_z_max)
-            th.move_to_z(cal_z_max)
+        # We just did a ManualProbeHelper, so we're going to zero the z-axis
+        # to make the following code easier, so it can assume z=0 is actually real zero.
+        # The Eddy sensor calibration is done to nozzle height (not sensor or trigger height).
+        th_pos = th.get_position() 
+        th_pos[2] = kin_pos[2]
 
-            mapping = None
-            toolhead_positions = []
-            first_sample_time = None
-            last_sample_time = None
+        th.set_position(th_pos, homing_axes=(2))
+
+        # move to the start of calibration
+        #th.move_by(-self.offset['x'], -self.offset['y'], cal_z_max)
+        th.manual_move([None, None, cal_z_max], lift_speed)
+
+        mapping = None
+        first_sample_time = None
+        last_sample_time = None
+
+        try:
+            self._sensor.set_drive_current(drive_current)
+            th.dwell(0.500) # give the sensor a bit to settle
+            th.wait_moves()
 
             with ProbeEddySampler(self, calculate_heights=False) as sampler:
                 first_sample_time = th.get_last_move_time()
-                th.move_to_z(Z_TARGET)
+                th.manual_move([None, None, z_target], probe_speed)
+                th.wait_moves()
                 last_sample_time = th.get_last_move_time()
                 sampler.finish()
 
-            # back to a safe spot
-            th.move_to_z(cal_z_max)
+                # back to start
+                th.manual_move([None, None, cal_z_max], lift_speed)
+        finally:
             self._sensor.set_drive_current(old_drive_current)
 
-        # the samples are a list of [print_time, freq] pairs.
-        # in toolhead_positions, we have a list of [print_time, kin_z] pairs.
-        samples = sampler.get_samples()
+        # the samples are a list of [print_time, freq, dummy_height] tuples
+        samples = sampler.get_raw_samples()
         if len(samples) == 0:
             gcmd.respond_raw("!! No samples collected\n")
             return
@@ -326,22 +370,23 @@ class ProbeEddy:
         freqs = []
         heights = []
 
-        data_file = open("/tmp/eddy-samples.csv", "w")
-        data_file.write(f"time,frequency,z,used\n")
 
-        for s_t, s_freq, _ in samples:
-            s_z = th.get_kin_z(at=s_t)
-            used = 0
-            if s_t > (first_sample_time + 0.050) and s_t < last_sample_time and s_z > Z_TARGET:
-                freqs.append(s_freq)
-                heights.append(s_z)
-                used = 1
-            data_file.write(f"{s_t},{s_freq},{s_z},{used}\n")
-            # we write everything for debugging, but only use the samples in our
-            # time range
+        with open("/tmp/eddy-calibration.csv", "w") as data_file:
+            data_file.write(f"time,frequency,z,used\n")
+
+            for s_t, s_freq, _ in samples:
+                # TODO use get_past_toolhead_goal_z
+                s_z = get_toolhead_kin_z(th, at=s_t)
+                # we write everything for debugging, but only use the samples in our
+                # time range; flag so we know in the csv what we used for calibration
+                used = 0
+                if s_t > (first_sample_time + 0.050) and s_t < last_sample_time and s_z > z_target:
+                    freqs.append(s_freq)
+                    heights.append(s_z)
+                    used = 1
+                data_file.write(f"{s_t},{s_freq},{s_z},{used}\n")
         
-        data_file.close()
-        gcmd.respond_info(f"Wrote {len(samples)} samples to /tmp/eddy-samples.csv")
+        gcmd.respond_info(f"Wrote {len(samples)} samples to /tmp/eddy-calibration.csv")
 
         # and build a map
         mapping = ProbeEddyFrequencyMap(self)
@@ -355,16 +400,6 @@ class ProbeEddy:
         self.save_config(gcmd)
 
         gcmd.respond_info(f"Calibration complete, R^2: freq-to-height={r2_fth:.3f}, height-to-freq={r2_htf:.3f}")
-
-    def save_config(self, gcmd: GCodeCommand):
-        for _, fmap in self._dc_to_fmap.items():
-            fmap.save_calibration(gcmd)
-
-        configfile = self._printer.lookup_object('configfile')
-        configfile.set(self._full_name, f"calibrated_drive_currents", str.join(', ', [str(dc) for dc in self._dc_to_fmap.keys()]))
-
-        if gcmd:
-            gcmd.respond_info("Calibration saved. Issue a SAVE_CONFIG to write the values to your config file and restart Klipper.")
 
     #
     # PrinterProbe interface
@@ -389,7 +424,6 @@ class ProbeEddy:
     def start_probe_session(self, gcmd):
         method = gcmd.get('METHOD', 'automatic').lower()
         if method in ('scan', 'rapid_scan'):
-            #z_offset = self.get_offsets()[2]
             session = ProbeEddyScanningProbe(self, gcmd)
             session.start_session()
             return session
@@ -407,46 +441,36 @@ class ProbeEddy:
     def cmd_TAP(self, gcmd: GCodeCommand):
         drive_current = self._sensor.get_drive_current()
         try:
-            self.tapping_move_homing(gcmd)
+            self.tapping_home(gcmd)
         finally:
             self._sensor.set_drive_current(drive_current)
 
-    def tapping_move_homing(self, gcmd: GCodeCommand):
-        logging.info("\n\nTapping move: homing")
+    def tapping_home(self, gcmd: GCodeCommand):
+        logging.info("\nTapping move begin")
+
         tap_drive_current = gcmd.get_int(name='DRIVE_CURRENT', default=self.params['tap_drive_current'], minval=0, maxval=31)
+        tap_speed = gcmd.get_float('SPEED', self.params['tap_speed'], above=0.0)
+        lift_speed = gcmd.get_float('RETRACT_SPEED', self.params['lift_speed'], above=0.0)
+        tap_start_z = gcmd.get_float('START_Z', self.params['tap_start_z'], above=2.0)
+        target_z = gcmd.get_float('TARGET_Z', self.params['tap_target_z'])
+        tap_threshold = gcmd.get_int('THRESHOLD', self.params['tap_threshold'], minval=0)
+        tap_threshold = gcmd.get_int('TT', tap_threshold, minval=0) # alias for THRESHOLD
+
+        do_retract = gcmd.get_int('RETRACT', 1)
+        do_adjust = gcmd.get_int('ADJUST', 1)
+
         self._sensor.set_drive_current(tap_drive_current)
 
-        TAP_MOVE_SPEED=3.0
-        TAP_RETRACT_SPEED=5.0
-        TAP_THRESHOLD=550
-        TARGET_Z=-0.250
-
-        tap_move_speed = gcmd.get_float('SPEED', TAP_MOVE_SPEED, above=0.0)
-        tap_threshold = gcmd.get_int('TTAP', TAP_THRESHOLD, minval=0)
-        do_retract = gcmd.get_int('RETRACT', 1)
-        no_adjust = gcmd.get_int('NO_ADJUST', 0)
-        tap_start_z = gcmd.get_float('START_Z', 3.5, above=2.0)
-        target_z = gcmd.get_float('TARGET_Z', TARGET_Z)
-
-        reactor = self._printer.get_reactor()
-        th = self._printer.lookup_object('toolhead')
-        kin = th.get_kinematics()
-
-        home_trigger_height = self.params['home_trigger_height']
-        home_trigger_height_start_offset = self.params['home_trigger_height_start_offset']
-
-        curtime_r = reactor.monotonic()
-        kin_status = kin.get_status(curtime_r)
-        z_homed = 'z' in kin_status['homed_axes']
-        if not z_homed:
+        if not self._z_homed():
             raise self._printer.command_error("Z axis must be homed before tapping")
 
-        th.manual_move([None, None, tap_start_z], TAP_RETRACT_SPEED)
+        # move to tap_start_z
+        th = self._printer.lookup_object('toolhead')
+        th.manual_move([None, None, tap_start_z], lift_speed)
         th.dwell(0.100)
         th.wait_moves()
 
         initial_position = th.get_position()
-        initial_z = initial_position[2]
         target_position = initial_position[:]
         target_position[2] = target_z
 
@@ -455,7 +479,7 @@ class ProbeEddy:
             self._endstop_wrapper.save_samples_path = "/tmp/tap-samples.csv"
             self._endstop_wrapper.tap_threshold = tap_threshold
             # this does a HomingMove.homing_move with a probe_pos = True
-            probe_position = phoming.probing_move(self._endstop_wrapper, target_position, tap_move_speed)
+            probe_position = phoming.probing_move(self._endstop_wrapper, target_position, tap_speed)
         except self._printer.command_error as e:
             raise
         finally:
@@ -466,52 +490,47 @@ class ProbeEddy:
         probe_trigger_z = probe_position[2]
         now_z = th_pos[2]
 
-        # we're at now_z, but probe_z is actual zero. We expect now_z
-        # to be below or equal to probe_z, i.e. it's the overshoot
+        # we're at now_z, but probe_z is the actual zero. We expect now_z
+        # to be below or equal to probe_z because there will always be
+        # a bit of overshoot due to trigger delay, and because we actually
+        # fire the trigger later than when the tap starts (and the tap start
+        # time is what's used to compute probe_position)
         if now_z > probe_trigger_z:
-            gcmd.respond_raw(f"!! warning: now_z {now_z:.3f} is above probe_z {probe_trigger_z:.3f}\n")
+            raise self._printer.command_error(f"Unexpected: now_z {now_z:.3f} is above probe_z {probe_trigger_z:.3f} after tap")
 
-        # How much we overshot the tap start location (which is what probe_trigger_z is based on;
-        # the actual sync trigger fires at a later time when we complete the tap detection)
+        # How much the toolhead overshot the real z=0 position. This is the amount
+        # the toolhead is pushing into the build plate.
         overshoot = probe_trigger_z - now_z
 
         logging.info(f"Probe triggered at: {probe_trigger_z:.4f}, now z: {now_z:.4f}, overshoot: {overshoot:.4f}")
 
-        # to get back to true zero, we need to move the toolhead up by 'overshoot'
-        # which means
+        # To re-home the toolhead to true zero, we need to adjust its position up by the overshoot,
+        # which means the real current toolhead position is just how much it overshot zero by.
+        real_z = -overshoot
 
-        real_z = - overshoot
-
+        # This is just for logging
         th_adjust = now_z - real_z
 
-        gcmd.respond_info(f"Adjusting z by {th_adjust:.4f}")
-        logging.info(f"Changing current toolhead z from {now_z:.3f} to {real_z:.3f} {'(no adjust)' if no_adjust else ''}")
-
-        if not no_adjust:
+        # Actually set the position
+        if do_adjust:
+            gcmd.respond_info(f"Adjusting z by {th_adjust:.4f}")
+            logging.info(f"Changing current toolhead z by {th_adjust:.4f} from {now_z:.3f} to {real_z:.3f} {'' if do_adjust else '(no adjust set; no change)'}")
             th_pos[2] = real_z
             th.set_position(th_pos)
+        else:
+            gcmd.respond_info(f"Z offset: {th_adjust:.4f}")
 
-        if initial_z < th_pos[2]:
-            raise self._printer.command_error(f"Initial position {initial_z:.3f} is below current, not moving down!")
+        # Now the Z axis is in the proper physical-aligned system. Retract back to tap_start_z
+        if tap_start_z < th_pos[2]:
+            raise self._printer.command_error(f"Initial position {tap_start_z:.3f} is below current, not moving down!")
 
         if do_retract:
-            th_pos[2] = initial_z
-            th.manual_move(th_pos, TAP_RETRACT_SPEED)
+            th_pos[2] = tap_start_z
+            th.manual_move(th_pos, lift_speed)
             th.wait_moves()
             th.flush_step_generation()
 
-        #th_pos[2] = th_pos[2] + overshoot + initial_z
-        #th.manual_move(th_pos, TAP_RETRACT_SPEED)
-        #th.wait_moves()
-        #logging.info(f"After move1: {th.get_position()}")
-        ## now this is true initial_z
-        #th_pos[2] = initial_z
-        #th.set_position(th_pos)
-
-        #th.set_position(initial_position)
-        #th.wait_moves()
-        #th.flush_step_generation()
-        logging.info("Tapping move: homing end\n\n")
+        logging.info("Tapping move end\n")
 
 
 #
@@ -524,7 +543,15 @@ class ProbeEddyScanningProbe:
         self._toolhead = eddy._printer.lookup_object('toolhead')
         self._toolhead_kin = self._toolhead.get_kinematics()
 
+        # we're going to scan at this height; pull_probed_results
+        # also expects to return values based on this height
         self._home_trigger_height = eddy.params['home_trigger_height']
+
+        # If we recently did a tap, this is the offset between what the
+        # sensor thinks is _home_trigger_height vs. what it actually is.
+        # For example, if we do a tap, adjust, and then we move the toolhead up
+        # to 2.0 but the sensor says 1.950, then this would be +0.050.
+        self.tap_offset = 0.0
 
         # how much to dwell at each sample position in addition to sample_time
         self._sample_time_delay = 0.050
@@ -580,6 +607,9 @@ class ProbeEddyScanningProbe:
             end_time = start_time + self._sample_time
             height = self._gather.find_height_at_time(start_time, end_time)
 
+            # adjust the sensor height value based on the fine-tuned tap offset amount
+            height += self.tap_offset
+
             # the delta between where the toolhead thinks it should be (since it
             # should be homed), and the actual physical offset (height)
             z_deviation = toolhead_pos[2] - height
@@ -600,9 +630,9 @@ class ProbeEddyScanningProbe:
 @final
 class ProbeEddyEndstopWrapper:
     REASON_BASE = mcu.MCU_trsync.REASON_COMMS_TIMEOUT + 1
-    REASON_SENSOR_ERROR = REASON_BASE + 1
-    REASON_PROBE_TOO_LOW = REASON_BASE + 2
-    REASON_PROBE_TOUCH = REASON_BASE + 5
+    REASON_ERROR_SENSOR = REASON_BASE + 0
+    REASON_ERROR_PROBE_TOO_LOW = REASON_BASE + 1
+    REASON_ERROR_TOO_EARLY = REASON_BASE + 2
 
     def __init__(self, eddy: ProbeEddy):
         self.eddy = eddy
@@ -610,14 +640,20 @@ class ProbeEddyEndstopWrapper:
         self._mcu = eddy._mcu
         self._reactor = eddy._printer.get_reactor()
 
+        # these two are filled in by the outside.
+        # if tap threshold is > 0, then we do a tap when we home
         self.tap_threshold = 0
+        # if not None, after a probe session is finished we'll
+        # write all samples here
         self.save_samples_path = None
 
         self._multi_probe_in_progress = False
 
         self._dispatch = mcu.TriggerDispatch(self._mcu)
+
+        # the times of the 
         self._trigger_time = 0.
-        self._tap_start_time = 0.0
+        self._tap_end_time = 0.0
 
         self._gather: Optional[ProbeEddySampler] = None
 
@@ -700,8 +736,8 @@ class ProbeEddyEndstopWrapper:
         self._dispatch.wait_end(home_end_time)
 
         # make sure homing is stopped, and grab the trigger_time from the mcu
-        active, trigger_time, tap_start_time, tap_amount = self._sensor.finish_home2()
-        logging.info(f"EDDY trigger_time {trigger_time} (mcu: {self._mcu.print_time_to_clock(trigger_time)}) tap_time: {tap_start_time}")
+        active, trigger_time, tap_end_time, tap_amount = self._sensor.finish_home2()
+        logging.info(f"EDDY trigger_time {trigger_time} (mcu: {self._mcu.print_time_to_clock(trigger_time)}) tap_end_time: {tap_end_time}")
 
         # nb: _dispatch.stop() will treat anything >= REASON_COMMS_TIMEOUT as an error,
         # and will only return those results. Fine for us since we only have one trsync,
@@ -718,24 +754,24 @@ class ProbeEddyEndstopWrapper:
         # success?
         if res == mcu.MCU_trsync.REASON_ENDSTOP_HIT:
             self._trigger_time = trigger_time
-            self._tap_start_time = tap_start_time
-            # TODO: change C side to have "tap end time", so that trigger time is always
-            # the correct thing
-            return tap_start_time if is_tap else trigger_time
+            self._tap_end_time = tap_end_time
+            return trigger_time
 
         # various errors
         if res == mcu.MCU_trsync.REASON_COMMS_TIMEOUT:
             raise self.eddy._printer.command_error("Communication timeout during homing")
-        if res == self.REASON_SENSOR_ERROR:
+        if res == self.REASON_ERROR_SENSOR:
             status = self._sensor.latched_status_str()
-            raise self.eddy._printer.command_error(f"Sensor error; status: {status}")
-        if res == self.REASON_PROBE_TOO_LOW:
-            raise self.eddy._printer.command_error(f"Probe too low at start of homing, or moved too fast to start trigger position.")
+            raise self.eddy._printer.command_error(f"Sensor error (ldc status: {status})")
+        if res == self.REASON_ERROR_PROBE_TOO_LOW:
+            raise self.eddy._printer.command_error(f"Probe too low at start of homing, did not clear safe threshold.")
+        if res == self.REASON_ERROR_TOO_EARLY:
+            raise self.eddy._printer.command_error(f"Probe did not clear safe time threshold.")
 
         raise self.eddy._printer.command_error(f"Unknown homing error: {res}")
 
     def query_endstop(self, print_time):
-        if self.use_tap:
+        if self.tap_threshold > 0:
             # XXX unclear how to do this with tap? It's basically always going to be false
             # unless the toolhead is somehow at 0.0, and we will never know if that's true 0.0
             # unless we tap.  We could remember the tap freq?
@@ -1240,7 +1276,6 @@ class ProbeEddyFrequencyMap:
 
         return (r2_fth, r2_htf)
 
-
     def save_calibration(self, gcmd: Optional[GCodeCommand] = None):
         if not self._freq_to_height or not self._height_to_freq:
             return
@@ -1279,92 +1314,8 @@ class ProbeEddyFrequencyMap:
     def calibrated(self) -> bool:
         return self._freq_to_height is not None and self._height_to_freq is not None
 
-@final
-class ToolheadMovementHelper:
-    def __init__(self, eddy: ProbeEddy, back_to_start: bool = False):
-        self._eddy = eddy
-        self._speed = eddy.params['probe_speed']
-        self._printer = eddy._printer
-        self._toolhead = eddy._printer.lookup_object('toolhead')
-        self._toolhead_kin = self._toolhead.get_kinematics()
-        self._notes = []
-        self._startpos = None
-        self._return = back_to_start
-
-    def __enter__(self):
-        self._startpos = self._toolhead.get_position()
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        if self._return:
-            pos = self._startpos[:3]
-            self.move_to(*pos, speed=5.0)
-
-    def no_return(self):
-        self._return = False
-
-    def dwell(self, dur: float):
-        self._toolhead.dwell(dur)
-
-    def set_absolute_position(self, x: float, y: float, z: float):
-        newpos = np.array(self._toolhead.get_position())
-        newpos[:3] = [x, y, z]
-        # TODO! this isn't really safe, we didn't home 0 and 1
-        # fix this when we remove ToolheadMovementHelper
-        self._toolhead.set_position(newpos, homing_axes=(0, 1, 2))
-        curpos = np.array(self._toolhead.get_position())
-        # TODO just do the mapping but whatever
-        self._return = False
-        logging.info(f"set_absolute_position, th now at: {curpos}")
-
-    def get_position(self):
-        curpos = np.array(self._toolhead.get_position())
-        if self._startpos:
-            curpos[:3] -= self._startpos[:3]
-        return curpos.tolist()
-
-    def get_last_move_time(self):
-        return self._toolhead.get_last_move_time()
-
-    def move_to(self, x: float, y: float, z: float):
-        newpos = np.array(self._toolhead.get_position())
-        oldpos = newpos
-        newpos[:3] = [x, y, z]
-        logging.info(f"move_to, manual_move to {newpos} from {oldpos}")
-        self._toolhead.manual_move(newpos, self._speed)
-        self._toolhead.wait_moves()
-
-    def move_by(self, xoffs: float, yoffs: float, zoffs: float):
-        newpos = np.array(self._toolhead.get_position()[:3])
-        newpos += [xoffs, yoffs, zoffs]
-        self.move_to(*newpos)
-
-    def move_to_z(self, z: float):
-        newpos = np.array(self._toolhead.get_position()[:3])
-        newpos[2] = z
-        self.move_to(*newpos)
-
-    def note_time_and_position(self, dwell: float = 0.100):
-        self._toolhead.wait_moves()
-        time = self._toolhead.get_last_move_time()
-        kin_z = self.get_kin_z()
-        self.dwell(dwell)
-        self._toolhead.wait_moves()
-
-        note = (time, time + dwell, kin_z)
-        self._notes.append(note)
-        return note
-
-    def notes(self):
-        return self._notes
-
-    def get_kin_z(self, at=None):
-        return get_toolhead_kin_z(self._toolhead, at=at)
-
-
 def get_toolhead_kin_z(toolhead, at=None):
     toolhead_kin = toolhead.get_kinematics()
-    # this is blowing up?
     toolhead.flush_step_generation()
     if at is None:
         kin_spos = {s.get_name(): s.get_commanded_position()

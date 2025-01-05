@@ -27,8 +27,10 @@ enum {
 
 #define BYTES_PER_SAMPLE 4
 
+// should match probe_eddy.py
 #define REASON_ERROR_SENSOR 0
 #define REASON_ERROR_PROBE_TOO_LOW 1
+#define REASON_ERROR_TOO_EARLY 2
 
 // Chip registers
 #define REG_DATA0_MSB 0x00
@@ -88,9 +90,13 @@ struct ldc1612_v2 {
     uint32_t tap_accum;
     // the earliest start of this tap
     uint32_t tap_start_time;
+    // when we actually fired the trigger
+    uint32_t tap_end_time;
 
-    // the time we fired a trigger (same as homing_clock in parent struct,
-    // due to code structure)
+    // the time we included when we fired a trigger (same as homing_clock
+    // in parent struct, due to code structure) -- either the regular homing
+    // threshold hit, or the time we started detecting the last tap
+    // sequence
     uint32_t trigger_time;
 
     //
@@ -519,16 +525,16 @@ command_ldc1612_finish_home2(uint32_t *args)
     uint8_t active = (ld1->homing_flags & LH_CAN_TRIGGER) && (ld1->homing_flags & LH_V2);
 
     uint32_t trigger_time = ld->trigger_time; // note: same as homing_clock in parent struct
-    uint32_t tap_start_time = ld->tap_start_time;
+    uint32_t tap_end_time = ld->tap_end_time;
     uint32_t tap_amount = ld->tap_accum;
 
     ld1->ts = NULL;
     ld1->homing_flags = 0;
 
-    sendf("ldc1612_finish_home2_reply oid=%c homing=%c trigger_clock=%u tap_start_clock=%u tap_amount=%u"
-          , args[0], active, trigger_time, tap_start_time, tap_amount);
+    sendf("ldc1612_finish_home2_reply oid=%c homing=%c trigger_clock=%u tap_end_clock=%u tap_amount=%u"
+          , args[0], active, trigger_time, tap_end_time, tap_amount);
 
-    dprint("ZZZ home2 finish trig_t=%u tap_t=%u tap=%u", trigger_time, tap_start_time, tap_amount);
+    dprint("ZZZ home2 finish trig_t=%u tap_t=%u tap=%u", trigger_time, tap_end_time, tap_amount);
 #if false
     uint32_t i = ld->deriv_i;
     for (i = 0; i < DERIV_WINDOW_SIZE; i += 4) {
@@ -678,7 +684,8 @@ check_home2(struct ldc1612* ld1, uint32_t data, uint32_t time)
         if (ld->tap_accum > ld->tap_threshold) {
             // Note: we notify with the time the tap started, not the current time
             notify_trigger(ld1, ld->tap_start_time, ld->success_reason);
-            ld->trigger_time = time;
+            ld->trigger_time = ld->tap_start_time;
+            ld->tap_end_time = time;
             dprint("ZZZ tap t=%u n=%u l=%u (f=%u)", ld->tap_start_time, time, ld->tap_accum, data);
         }
     }
