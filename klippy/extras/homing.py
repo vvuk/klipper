@@ -43,13 +43,17 @@ class StepperPosition:
 
 # Implementation of homing/probing moves
 class HomingMove:
-    def __init__(self, printer, endstops, toolhead=None):
+    def __init__(self, printer, endstops, toolhead=None, update_position=True):
         self.printer = printer
         self.endstops = endstops
         if toolhead is None:
             toolhead = printer.lookup_object('toolhead')
         self.toolhead = toolhead
         self.stepper_positions = []
+
+        self.update_position = update_position
+        self.haltpos = None
+        self.trigpos = None
     def get_mcu_endstops(self):
         return [es for es, name in self.endstops]
     def _calc_endstop_rate(self, mcu_endstop, movepos, speed):
@@ -128,7 +132,10 @@ class HomingMove:
             haltpos = trigpos = self.calc_toolhead_pos(kin_spos, trig_steps)
             if trig_steps != halt_steps:
                 haltpos = self.calc_toolhead_pos(kin_spos, halt_steps)
-            self.toolhead.set_position(haltpos)
+            if self.update_position:
+                self.toolhead.set_position(haltpos)
+            self.haltpos = haltpos
+            self.trigpos = trigpos
             for sp in self.stepper_positions:
                 sp.verify_no_probe_skew(haltpos)
         else:

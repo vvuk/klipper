@@ -262,7 +262,7 @@ class LDC1612_ng:
         trigger_clock = reply['trigger_clock']
         tap_end_clock = reply['tap_end_clock']
         trigger_time = self._clock32_to_print_time(trigger_clock) if trigger_clock > 0 else 0
-        tap_end_time = self._clock32_to_print_time(tap_end_clock) if trigger_clock > 0 else 0
+        tap_end_time = self._clock32_to_print_time(tap_end_clock) if tap_end_clock > 0 else 0
         tap_amount = reply['tap_amount']
 
         return LDC1612_ng_homing_result(trigger_time, tap_end_time, tap_amount)
