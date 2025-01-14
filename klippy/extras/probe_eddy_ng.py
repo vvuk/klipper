@@ -608,6 +608,7 @@ class ProbeEddy:
                 max_value=float(max_value),
                 tstart=float(stime),
                 tend=float(etime)
+            )
 
     cmd_PROBE_help = "Probe the height using the eddy current sensor, moving the toolhead to the home start height or Z if specified."
     def cmd_PROBE(self, gcmd: GCodeCommand):
