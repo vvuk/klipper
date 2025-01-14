@@ -23,7 +23,7 @@ This repository is a fairly recent Klipper. It's easiest to use it directly if y
 cd ~/klipper
 git remote add vlad-eddy http://github.com/vvuk/klipper
 git fetch vlad-eddy
-git checkout vlad-eddy/vlad/eddy-ng
+git checkout vlad/eddy-ng
 ```
 
 If you'd like to integrate this code into your own version, assuming it is similarly recent, you will need to copy in:
