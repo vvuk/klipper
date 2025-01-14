@@ -249,6 +249,7 @@ class ProbeEddyProbeResult:
     max_value: float = 0.0
     tstart: float = 0.0
     tend: float = 0.0
+    errors: int = 0
 
     USE_MEAN_FOR_VALUE: ClassVar[bool] = False
 
@@ -607,7 +608,8 @@ class ProbeEddy:
                 min_value=float(min_value),
                 max_value=float(max_value),
                 tstart=float(stime),
-                tend=float(etime)
+                tend=float(etime),
+                errors=sampler.get_error_count()
             )
 
     cmd_PROBE_help = "Probe the height using the eddy current sensor, moving the toolhead to the home start height or Z if specified."
@@ -1901,6 +1903,7 @@ class ProbeEddyFrequencyMap:
         self.drive_current = 0
         self._freqs = None
         self._heights = None
+        self._height_range = (-math.inf, math.inf)
 
     def _str_to_exact_floatlist(self, str):
         return [float.fromhex(v) for v in str.split(',')]
@@ -1934,18 +1937,21 @@ class ProbeEddyFrequencyMap:
             self.drive_current = 0
             self._freqs = None
             self._heights = None
+            self._height_range = (-math.inf, math.inf)
             return
 
         data = pickle.loads(base64.b64decode(calibstr))
         freqs = np.asarray(data['f'])
         heights = np.asarray(data['h'])
         dc = data['dc']
+        range = data['range'] if 'range' in data else (-math.inf, math.inf)
 
         if dc is not drive_current:
             raise configerror(f"ProbeEddyFrequencyMap: drive current mismatch: {dc} != {drive_current}")
 
         self._freqs = freqs
         self._heights = heights
+        self._height_range = range
         self.drive_current = drive_current
 
         logging.info(f"EDDYng Loaded calibration for drive current {drive_current} ({len(self._freqs)} points)")
@@ -1958,6 +1964,7 @@ class ProbeEddyFrequencyMap:
         data = {
             'f': self._freqs.tolist(),
             'h': self._heights.tolist(),
+            'range': self._height_range,
             'dc': self.drive_current
         }
         calibstr = base64.b64encode(pickle.dumps(data)).decode()
@@ -1994,19 +2001,25 @@ class ProbeEddyFrequencyMap:
             logging.info(f"Wrote {len(raw_freqs)} samples to /tmp/eddy-calibration.csv")
             #gcmd.respond_info(f"Wrote {len(raw_freqs)} samples to /tmp/eddy-calibration.csv")
 
+        max_height = avg_heights.max()
+        min_height = avg_heights.min()
+        if max_height < 2.5: # we really can't do anything with this
+            gcmd.respond_raw(f"!! Calibration failed: max height for valid samples is too low: {max_height:.3f} < 2.5\n")
+
         qf = np.linspace(avg_freqs.min(), avg_freqs.max(), self._eddy.params.calibration_points)
         qz = np.interp(qf, avg_freqs, avg_heights)
         # 25: because we don't care too much about the early (high z) values
         rmse_fth = np_rmse(lambda v: np.interp(v, qf, qz), avg_freqs[25:], avg_heights[25:])
         rmse_htf = np_rmse(lambda v: np.interp(v, qz[::-1], qf[::-1]), avg_heights[25:], avg_freqs[25:])
 
-        msg = f"Calibration for drive current {drive_current}: RMSE F->H: {rmse_fth:.4f}, H->F: {rmse_htf:.2f}"
+        msg = f"Calibration for drive current {drive_current}: max height: {max_height:.3f}, RMSE F->H: {rmse_fth:.4f}, H->F: {rmse_htf:.2f}"
         logging.info(msg)
         if gcmd:
             gcmd.respond_info(msg, gcmd)
 
         self._freqs = qf
         self._heights = qz
+        self._height_range = (min_height, max_height)
         self.drive_current = drive_current
 
         self._save_calibration_plot(avg_freqs, avg_heights, qf, qz, rmse_fth, rmse_htf)
@@ -2022,13 +2035,15 @@ class ProbeEddyFrequencyMap:
         fig.add_trace(go.Scatter(x=freqs, y=heights, mode='lines', name='Z'))
         fig.add_trace(go.Scatter(x=freqs, y=np.interp(freqs, qf, qz), mode='lines', name=f'Z {rmse_fth:.4f}'))
 
-        fig.add_trace(go.Scatter(x=heights, y=freqs, mode='lines', name='F', yaxis='y2'))
-        fig.add_trace(go.Scatter(x=heights, y=np.interp(heights, qz[::-1], qf[::-1]), mode='lines', name=f'F ({rmse_htf:.2f})', yaxis='y2'))
+        fig.add_trace(go.Scatter(x=heights, y=freqs, mode='lines', name='F', xaxis='x2', yaxis='y2'))
+        fig.add_trace(go.Scatter(x=heights, y=np.interp(heights, qz[::-1], qf[::-1]), mode='lines', name=f'F ({rmse_htf:.2f})',
+                                 xaxis='x2', yaxis='y2'))
 
         fig.update_layout(
             hovermode='x unified',
             title=f"Calibration for drive current {self.drive_current}",
-            yaxis2=dict(title='Frequ', overlaying='y', side='right'),
+            xaxis2=dict(title='Height', overlaying='x', side='top'),
+            yaxis2=dict(title='Freq', overlaying='y', side='right'),
             )
         fig.write_html("/tmp/eddy-calibration.html")
 
