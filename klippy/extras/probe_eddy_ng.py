@@ -597,17 +597,17 @@ class ProbeEddy:
             min_value = min(samples)
             max_value = max(samples)
 
-            mean: float = np.mean(samples)
-            median: float = np.median(samples)
+            mean: float = float(np.mean(samples))
+            median: float = float(np.median(samples))
 
             return ProbeEddyProbeResult(
                 samples=samples,
-                mean=mean,
-                median=median,
-                min_value=min_value,
-                max_value=max_value,
-                tstart=stime,
-                tend=etime)
+                mean=float(mean),
+                median=float(median),
+                min_value=float(min_value),
+                max_value=float(max_value),
+                tstart=float(stime),
+                tend=float(etime)
 
     cmd_PROBE_help = "Probe the height using the eddy current sensor, moving the toolhead to the home start height or Z if specified."
     def cmd_PROBE(self, gcmd: GCodeCommand):
@@ -639,7 +639,7 @@ class ProbeEddy:
             gcmd.respond_info(f"Probe {r}")
             # TODO update last_z_result. But we need to know
             #gcmd.respond_info(f"Collection started at {now:.3f}, sample time range {stime:.3f} - {etime:.3f}, finished at {cend:.3f}")
-            self._last_probe_result = r.value
+            self._last_probe_result = float(r.value)
         finally:
             self._sensor.set_drive_current(drive_current)
 
@@ -664,7 +664,7 @@ class ProbeEddy:
 
             gcmd.respond_info(f"Probe {r}")
             #gcmd.respond_info(f"Collection started at {now:.3f}, sample time range {stime:.3f} - {etime:.3f}, finished at {cend:.3f}")
-            self._cmd_helper.last_z_result = r.median
+            self._cmd_helper.last_z_result = float(r.median)
         finally:
             self._sensor.set_drive_current(drive_current)
 
@@ -943,9 +943,7 @@ class ProbeEddy:
 
         th.wait_moves()
 
-
-
-    # 
+    #
     # Tap probe
     #
     cmd_TAP_help = "Calculate a z-offset by touching the build plate."
@@ -1299,7 +1297,7 @@ class ProbeEddyScanningProbe:
 
             # what callers want to know is "what Z would the toolhead be at, if it was at the height
             # the probe would 'trigger'", because this is all done in terms of klicky-type probes
-            th_pos[2] = self._scan_z + z_deviation
+            th_pos[2] = float(self._scan_z + z_deviation)
             #toolhead_pos[2] = height
 
             results.append(th_pos)
@@ -1923,11 +1921,11 @@ class ProbeEddyFrequencyMap:
             return b[-1] + right_slope * (v - a[-1])
         return np.interp(v, a, b)
 
-    def _freq_to_height(self, v):
-        return self._interp_extrapolate(v, self._freqs, self._heights)
+    def _freq_to_height(self, freq: float):
+        return float(self._interp_extrapolate(freq, self._freqs, self._heights))
 
-    def _height_to_freq(self, v):
-        return self._interp_extrapolate(v, self._heights[::-1], self._freqs[::-1])
+    def _height_to_freq(self, height: float):
+        return float(self._interp_extrapolate(height, self._heights[::-1], self._freqs[::-1]))
 
     def load_from_config(self, config: ConfigWrapper, drive_current: int):
         calibstr = config.get(f"calibration_{drive_current}", None)
@@ -2012,7 +2010,7 @@ class ProbeEddyFrequencyMap:
 
         self._save_calibration_plot(avg_freqs, avg_heights, qf, qz, rmse_fth, rmse_htf)
 
-        return (rmse_fth, rmse_htf)
+        return rmse_fth, rmse_htf
 
     def _save_calibration_plot(self, freqs, heights, qf, qz, rmse_fth, rmse_htf):
         if not HAS_PLOTLY:
@@ -2046,12 +2044,12 @@ class ProbeEddyFrequencyMap:
     def freq_to_height(self, freq: float) -> float:
         if self._freq_to_height is None:
             return math.inf
-        return float(self._freq_to_height(freq))
+        return self._freq_to_height(freq)
 
     def height_to_freq(self, height: float) -> float:
         if self._height_to_freq is None:
             return math.inf
-        return float(self._height_to_freq(height))
+        return self._height_to_freq(height)
 
     def calibrated(self) -> bool:
         return self._freq_to_height is not None and self._height_to_freq is not None
