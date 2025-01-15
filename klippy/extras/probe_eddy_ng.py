@@ -1,16 +1,21 @@
+# EDDY-ng
+#
+# Copyright (C) 2025  Vladimir Vukicevic <vladimir@pobox.com>
+# Copyright (C) 2020-2024  Kevin O'Connor <kevin@koconnor.net>
+#
+# This file may be distributed under the terms of the GNU GPLv3 license.
 from __future__ import annotations
 
 import logging, math, bisect, re
 import numpy as np
 import numpy.polynomial as npp
 import traceback
-import codecs, pickle, base64
+import pickle, base64
 
 import mcu
 import pins
 
 from dataclasses import dataclass
-from enum import IntEnum
 from typing import Callable, Dict, List, Optional, Tuple, TypedDict, final, ClassVar
 
 try:
@@ -20,12 +25,10 @@ try:
 except:
     HAS_PLOTLY=False
 
-from clocksync import SecondarySync
 from configfile import ConfigWrapper
 from configfile import error as configerror
 from gcode import GCodeCommand
 from klippy import Printer
-from mcu import MCU, MCU_trsync
 from stepper import MCU_stepper
 from toolhead import ToolHead
 
@@ -72,7 +75,7 @@ from .ldc1612_ng import SETTLETIME as LDC1612_SETTLETIME
 #    calling `pull_probed_results`, which returns an array of results at each
 #    point that `run_probe` was called for, in order.
 #
-#    A `PROBE`, `SET_Z_FROM_PROBE` can be used to set the toolhead's Z position
+#    PROBE_STATIC HOME_Z=1 can be used to set the toolhead's Z position
 #    based on the current height reading from the probe while the toolhead is
 #    static, leading to a more accurate result than a regular homing operation
 #    (which involves movement).
@@ -343,6 +346,9 @@ class ProbeEddy:
         self._tap_offset = 0.0
         self._last_probe_result = 0.0
 
+        # runtime configurable
+        self._tap_adjust_z = self.params.tap_adjust_z
+
         # define our own commands
         self._gcode = self._printer.lookup_object('gcode')
         self._dummy_gcode_cmd = self._gcode.create_gcode_command("", "", {})
@@ -367,7 +373,8 @@ class ProbeEddy:
         gcode.register_command("PROBE_EDDY_NG_PROBE_STATIC", self.cmd_PROBE_STATIC, self.cmd_PROBE_STATIC_help)
         gcode.register_command("PROBE_EDDY_NG_PROBE_ACCURACY", self.cmd_PROBE_ACCURACY, self.cmd_PROBE_ACCURACY_help)
         gcode.register_command("PROBE_EDDY_NG_TAP", self.cmd_TAP, self.cmd_TAP_help)
-        gcode.register_command("PROBE_EDDY_NG_SET_TAP_OFFSET", self.cmd_SET_TAP_OFFSET, "Set the tap offset for the bed mesh scan and other probe operations")
+        gcode.register_command("PROBE_EDDY_NG_SET_TAP_OFFSET", self.cmd_SET_TAP_OFFSET, "Set or clear the tap offset for the bed mesh scan and other probe operations")
+        gcode.register_command("PROBE_EDDY_NG_SET_TAP_ADJUST_Z", self.cmd_SET_TAP_ADJUST_Z, "Set the tap adjustment value")
         gcode.register_command("PROBE_EDDY_NG_TEST_DRIVE_CURRENT", self.cmd_TEST_DRIVE_CURRENT, "Test a drive current.")
 
         # some handy aliases while I'm debugging things to save my fingers
@@ -586,6 +593,22 @@ class ProbeEddy:
             tap_offset += adjust
         self._tap_offset = tap_offset
         gcmd.respond_info(f"Set tap offset: {tap_offset:.3f}")
+
+    def cmd_SET_TAP_ADJUST_Z(self, gcmd: GCodeCommand):
+        value = gcmd.get_float('VALUE', None)
+        adjust = gcmd.get_float('ADJUST', None)
+        tap_adjust_z = self._tap_adjust_z
+        if value is not None:
+            tap_adjust_z = value
+        if adjust is not None:
+            tap_adjust_z += adjust
+        self._tap_adjust_z = tap_adjust_z
+
+        if self.params.tap_adjust_z != self._tap_adjust_z:
+            configfile = self._printer.lookup_object('configfile')
+            configfile.set(self._full_name, "tap_adjust_z", str(float(self._tap_adjust_z)))
+
+        gcmd.respond_info(f"Set tap_adjust_z: {tap_adjust_z:.3f} (SAVE_CONFIG to make it permanent)")
 
     def probe_static_height(self, duration: float = 0.100) -> ProbeEddyProbeResult:
         reactor = self._printer.get_reactor()
@@ -1102,9 +1125,9 @@ class ProbeEddy:
         # Set the probe_trigger_z as the z offset
         gcode_move = self._printer.lookup_object('gcode_move')
         logging.info(f"  Pre: gcode homing position: {gcode_move.homing_position[2]:.3f}, base position: {gcode_move.base_position[2]:.3f}")
-        gcode_delta = probe_trigger_z - gcode_move.homing_position[2] + self.params.tap_adjust_z
+        gcode_delta = probe_trigger_z - gcode_move.homing_position[2] + self._tap_adjust_z
         gcode_move.base_position[2] += gcode_delta
-        gcode_move.homing_position[2] = probe_trigger_z + self.params.tap_adjust_z
+        gcode_move.homing_position[2] = probe_trigger_z + self._tap_adjust_z
         logging.info(f"After: gcode homing position: {gcode_move.homing_position[2]:.3f}, base position: {gcode_move.base_position[2]:.3f}")
 
         # Now the Z axis is in the proper physical-aligned system. Retract back to tap_start_z
