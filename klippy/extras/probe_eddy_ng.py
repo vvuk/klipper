@@ -344,9 +344,20 @@ class ProbeEddy:
         self._last_probe_result = 0.0
 
         # define our own commands
-        gcode = self._printer.lookup_object('gcode')
-        self._dummy_gcode_cmd = gcode.create_gcode_command("", "", {})
-        self.define_commands(gcode)
+        self._gcode = self._printer.lookup_object('gcode')
+        self._dummy_gcode_cmd = self._gcode.create_gcode_command("", "", {})
+        self.define_commands(self._gcode)
+
+    def _log_error(self, msg):
+        logging.error(f"{self._name}: {msg}")
+        self._gcode.respond_raw(f"!! {msg}\n")
+    
+    def _log_info(self, msg):
+        logging.info(f"{self._name}: {msg}")
+        self._gcode.respond_info(msg)
+
+    def _log_trace(self, msg):
+        logging.debug(f"{self._name}: {msg}")
 
     def define_commands(self, gcode):
         gcode.register_command("PROBE_EDDY_NG_STATUS", self.cmd_STATUS, self.cmd_STATUS_help)
@@ -409,16 +420,15 @@ class ProbeEddy:
         curpos[2] = curpos[2] + by
         toolhead.manual_move(curpos, self.params.probe_speed)
 
-    def save_config(self, gcmd: GCodeCommand):
+    def save_config(self):
         for _, fmap in self._dc_to_fmap.items():
-            fmap.save_calibration(gcmd)
+            fmap.save_calibration()
 
         configfile = self._printer.lookup_object('configfile')
         configfile.set(self._full_name, "calibrated_drive_currents", str.join(', ', [str(dc) for dc in self._dc_to_fmap.keys()]))
         configfile.set(self._full_name, "calibration_version", str(ProbeEddyFrequencyMap.calibration_version))
 
-        if gcmd:
-            gcmd.respond_info("Calibration saved. Issue a SAVE_CONFIG to write the values to your config file and restart Klipper.")
+        self._log_info("Calibration saved. Issue a SAVE_CONFIG to write the values to your config file and restart Klipper.")
 
     def start_sampler(self, *args, **kwargs) -> ProbeEddySampler:
         if self._sampler:
@@ -563,7 +573,7 @@ class ProbeEddy:
                 raise self._printer.command_error(f"Drive current {drive_current} not calibrated")
             del self._dc_to_fmap[drive_current]
             gcmd.respond_info(f"Cleared calibration for drive current {drive_current}")
-        self.save_config(gcmd)
+        self.save_config()
 
     def cmd_SET_TAP_OFFSET(self, gcmd: GCodeCommand):
         value = gcmd.get_float('VALUE', None)
@@ -773,16 +783,16 @@ class ProbeEddy:
         
         # and build a map
         mapping = ProbeEddyFrequencyMap(self)
-        fth_fit, htf_fit = mapping.calibrate_from_values(drive_current, times, freqs, heights, gcmd)
+        fth_fit, htf_fit = mapping.calibrate_from_values(drive_current, times, freqs, heights)
 
         if fth_fit is None or htf_fit is None:
-            gcmd.respond_raw("!! Calibration failed\n")
+            self._log_error("Calibration failed")
             return
 
         self._dc_to_fmap[drive_current] = mapping
-        self.save_config(gcmd)
+        self.save_config()
 
-        gcmd.respond_info(f"Calibration complete, RMSE: freq-to-height={fth_fit:.4f}, height-to-freq={htf_fit:.4f}")
+        self._log_info(f"Calibration complete, RMSE: freq-to-height={fth_fit:.4f}, height-to-freq={htf_fit:.4f}")
 
         if not was_homed and hasattr(th.get_kinematics(), "note_z_not_homed"):
             th.get_kinematics().note_z_not_homed()
@@ -1956,7 +1966,7 @@ class ProbeEddyFrequencyMap:
 
         logging.info(f"EDDYng Loaded calibration for drive current {drive_current} ({len(self._freqs)} points)")
 
-    def save_calibration(self, gcmd: Optional[GCodeCommand] = None):
+    def save_calibration(self):
         if self._freqs is None or self._heights is None:
             return
 
@@ -1974,8 +1984,7 @@ class ProbeEddyFrequencyMap:
     def calibrate_from_values(self, drive_current: int,
                               times: List[float],
                               raw_freqs_list: List[float],
-                              raw_heights_list: List[float],
-                              gcmd: Optional[GCodeCommand] = None):
+                              raw_heights_list: List[float]):
         if len(raw_freqs_list) != len(raw_heights_list):
             raise ValueError("freqs and heights must be the same length")
 
@@ -2004,7 +2013,12 @@ class ProbeEddyFrequencyMap:
         max_height = avg_heights.max()
         min_height = avg_heights.min()
         if max_height < 2.5: # we really can't do anything with this
-            gcmd.respond_raw(f"!! Calibration failed: max height for valid samples is too low: {max_height:.3f} < 2.5\n")
+            self._eddy._log_error(f"Calibration failed: max height for valid samples is too low: {max_height:.3f} < 2.5")
+            return None, None
+
+        min_freq = avg_freqs.min()
+        max_freq = avg_freqs.max()
+        freq_spread = ((max_freq / min_freq) - 1.0) * 100.0
 
         qf = np.linspace(avg_freqs.min(), avg_freqs.max(), self._eddy.params.calibration_points)
         qz = np.interp(qf, avg_freqs, avg_heights)
@@ -2012,10 +2026,13 @@ class ProbeEddyFrequencyMap:
         rmse_fth = np_rmse(lambda v: np.interp(v, qf, qz), avg_freqs[25:], avg_heights[25:])
         rmse_htf = np_rmse(lambda v: np.interp(v, qz[::-1], qf[::-1]), avg_heights[25:], avg_freqs[25:])
 
-        msg = f"Calibration for drive current {drive_current}: max height: {max_height:.3f}, RMSE F->H: {rmse_fth:.4f}, H->F: {rmse_htf:.2f}"
-        logging.info(msg)
-        if gcmd:
-            gcmd.respond_info(msg, gcmd)
+        self._eddy._log_info(f"Calibration for drive current {drive_current}: max height: {max_height:.3f}, " + \
+                             f"freq spread {freq_spread:.2f}%, RMSE F->H: {rmse_fth:.4f}, H->F: {rmse_htf:.2f}")
+
+        # somewhat arbitrary
+        if freq_spread < 0.85:
+            self._eddy._log_info(f"Warning: frequency spread is low ({freq_spread:.2f}%, {min_freq:.1f}-{max_freq:.1f}), " + \
+                                 "consider adjusting your sensor height")
 
         self._freqs = qf
         self._heights = qz
