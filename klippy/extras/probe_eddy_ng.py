@@ -731,7 +731,7 @@ class ProbeEddy:
         old_drive_current = self.current_drive_current()
         drive_current: int = gcmd.get_int('DRIVE_CURRENT', old_drive_current, minval=0, maxval=31)
         cal_z_max: float = gcmd.get_float('Z_MAX', self.params.calibration_z_max, above=2.0)
-        z_target: float = gcmd.get_float('Z_TARGET', 0.010)
+        z_target: float = gcmd.get_float('Z_TARGET', 0.0)
 
         probe_speed: float = gcmd.get_float('SPEED', self.params.probe_speed, above=0.0)
         lift_speed: float = gcmd.get_float('LIFT_SPEED', self.params.lift_speed, above=0.0)
@@ -751,8 +751,8 @@ class ProbeEddy:
 
         mapping, fth_fit, htf_fit = self._create_mapping(cal_z_max,
                                                          z_target,
-                                                         drive_current,
                                                          probe_speed,
+                                                         lift_speed,
                                                          drive_current,
                                                          for_calibration=True)
         if mapping is None or fth_fit is None or htf_fit is None:
@@ -779,9 +779,6 @@ class ProbeEddy:
         if for_calibration:
             th.manual_move([th_pos[0]-self.offset['x'], th_pos[1]-self.offset['y'], None], self.params.move_speed)
 
-        first_sample_time = None
-        last_sample_time = None
-
         old_drive_current = self.current_drive_current()
         try:
             self._sensor.set_drive_current(drive_current)
@@ -800,9 +797,6 @@ class ProbeEddy:
         return mapping, fth_fit, htf_fit
 
     def _capture_samples_down_to(self, z_target: float, probe_speed: float) -> tuple[List[float], List[float], List[float]]:
-        first_sample_time = None
-        last_sample_time = None
-
         th = self._printer.lookup_object('toolhead')
         th.dwell(0.500) # give the sensor a bit to settle
         th.wait_moves()
@@ -837,7 +831,8 @@ class ProbeEddy:
     def cmd_TEST_DRIVE_CURRENT(self, gcmd: GCodeCommand):
         drive_current: int = gcmd.get_int('DRIVE_CURRENT', self.params.reg_drive_current, minval=1, maxval=31)
         z_start: float = gcmd.get_float('Z_MAX', self.params.calibration_z_max, above=2.0)
-        z_end: float = gcmd.get_float('Z_TARGET', 0.010)
+        z_end: float = gcmd.get_float('Z_TARGET', 0.0)
+        self._log_info(f"Testing Z={z_start:.3f} to Z={z_end:.3f}, drive current {drive_current}")
 
         mapping, fth, htf = self._create_mapping(z_start,
                                                  z_end,
@@ -851,9 +846,10 @@ class ProbeEddy:
 
         hmin, hmax = mapping._height_range
         fmin, fmax = mapping._freq_range
+        fpct = ((fmax / fmin) - 1.0) * 100.0
 
-        self._log_info(f"Drive current {drive_current}: height range: {hmin:.3f} to {hmax:.3f}, " + \
-                       f"freq range: {fmin:.1f} to {fmax:.1f}. (Fit {fth:.4f},{htf:.4f})")
+        self._log_info(f"Drive current {drive_current}: valid height range: {hmin:.3f} to {hmax:.3f}, " + \
+                       f"freq range: {fmin:.1f} to {fmax:.1f} (spread {fpct:.2f}%. (Fit {fth:.4f},{htf:.4f})")
 
     #
     # PrinterProbe interface
