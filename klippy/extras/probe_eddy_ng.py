@@ -652,9 +652,6 @@ class ProbeEddy:
         if not self.calibrated(drive_current):
             raise self._printer.command_error(f"Drive current {drive_current} not calibrated")
 
-        if not self._z_homed():
-            raise self._printer.command_error(f"Must home Z before PROBE_STATIC")
-
         try:
             self._sensor.set_drive_current(drive_current)
 
