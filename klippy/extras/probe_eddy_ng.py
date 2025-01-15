@@ -792,8 +792,6 @@ class ProbeEddy:
         self._dc_to_fmap[drive_current] = mapping
         self.save_config()
 
-        self._log_info(f"Calibration complete, RMSE: freq-to-height={fth_fit:.4f}, height-to-freq={htf_fit:.4f}")
-
         if not was_homed and hasattr(th.get_kinematics(), "note_z_not_homed"):
             th.get_kinematics().note_z_not_homed()
 
@@ -1914,6 +1912,7 @@ class ProbeEddyFrequencyMap:
         self._freqs = None
         self._heights = None
         self._height_range = (-math.inf, math.inf)
+        self._freq_range = (-math.inf, math.inf)
 
     def _str_to_exact_floatlist(self, str):
         return [float.fromhex(v) for v in str.split(',')]
@@ -1948,20 +1947,23 @@ class ProbeEddyFrequencyMap:
             self._freqs = None
             self._heights = None
             self._height_range = (-math.inf, math.inf)
+            self._freq_range = (-math.inf, math.inf)
             return
 
         data = pickle.loads(base64.b64decode(calibstr))
         freqs = np.asarray(data['f'])
         heights = np.asarray(data['h'])
         dc = data['dc']
-        range = data['range'] if 'range' in data else (-math.inf, math.inf)
+        h_range = data.get('h_range', (-math.inf, math.inf))
+        f_range = data.get('f_range', (-math.inf, math.inf))
 
-        if dc is not drive_current:
-            raise configerror(f"ProbeEddyFrequencyMap: drive current mismatch: {dc} != {drive_current}")
+        if dc != drive_current:
+            raise configerror(f"ProbeEddyFrequencyMap: drive current mismatch: loaded {dc} != requested {drive_current}")
 
         self._freqs = freqs
         self._heights = heights
-        self._height_range = range
+        self._height_range = h_range
+        self._freq_range = f_range
         self.drive_current = drive_current
 
         logging.info(f"EDDYng Loaded calibration for drive current {drive_current} ({len(self._freqs)} points)")
@@ -1974,7 +1976,8 @@ class ProbeEddyFrequencyMap:
         data = {
             'f': self._freqs.tolist(),
             'h': self._heights.tolist(),
-            'range': self._height_range,
+            'h_range': self._height_range,
+            'f_range': self._freq_range,
             'dc': self.drive_current
         }
         calibstr = base64.b64encode(pickle.dumps(data)).decode()
@@ -2010,15 +2013,31 @@ class ProbeEddyFrequencyMap:
             logging.info(f"Wrote {len(raw_freqs)} samples to /tmp/eddy-calibration.csv")
             #gcmd.respond_info(f"Wrote {len(raw_freqs)} samples to /tmp/eddy-calibration.csv")
 
-        max_height = avg_heights.max()
-        min_height = avg_heights.min()
+        max_height = float(avg_heights.max())
+        min_height = float(avg_heights.min())
+        min_freq = float(avg_freqs.min())
+        max_freq = float(avg_freqs.max())
+        freq_spread = ((max_freq / min_freq) - 1.0) * 100.0
+
+        # Check if our calibration is good enough
+
         if max_height < 2.5: # we really can't do anything with this
-            self._eddy._log_error(f"Calibration failed: max height for valid samples is too low: {max_height:.3f} < 2.5")
+            self._eddy._log_error(f"Calibration failed: max height for valid samples is too low: {max_height:.3f} < 2.5. Refer to the documentation for troubleshooting.")
             return None, None
 
-        min_freq = avg_freqs.min()
-        max_freq = avg_freqs.max()
-        freq_spread = ((max_freq / min_freq) - 1.0) * 100.0
+        if min_height > 0.25: # likewise can't do anything with this
+            self._eddy._log_error(f"Calibration failed: min height for valid samples is too high: {min_height:.3f} > 0.25. Refer to the documentation for troubleshooting.")
+            return None, None
+
+        if min_height > 0.025:
+            self._eddy._log_info(f"Warning: min height is {min_height:.3f}, which is too high for tap. You may need a different drive current for tap. Refer to the documentation.")
+
+        # somewhat arbitrary spread
+        if freq_spread < 0.85:
+            self._eddy._log_info(f"Warning: frequency spread is low ({freq_spread:.2f}%, {min_freq:.1f}-{max_freq:.1f}), " + \
+                                 "consider adjusting your sensor height")
+
+        # Calculate RMSE
 
         qf = np.linspace(avg_freqs.min(), avg_freqs.max(), self._eddy.params.calibration_points)
         qz = np.interp(qf, avg_freqs, avg_heights)
@@ -2027,16 +2046,12 @@ class ProbeEddyFrequencyMap:
         rmse_htf = np_rmse(lambda v: np.interp(v, qz[::-1], qf[::-1]), avg_heights[25:], avg_freqs[25:])
 
         self._eddy._log_info(f"Calibration for drive current {drive_current}: max height: {max_height:.3f}, " + \
-                             f"freq spread {freq_spread:.2f}%, RMSE F->H: {rmse_fth:.4f}, H->F: {rmse_htf:.2f}")
-
-        # somewhat arbitrary
-        if freq_spread < 0.85:
-            self._eddy._log_info(f"Warning: frequency spread is low ({freq_spread:.2f}%, {min_freq:.1f}-{max_freq:.1f}), " + \
-                                 "consider adjusting your sensor height")
+                             f"freq spread {freq_spread:.2f}% (max freq: {max_freq:.1f}), RMSE F->H: {rmse_fth:.4f}, H->F: {rmse_htf:.2f}")
 
         self._freqs = qf
         self._heights = qz
         self._height_range = (min_height, max_height)
+        self._freq_range = (min_freq, max_freq)
         self.drive_current = drive_current
 
         self._save_calibration_plot(avg_freqs, avg_heights, qf, qz, rmse_fth, rmse_htf)
