@@ -368,6 +368,7 @@ class ProbeEddy:
         gcode.register_command("PROBE_EDDY_NG_PROBE_ACCURACY", self.cmd_PROBE_ACCURACY, self.cmd_PROBE_ACCURACY_help)
         gcode.register_command("PROBE_EDDY_NG_TAP", self.cmd_TAP, self.cmd_TAP_help)
         gcode.register_command("PROBE_EDDY_NG_SET_TAP_OFFSET", self.cmd_SET_TAP_OFFSET, "Set the tap offset for the bed mesh scan and other probe operations")
+        gcode.register_command("PROBE_EDDY_NG_TEST_DRIVE_CURRENT", self.cmd_TEST_DRIVE_CURRENT, "Test a drive current.")
 
         # some handy aliases while I'm debugging things to save my fingers
         gcode.register_command("PES", self.cmd_STATUS, self.cmd_STATUS_help + " (alias for PROBE_EDDY_NG_STATUS)")
@@ -622,51 +623,37 @@ class ProbeEddy:
                 errors=sampler.get_error_count()
             )
 
-    cmd_PROBE_help = "Probe the height using the eddy current sensor, moving the toolhead to the home start height or Z if specified."
+    cmd_PROBE_help = "Probe the height using the eddy current sensor, moving the toolhead to the home trigger height, or Z if specified."
     def cmd_PROBE(self, gcmd: GCodeCommand):
-        z: float = gcmd.get_float('Z', self._home_start_height)
+        z: float = gcmd.get_float('Z', self.params.home_trigger_height)
         duration: float = gcmd.get_float('DURATION', 0.100, above=0.0)
 
-        # drive current to use
+        if not self._z_homed():
+            raise self._printer.command_error(f"Must home Z before PROBE")
+
+        th = self._printer.lookup_object('toolhead')
+        th_pos = th.get_position()
+        if th_pos[2] < z:
+            th.manual_move([None, None, z + 3.0], self.params.lift_speed)
+        th.manual_move([None, None, z], self.params.lift_speed)
+        th.dwell(0.100)
+        th.wait_moves()
+
+        self.cmd_PROBE_STATIC(gcmd)
+
+    cmd_PROBE_STATIC_help = "Probe the current height using the eddy current sensor without moving the toolhead."
+    def cmd_PROBE_STATIC(self, gcmd: GCodeCommand):
         old_drive_current = self.current_drive_current()    
         drive_current: int = gcmd.get_int('DRIVE_CURRENT', old_drive_current, minval=0, maxval=31)
+        duration: float = gcmd.get_float('DURATION', 0.100, above=0.0)
+        save: bool = gcmd.get_int('SAVE', 0) == 1
+        home_z: bool = gcmd.get_int('HOME_Z', 0) == 1
 
         if not self.calibrated(drive_current):
             raise self._printer.command_error(f"Drive current {drive_current} not calibrated")
 
         if not self._z_homed():
-            raise self._printer.command_error(f"Must home Z before PROBE")
-
-        try:
-            self._sensor.set_drive_current(drive_current)
-
-            th = self._printer.lookup_object('toolhead')
-            th_pos = th.get_position()
-            th_pos[2] = z
-            th.manual_move(th_pos, self.params.probe_speed)
-            th.dwell(0.100)
-            th.wait_moves()
-
-            r = self.probe_static_height(duration)
-
-            gcmd.respond_info(f"Probe {r}")
-            # TODO update last_z_result. But we need to know
-            #gcmd.respond_info(f"Collection started at {now:.3f}, sample time range {stime:.3f} - {etime:.3f}, finished at {cend:.3f}")
-            self._last_probe_result = float(r.value)
-        finally:
-            self._sensor.set_drive_current(drive_current)
-
-    cmd_PROBE_STATIC_help = "Probe the current height using the eddy current sensor without moving the toolhead. "
-    def cmd_PROBE_STATIC(self, gcmd: GCodeCommand):
-        duration: float = gcmd.get_float('DURATION', 0.100, above=0.0)
-
-        # drive current to use
-        old_drive_current = self.current_drive_current()    
-        drive_current: int = gcmd.get_int('DRIVE_CURRENT', old_drive_current, minval=0, maxval=31)
-        save: bool = gcmd.get_int('SAVE', 0) == 1
-
-        if not self.calibrated(drive_current):
-            raise self._printer.command_error(f"Drive current {drive_current} not calibrated")
+            raise self._printer.command_error(f"Must home Z before PROBE_STATIC")
 
         try:
             self._sensor.set_drive_current(drive_current)
@@ -675,9 +662,17 @@ class ProbeEddy:
                 self.save_samples_path = "/tmp/eddy-probe-static.csv"
             r = self.probe_static_height(duration)
 
-            gcmd.respond_info(f"Probe {r}")
-            #gcmd.respond_info(f"Collection started at {now:.3f}, sample time range {stime:.3f} - {etime:.3f}, finished at {cend:.3f}")
-            self._cmd_helper.last_z_result = float(r.median)
+            self._cmd_helper.last_z_result = float(r.value)
+
+            if home_z:
+                th = self._printer.lookup_object('toolhead')
+                th_pos = th.get_position()
+                th_pos[2] = r.value
+                th.set_position(th_pos, [2])
+                self._log_info(f"Homed Z to {r}")
+            else:
+                self._log_info(f"Probed {r}")
+
         finally:
             self._sensor.set_drive_current(drive_current)
 
@@ -713,13 +708,13 @@ class ProbeEddy:
             # User cancelled ManualProbeHelper
             return
 
-        old_drive_current = self.current_drive_current()    
+        old_drive_current = self.current_drive_current()
         drive_current: int = gcmd.get_int('DRIVE_CURRENT', old_drive_current, minval=0, maxval=31)
         cal_z_max: float = gcmd.get_float('Z_MAX', self.params.calibration_z_max, above=2.0)
         z_target: float = gcmd.get_float('Z_TARGET', 0.010)
 
-        probe_speed = gcmd.get_float('SPEED', self.params.probe_speed, above=0.0)
-        lift_speed = gcmd.get_float('LIFT_SPEED', self.params.lift_speed, above=0.0)
+        probe_speed: float = gcmd.get_float('SPEED', self.params.probe_speed, above=0.0)
+        lift_speed: float = gcmd.get_float('LIFT_SPEED', self.params.lift_speed, above=0.0)
 
         th = self._printer.lookup_object('toolhead')
 
@@ -731,42 +726,78 @@ class ProbeEddy:
         th.set_position(th_pos, homing_axes=[2])
 
         th.wait_moves()
+
+        logging.info(f"EDDYng calibrating from {kin_pos}, {th_pos}")
+
+        mapping, fth_fit, htf_fit = self._create_mapping(cal_z_max,
+                                                         z_target,
+                                                         drive_current,
+                                                         probe_speed,
+                                                         drive_current,
+                                                         for_calibration=True)
+        if mapping is None or fth_fit is None or htf_fit is None:
+            self._log_error("Calibration failed")
+            return
+
+        self._dc_to_fmap[drive_current] = mapping
+        self.save_config()
+
+        if not was_homed and hasattr(th.get_kinematics(), "note_z_not_homed"):
+            th.get_kinematics().note_z_not_homed()
+
+    def _create_mapping(self, z_start: float, z_target: float,
+                       probe_speed: float, lift_speed: float,
+                       drive_current: int,
+                       for_calibration: bool) -> Tuple[ProbeEddyFrequencyMap, float, float]:
+        th = self._printer.lookup_object('toolhead')
         th_pos = th.get_position() 
 
-        logging.info(f"CALIBRATE: {kin_pos}, {th_pos}")
+        # move to the start z of the mapping, going up first if we need to for backlash
+        if th_pos[2] < z_start:
+            th.manual_move([None, None, z_start + 3.0], lift_speed)
+        th.manual_move([None, None, z_start], lift_speed)
+        if for_calibration:
+            th.manual_move([th_pos[0]-self.offset['x'], th_pos[1]-self.offset['y'], None], self.params.move_speed)
 
-        # move to the start of calibration, up first then over
-        th.manual_move([None, None, cal_z_max + 3.0], lift_speed)
-        th.manual_move([None, None, cal_z_max], lift_speed)
-        th.manual_move([th_pos[0]-self.offset['x'], th_pos[1]-self.offset['y'], None], self.params.move_speed)
-        #th.manual_move([None, None, cal_z_max], lift_speed)
-
-        mapping = None
         first_sample_time = None
         last_sample_time = None
 
+        old_drive_current = self.current_drive_current()
         try:
             self._sensor.set_drive_current(drive_current)
-            th.dwell(0.500) # give the sensor a bit to settle
-            th.wait_moves()
-
-            with self.start_sampler(calculate_heights=False) as sampler:
-                first_sample_time = th.get_last_move_time()
-                th.manual_move([None, None, z_target], probe_speed)
-                th.wait_moves()
-                last_sample_time = th.get_last_move_time()
-                sampler.finish()
-
-                # back to start
-                th.manual_move([None, None, cal_z_max], lift_speed)
+            times, freqs, heights = self._capture_samples_down_to(z_target, probe_speed)
+            th.manual_move([None, None, z_start], lift_speed)
         finally:
             self._sensor.set_drive_current(old_drive_current)
+
+        if times is None:
+            self._log_error("No samples collected. This could be a hardware issue or an incorrect drive current.")
+            return None, None, None
+
+        # and build a map
+        mapping = ProbeEddyFrequencyMap(self)
+        fth_fit, htf_fit = mapping.calibrate_from_values(drive_current, times, freqs, heights, for_calibration)
+        return mapping, fth_fit, htf_fit
+
+    def _capture_samples_down_to(self, z_target: float, probe_speed: float) -> tuple[List[float], List[float], List[float]]:
+        first_sample_time = None
+        last_sample_time = None
+
+        th = self._printer.lookup_object('toolhead')
+        th.dwell(0.500) # give the sensor a bit to settle
+        th.wait_moves()
+
+        with self.start_sampler(calculate_heights=False) as sampler:
+            first_sample_time = th.get_last_move_time()
+            th.manual_move([None, None, z_target], probe_speed)
+            th.wait_moves()
+            last_sample_time = th.get_last_move_time()
+            sampler.finish()
 
         # the samples are a list of [print_time, freq, dummy_height] tuples
         samples = sampler.get_samples()
         if len(samples) == 0:
-            gcmd.respond_raw("!! No samples collected\n")
-            return
+            return None, None, None
 
         freqs = []
         heights = []
@@ -777,23 +808,32 @@ class ProbeEddy:
             s_pos, _ = get_toolhead_kin_pos(self._printer, at=s_t)
             s_z = s_pos[2]
             if first_sample_time < s_t < last_sample_time and s_z >= z_target:
+                times.append(s_t)
                 freqs.append(s_freq)
                 heights.append(s_z)
-                times.append(s_t)
         
-        # and build a map
-        mapping = ProbeEddyFrequencyMap(self)
-        fth_fit, htf_fit = mapping.calibrate_from_values(drive_current, times, freqs, heights)
+        return times, freqs, heights
+    
+    def cmd_TEST_DRIVE_CURRENT(self, gcmd: GCodeCommand):
+        drive_current: int = gcmd.get_int('DRIVE_CURRENT', self.params.reg_drive_current, minval=1, maxval=31)
+        z_start: float = gcmd.get_float('Z_MAX', self.params.calibration_z_max, above=2.0)
+        z_end: float = gcmd.get_float('Z_TARGET', 0.010)
 
-        if fth_fit is None or htf_fit is None:
-            self._log_error("Calibration failed")
+        mapping, fth, htf = self._create_mapping(z_start,
+                                                 z_end,
+                                                 self.params.probe_speed,
+                                                 self.params.lift_speed,
+                                                 drive_current,
+                                                 False)
+        if mapping is None or fth is None or htf is None:
+            self._log_error("Test failed: likely no samples received, check the log for more clues")
             return
 
-        self._dc_to_fmap[drive_current] = mapping
-        self.save_config()
+        hmin, hmax = mapping._height_range
+        fmin, fmax = mapping._freq_range
 
-        if not was_homed and hasattr(th.get_kinematics(), "note_z_not_homed"):
-            th.get_kinematics().note_z_not_homed()
+        self._log_info(f"Drive current {drive_current}: height range: {hmin:.3f} to {hmax:.3f}, " + \
+                       f"freq range: {fmin:.1f} to {fmax:.1f}. (Fit {fth:.4f},{htf:.4f})")
 
     #
     # PrinterProbe interface
@@ -1987,7 +2027,8 @@ class ProbeEddyFrequencyMap:
     def calibrate_from_values(self, drive_current: int,
                               times: List[float],
                               raw_freqs_list: List[float],
-                              raw_heights_list: List[float]):
+                              raw_heights_list: List[float],
+                              for_calibration: bool = True):
         if len(raw_freqs_list) != len(raw_heights_list):
             raise ValueError("freqs and heights must be the same length")
 
@@ -2001,17 +2042,18 @@ class ProbeEddyFrequencyMap:
         avg_freqs = np_rolling_mean(raw_freqs, 16)
         avg_heights = np_rolling_mean(raw_heights, 16)
 
-        with open("/tmp/eddy-calibration.csv", "w") as data_file:
-            data_file.write(f"time,frequency,avg_freq,z,avg_z\n")
-            for i in range(len(raw_freqs)):
-                s_t = times[i]
-                s_f = raw_freqs[i]
-                s_z = raw_heights[i]
-                s_af = avg_freqs[i]
-                s_az = avg_heights[i]
-                data_file.write(f"{s_t},{s_f},{s_af},{s_z},{s_az}\n")
-            logging.info(f"Wrote {len(raw_freqs)} samples to /tmp/eddy-calibration.csv")
-            #gcmd.respond_info(f"Wrote {len(raw_freqs)} samples to /tmp/eddy-calibration.csv")
+        if for_calibration:
+            with open("/tmp/eddy-calibration.csv", "w") as data_file:
+                data_file.write(f"time,frequency,avg_freq,z,avg_z\n")
+                for i in range(len(raw_freqs)):
+                    s_t = times[i]
+                    s_f = raw_freqs[i]
+                    s_z = raw_heights[i]
+                    s_af = avg_freqs[i]
+                    s_az = avg_heights[i]
+                    data_file.write(f"{s_t},{s_f},{s_af},{s_z},{s_az}\n")
+                logging.info(f"Wrote {len(raw_freqs)} samples to /tmp/eddy-calibration.csv")
+                #gcmd.respond_info(f"Wrote {len(raw_freqs)} samples to /tmp/eddy-calibration.csv")
 
         max_height = float(avg_heights.max())
         min_height = float(avg_heights.min())
@@ -2020,22 +2062,21 @@ class ProbeEddyFrequencyMap:
         freq_spread = ((max_freq / min_freq) - 1.0) * 100.0
 
         # Check if our calibration is good enough
+        if for_calibration:
+            if max_height < 2.5: # we really can't do anything with this
+                self._eddy._log_error(f"Error: max height for valid samples is too low: {max_height:.3f} < 2.5. Refer to the documentation for troubleshooting.")
+                return None, None
 
-        if max_height < 2.5: # we really can't do anything with this
-            self._eddy._log_error(f"Calibration failed: max height for valid samples is too low: {max_height:.3f} < 2.5. Refer to the documentation for troubleshooting.")
-            return None, None
+            if min_height > 0.25: # likewise can't do anything with this
+                self._eddy._log_error(f"Error: min height for valid samples is too high: {min_height:.3f} > 0.25. Refer to the documentation for troubleshooting.")
+                return None, None
 
-        if min_height > 0.25: # likewise can't do anything with this
-            self._eddy._log_error(f"Calibration failed: min height for valid samples is too high: {min_height:.3f} > 0.25. Refer to the documentation for troubleshooting.")
-            return None, None
+            if min_height > 0.025:
+                self._eddy._log_info(f"Warning: min height is {min_height:.3f}, which is too high for tap. This drive current will likely not work for tap, but should be fine for homing.")
 
-        if min_height > 0.025:
-            self._eddy._log_info(f"Warning: min height is {min_height:.3f}, which is too high for tap. You may need a different drive current for tap. Refer to the documentation.")
-
-        # somewhat arbitrary spread
-        if freq_spread < 0.85:
-            self._eddy._log_info(f"Warning: frequency spread is low ({freq_spread:.2f}%, {min_freq:.1f}-{max_freq:.1f}), " + \
-                                 "consider adjusting your sensor height")
+            # somewhat arbitrary spread
+            if freq_spread < 0.85:
+                self._eddy._log_info(f"Warning: frequency spread is low ({freq_spread:.2f}%, {min_freq:.1f}-{max_freq:.1f}), consider adjusting your sensor height")
 
         # Calculate RMSE
 
@@ -2045,16 +2086,16 @@ class ProbeEddyFrequencyMap:
         rmse_fth = np_rmse(lambda v: np.interp(v, qf, qz), avg_freqs[25:], avg_heights[25:])
         rmse_htf = np_rmse(lambda v: np.interp(v, qz[::-1], qf[::-1]), avg_heights[25:], avg_freqs[25:])
 
-        self._eddy._log_info(f"Calibration for drive current {drive_current}: max height: {max_height:.3f}, " + \
-                             f"freq spread {freq_spread:.2f}% (max freq: {max_freq:.1f}), RMSE F->H: {rmse_fth:.4f}, H->F: {rmse_htf:.2f}")
-
         self._freqs = qf
         self._heights = qz
         self._height_range = (min_height, max_height)
         self._freq_range = (min_freq, max_freq)
         self.drive_current = drive_current
 
-        self._save_calibration_plot(avg_freqs, avg_heights, qf, qz, rmse_fth, rmse_htf)
+        if for_calibration:
+            self._eddy._log_info(f"Calibration for drive current {drive_current}: height: {min_height:.3f} to {max_height:.3f}, " + \
+                                f"freq spread {freq_spread:.2f}% (max freq: {max_freq:.1f}), RMSE F->H: {rmse_fth:.4f}, H->F: {rmse_htf:.2f}")
+            self._save_calibration_plot(avg_freqs, avg_heights, qf, qz, rmse_fth, rmse_htf)
 
         return rmse_fth, rmse_htf
 
