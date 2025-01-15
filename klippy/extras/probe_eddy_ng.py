@@ -722,6 +722,7 @@ class ProbeEddy:
                                        lambda kin_pos: self.cmd_CALIBRATE_next(gcmd, kin_pos, was_homed))
 
     def cmd_CALIBRATE_next(self, gcmd: GCodeCommand, kin_pos: List[float], was_homed: bool):
+        th = self._printer.lookup_object('toolhead')
         if kin_pos is None:
             if not was_homed and hasattr(th.get_kinematics(), "note_z_not_homed"):
                 th.get_kinematics().note_z_not_homed()
@@ -735,8 +736,6 @@ class ProbeEddy:
 
         probe_speed: float = gcmd.get_float('SPEED', self.params.probe_speed, above=0.0)
         lift_speed: float = gcmd.get_float('LIFT_SPEED', self.params.lift_speed, above=0.0)
-
-        th = self._printer.lookup_object('toolhead')
 
         # We just did a ManualProbeHelper, so we're going to zero the z-axis
         # to make the following code easier, so it can assume z=0 is actually real zero.
