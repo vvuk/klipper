@@ -1619,113 +1619,6 @@ class ProbeEddyEndstopWrapper:
         self._sampler.finish()
         self._sampler = None
 
-
-    # these are the ProbeEndstopWrapper methods
-
-    # XXX called from ProbeSessionHelper, kill
-    # This is called before the start of a series of probe measurements (1 or more)
-    def multi_probe_begin(self):
-        logging.info("EDDYng multi_probe_begin >>>>>>>>>>>>>>>>>>>>>>>>>>>>")
-        self._multi_probe_in_progress = True
-        self._setup_sampler()
-
-    # XXX called from ProbeSessionHelper, kill
-    # The end of a series of measurements
-    def multi_probe_end(self):
-        if not self._multi_probe_in_progress:
-            raise self._printer.command_error("multi_probe_end called without a multi_probe_begin")
-        self._finish_sampler()
-        self._multi_probe_in_progress = False
-        logging.info("EDDYng multi_probe_end <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<")
-
-    # XXX called from ProbeSessionHelper, kill
-    # This is an odd method that's called by ProbeSessionHelper's _probe
-    # implementation. It doesn't actually do a homing move as best I can tell,
-    # because z must be homed before _probe is called. Instead, this is
-    # "do the move you need to do for probing" which is not relevant for eddy
-
-    # Perform a move to pos at speed, stopping when the probe triggers.
-    # Report the actual toolhead position _now_ (not when the probe triggered,
-    # which might be earlier).
-    def probing_move(self, pos, speed):
-        logging.info(f"EDDYng probing_move start: {pos} {speed}")
-        toolhead = self._printer.lookup_object('toolhead')
-        phoming = self._printer.lookup_object('homing')
-
-        # this may seem like an odd requirement, but the idea is that
-        # you do a generic home first with just a regular 2.0 height trigger
-        # to get into the ballpark, and then you can fine-tune with this
-        # TODO -- revisit this
-        if not self.eddy._z_homed():
-            raise self._printer.command_error("Z axis must be homed before probing (probing_move)")
-
-        toolhead_z = toolhead.get_position()[2]
-        trigger_position = None
-
-        height = self._sampler.get_height_now(average=True)
-        if height is None:
-            raise self._printer.command_error("probing_move: couldn't get height, did we not probe_start?")
-
-        # are we too high? if so, just do a simple probing_move to get us into the ballpark;
-        # same if the toolhead z and sensor height disagree by more than 0.5mm
-        if height > self.eddy.params.home_trigger_height:
-            # this probing move just gets us into the ballpark of probing coordinates
-            trigger_position = phoming.probing_move(self, pos, speed)
-            logging.info(f"EDDYng did homing.probing_move: trigger_position {trigger_position} trigger_time {self._trigger_time}")
-        elif toolhead_z < self._home_start_height:
-            toolhead.manual_move([None, None, self._home_start_height + 1.0], speed)
-            toolhead.manual_move([None, None, self._home_start_height], speed)
-            toolhead.wait_moves()
-
-        # We know we should have triggered at exactly height=2.0 (home_trigger_height),
-        # but because of the averaging that we do on the probe, we probably overshot it
-        # a little bit. But we have the raw data, so we can figure out by how much, and
-        # adjust the trigger position here.
-
-        toolhead.wait_moves() # should be a no-op
-        #start_time = self._trigger_time - LDC1612_SETTLETIME
-        # we're actually going to recheck the height now that toolhead is static
-        start_time = self.eddy._mcu.estimated_print_time(self._reactor.monotonic())
-        end_time = start_time + LDC1612_SETTLETIME*4
-
-        self._sampler.wait_for_sample_at_time(end_time, max_wait_time=0.500)
-
-        toolhead_pos = toolhead.get_position()
-        trigger_z = trigger_position[2] if trigger_position is not None else 0.0
-        toolhead_z = toolhead_pos[2]
-
-        # this is the offset from where the toolhead is now relative to... 
-        # well it can't be height, we don't care about the trigger time, do we?
-        z_deviation = toolhead_z - height
-
-        logging.info(f"EDDYng: toolhead_pos {toolhead_pos}")
-        logging.info(f"EDDYng: toolhead trigger z {trigger_z:.3f}")
-        logging.info(f"EDDYng: toolhead current z {toolhead_z:.3f}")
-        logging.info(f"EDDYng:      actual height {height:.3f} (deviation from current {z_deviation:.3f})")
-
-        # the z coordinate of this is supposed to be relative to the trigger position
-        # (our z_offset)
-        # i.e. at where the trigger would trigger at this point, if a trigger
-        # was triggered.  We may not have used the trigger position to probe though!
-
-        toolhead_pos[2] = self._home_trigger_height + z_deviation
-        logging.info(f"EDDYng:           reported {toolhead_pos[2]:.3f}")
-
-        return toolhead_pos
-
-    # XXX called from ProbeSessionHelper, kill
-    def probe_prepare(self, hmove):
-        logging.info(f"EDDYng probe_prepare ....................................")
-        if not self._multi_probe_in_progress:
-            self._setup_sampler()
-        self.eddy.probe_to_start_position()
-
-    # XXX called from ProbeSessionHelper, kill
-    def probe_finish(self, hmove):
-        if not self._multi_probe_in_progress:
-            self._finish_sampler();
-        logging.info(f"EDDYng probe_finish ....................................")
-
 # Helper to gather samples and convert them to probe positions
 @final
 class ProbeEddySampler:
@@ -1882,6 +1775,7 @@ class ProbeEddySampler:
         # Make sure enough samples have been collected
         wait_start_time = self._mcu.estimated_print_time(self._reactor.monotonic())
 
+        start_error_count = self._errors
         if new_only:
             start_count = len(self._raw_samples) + (self._errors if count_errors else 0)
         else:
@@ -1891,7 +1785,7 @@ class ProbeEddySampler:
             now = self._mcu.estimated_print_time(self._reactor.monotonic())
             if now - wait_start_time > max_wait_time:
                 if raise_error:
-                    raise self._printer.command_error(f"probe_eddy_ng sensor outage: no samples for {max_wait_time:.2f}s")
+                    raise self._printer.command_error(f"probe_eddy_ng sensor outage: no samples for {max_wait_time:.2f}s (got {self._errors - start_error_count} errors)")
                 return False
             self._reactor.pause(now + 0.010)
 
