@@ -27,8 +27,6 @@ DEGLITCH_3_3MHZ = 0x04
 DEGLITCH_10MHZ = 0x05
 DEGLITCH_33MHZ = 0x07
 
-DEGLITCH = DEGLITCH_10MHZ
-
 LDC1612_MANUF_ID = 0x5449
 LDC1612_DEV_ID = 0x3055
 
@@ -65,6 +63,7 @@ class LDC1612_ng:
 
         self._name = config.get_name().split()[-1]
         self._drive_current: int = config.getint("reg_drive_current", DRIVE_CURRENT_DEFAULT, minval=0, maxval=31)
+        self._deglitch: str = config.get("ldc_deglitch", "default").lower()
         self._data_rate: int = config.getint("samples_per_second", 250, minval=50)
         self._verbose = config.getboolean("verbose", True)
 
@@ -307,7 +306,17 @@ class LDC1612_ng:
         self._verify_chip()
 
         # TODO: have a max_frequency and pick the best deglitch for it
-        deglitch = DEGLITCH
+        if self._deglitch == "1mhz":
+            deglitch = DEGLITCH_1_0MHZ
+        elif self._deglitch == "3.3mhz":
+            deglitch = DEGLITCH_3_3MHZ
+        elif self._deglitch == "10mhz" or self._deglitch == "default":
+            deglitch = DEGLITCH_10MHZ
+        elif self._deglitch == "33mhz":
+            deglitch = DEGLITCH_33MHZ
+        else:
+            raise self.printer.error(f"Invalid {self._name} deglitch value: {self._deglitch}")
+
         # this is the settle time for the initial conversion (and initial conversion only)
         settle_time = SETTLETIME
 
@@ -326,17 +335,33 @@ class LDC1612_ng:
 
         self._initialized = True
 
+    def get_deglitch(self):
+        return self.read_reg(REG_MUX_CONFIG) & ~0x0208
+    
+    def set_deglitch(self, val: int):
+        logging.info(f"LDC1612ng {self._name} deglitch set {val}")
+        self.set_reg(REG_MUX_CONFIG, val | 0x0208)
+
     def get_drive_current(self) -> int:
         return self._drive_current
 
-    def set_drive_current(self, cval: int):
+    def set_drive_current(self, cval: int, maxfreq: float = None):
         if cval < 0 or cval > 31:
             raise self.printer.command_error("Drive current must be between 0 and 31")
         if self._drive_current == cval:
             return
 
-        logging.info(f"LDC1612ng {self._name} set drive current {cval}")
+        if maxfreq is not None:
+            if maxfreq < 1_000_000.:
+                self.set_deglitch(DEGLITCH_1_0MHZ)
+            elif maxfreq < 3_300_000.:
+                self.set_deglitch(DEGLITCH_3_3MHZ)
+            elif maxfreq < 10_000_000.:
+                self.set_deglitch(DEGLITCH_10MHZ)
+            else:
+                self.set_deglitch(DEGLITCH_33MHZ)
 
+        logging.info(f"LDC1612ng {self._name} set drive current {cval}")
         self._drive_current = cval
         self.set_reg(REG_DRIVE_CURRENT0, cval << 11)
 
