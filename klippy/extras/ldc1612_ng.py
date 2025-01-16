@@ -333,7 +333,7 @@ class LDC1612_ng:
         self.set_reg(REG_CONFIG, (1<<12) | (1<<10) | (1<<9) | 0x001)
         self.set_reg(REG_DRIVE_CURRENT0, self._drive_current << 11)
 
-        self._initialized = True
+        self._chip_initialized = True
 
     def get_deglitch(self):
         return self.read_reg(REG_MUX_CONFIG) & ~0x0208
