@@ -214,9 +214,11 @@ class ProbeEddyParams:
     scipy_tap_max_z_offset: float = 0.075
     # like tap_adjust_z, but only for the scipy tap
     scipy_tap_adjust_z: float = 0.0
-
+    # Probe position relative to toolhead
     x_offset: float = 0.0
     y_offset: float = 0.0
+    # remove some safety checks, largely for testing/development
+    allow_unsafe: bool = False
 
     @staticmethod
     def str_to_floatlist(s):
@@ -228,6 +230,8 @@ class ProbeEddyParams:
             raise configerror(f"Can't parse '{s}' as list of floats")
     
     def load_from_config(self, config: ConfigWrapper):
+        bool_choices = {'true': True, 'True': True, 'false': False, 'False': False, '1': True, '0': False}
+
         self.probe_speed = config.getfloat('probe_speed', self.probe_speed, above=0.0)
         self.lift_speed = config.getfloat('lift_speed', self.lift_speed, above=0.0)
         self.move_speed = config.getfloat('move_speed', self.move_speed, above=0.0)
@@ -249,8 +253,9 @@ class ProbeEddyParams:
 
         # sigh
         #self.use_scipy_tap = config.getbool('use_scipy_tap', self.use_scipy_tap)
-        bool_choices = {'true': True, 'True': True, 'false': False, 'False': False, '1': True, '0': False}
         self.use_scipy_tap = config.getchoice('use_scipy_tap', bool_choices, default='False')
+
+        self.allow_unsafe = config.getchoice('allow_unsafe', bool_choices, default='False')
 
         self.x_offset = config.getfloat('x_offset', self.x_offset)
         self.y_offset = config.getfloat('y_offset', self.y_offset)
@@ -261,7 +266,7 @@ class ProbeEddyParams:
         req_cal_z_max = self.home_trigger_safe_start_offset + self.home_trigger_height + 1.0
         if self.calibration_z_max < req_cal_z_max:
             raise config.get_printer().config_error(f"calibration_z_max must be at least home_trigger_safe_start_offset+home_trigger_height+1.0 ({self.home_trigger_safe_start_offset:.3f}+{self.home_trigger_height:.3f}+1.0={req_cal_z_max:.3f})")
-        if self.x_offset == 0.0 and self.y_offset == 0.0 and not ALLOW_UNSAFE:
+        if self.x_offset == 0.0 and self.y_offset == 0.0 and not self.allow_unsafe:
             raise config.get_printer().config_error(f"ProbeEddy: x_offset and y_offset are both 0.0; is the sensor really mounted at the nozzle?")
 
 @dataclass
@@ -292,8 +297,6 @@ class ProbeEddyProbeResult:
         mean_star = '*' if self.USE_MEAN_FOR_VALUE else ''
         median_star = '*' if not self.USE_MEAN_FOR_VALUE else ''
         return f"mean{mean_star}={self.mean:.3f}, median{median_star}={self.median:.3f}, range={self.min_value:.3f} to {self.max_value:.3f}, stddev={self.stddev:.3f}"
-
-ALLOW_UNSAFE=True
 
 @final
 class ProbeEddy:
@@ -2132,7 +2135,7 @@ class ProbeEddyFrequencyMap:
 
             if min_height > 0.25: # likewise can't do anything with this
                 self._eddy._log_error(f"Error: min height for valid samples is too high: {min_height:.3f} > 0.25. Refer to the documentation for troubleshooting.")
-                if not ALLOW_UNSAFE:
+                if not self._eddy.params.allow_unsafe:
                     return None, None
 
             if min_height > 0.025:
