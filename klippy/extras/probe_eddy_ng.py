@@ -1393,7 +1393,7 @@ class ProbeEddy:
         if tap_threshold > 0:
             fig.add_shape(type='line', x0=0, x1=1, y0=tap_threshold, y1=tap_threshold, xref="paper", yref="y3", line=dict(color='gray', width=1, dash='dash'))
         if tap is not None and tap.computed_tap_t is not None:
-            fig.add_shape(type='line', x0=tap.computed_tap_t, x1=tap.computed_tap_t, y0=0, y1=1, xref="x", yref="paper", line=dict(color='pink', width=1))
+            fig.add_shape(type='line', x0=tap.computed_tap_t-time_start, x1=tap.computed_tap_t-time_start, y0=0, y1=1, xref="x", yref="paper", line=dict(color='pink', width=1))
 
         fig.update_layout(hovermode='x unified',
           yaxis=dict(title="Z", side="right"), # Z axis
