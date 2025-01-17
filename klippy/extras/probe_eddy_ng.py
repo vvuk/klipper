@@ -1058,10 +1058,10 @@ class ProbeEddy:
         overshoot: float
         tap_start_time: float
         tap_end_time: float
-        computed_tap_t: Optional[float]
-        computed_tap_z: Optional[float]
-        computed_s_t: Optional[np.array]
-        computed_s_v: Optional[np.array]
+        computed_tap_t: Optional[float] = None
+        computed_tap_z: Optional[float] = None
+        computed_s_t: Optional[np.array] = None
+        computed_s_v: Optional[np.array] = None
 
     #self.save_samples_path = "/tmp/tap-samples.csv"
 
@@ -1742,7 +1742,7 @@ class ProbeEddyEndstopWrapper:
             raise self._printer.command_error("Communication timeout during homing")
         if res == self.REASON_ERROR_SENSOR:
             status = self._sensor.latched_status_str()
-            raise self._printer.command_error(f"Sensor error" + (f"(ldc status: {status})" if status else ""))
+            raise self._printer.command_error(f"Sensor error" + (f" (ldc status: {status})" if status else ""))
         if res == self.REASON_ERROR_PROBE_TOO_LOW:
             raise self._printer.command_error(f"Probe too low at start of homing, did not clear safe threshold.")
         if res == self.REASON_ERROR_TOO_EARLY:

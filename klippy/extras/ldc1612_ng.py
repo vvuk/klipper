@@ -209,11 +209,11 @@ class LDC1612_ng:
             'ERR_ZC', 'ERR_ALE', 'ERR_AHE', 'ERR_WD',
             'ERR_OR', 'ERR_UR', '14', 'ERR_CH1'
         ]
-        result = ''
-        for i in range(16):
-            if s & (1<<i):
-                result += status_bits[i] + ' '
-        return result
+        flags = []
+        for bit, flag in enumerate(status_bits):
+            if s & (1<<bit):
+                flags.append(flag)
+        return ' '.join(flags)
 
     def read_one_value(self):
         self._init_chip()
