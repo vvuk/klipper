@@ -1199,6 +1199,7 @@ class ProbeEddy:
         if not self._z_homed():
             raise self._printer.command_error("Z axis must be homed before tapping")
 
+        tap = None
         try:
             self.save_samples_path = "/tmp/tap-samples.csv"
             tap = self.do_one_tap(start_z=tap_start_z,
@@ -1211,9 +1212,9 @@ class ProbeEddy:
                 self._log_error(f"Tap failed at: {tap.toolhead_z}")
                 raise tap.error
         finally:
+            self._sensor.set_drive_current(self.params.reg_drive_current)
             # Need to do this right after to make sure we pick up the right samples
             self._write_tap_plot(tap)
-            self._sensor.set_drive_current(self.params.reg_drive_current)
 
         self._log_trace(f"EDDYng post tap: trigger at: {tap.probe_z:.3f} toolhead at: {tap.toolhead_z:.3f} overshoot: {tap.overshoot:.3f}")
         msg = f"probe computed tap: z={tap.probe_z:.3f} at {tap.tap_start_time:.4f}s"
@@ -1382,7 +1383,7 @@ class ProbeEddy:
         fig.add_trace(go.Scatter(x=s_t, y=c_tap_accums, mode='lines', name='accum', yaxis='y3'))
 
         # the alternate scipy tap if we have the data
-        if tap.computed_s_t is not None and tap.computed_tap_t is not None:
+        if tap is not None and tap.computed_s_t is not None and tap.computed_tap_t is not None:
             fig.add_trace(go.Scatter(x=(tap.computed_s_t - time_start), y=tap.computed_s_v, mode='lines', name='alt', yaxis='y4'))
 
         if trigger_time > 0:
@@ -1391,7 +1392,7 @@ class ProbeEddy:
             fig.add_shape(type='line', x0=tap_end_time, x1=tap_end_time, y0=0, y1=1, xref="x", yref="paper", line=dict(color='green', width=1))
         if tap_threshold > 0:
             fig.add_shape(type='line', x0=0, x1=1, y0=tap_threshold, y1=tap_threshold, xref="paper", yref="y3", line=dict(color='gray', width=1, dash='dash'))
-        if tap.computed_tap_t is not None:
+        if tap is not None and tap.computed_tap_t is not None:
             fig.add_shape(type='line', x0=tap.computed_tap_t, x1=tap.computed_tap_t, y0=0, y1=1, xref="x", yref="paper", line=dict(color='pink', width=1))
 
         fig.update_layout(hovermode='x unified',
