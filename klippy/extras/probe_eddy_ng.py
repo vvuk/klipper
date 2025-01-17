@@ -1191,7 +1191,8 @@ class ProbeEddy:
             self._sensor.set_drive_current(self.params.reg_drive_current)
 
         self._log_trace(f"EDDYng post tap: trigger at: {tap.probe_z:.3f} toolhead at: {tap.toolhead_z:.3f} overshoot: {tap.overshoot:.3f}")
-        self._log_info(f"computed tap: {tap.computed_tap_z:.3f} at {tap.computed_tap_t:.3f}")
+        if tap.computed_tap_z is not None:
+            self._log_info(f"computed tap: {tap.computed_tap_z:.3f} at {tap.computed_tap_t:.3f}")
 
         # Set the probe_trigger_z as the z offset
         adjusted_tap_z = tap.probe_z + self._tap_adjust_z
@@ -1332,7 +1333,6 @@ class ProbeEddy:
         # the derivative and deriv averages
         fig.add_trace(go.Scatter(x=s_t, y=c_wma_ds, mode='lines', name='wma_d', yaxis='y3', visible='legendonly'))
         fig.add_trace(go.Scatter(x=s_t, y=c_wma_d_avgs, mode='lines', name='wma_d_avg', yaxis='y3'))
-
         fig.add_trace(go.Scatter(x=s_t, y=c_tap_accums, mode='lines', name='accum', yaxis='y3'))
 
         if trigger_time > 0:
@@ -1340,11 +1340,11 @@ class ProbeEddy:
         if tap_end_time > 0:
             fig.add_shape(type='line', x0=tap_end_time, x1=tap_end_time, y0=0, y1=1, xref="x", yref="paper", line=dict(color='green', width=1))
         if tap_threshold > 0:
-            fig.add_shape(type='line', x0=0, x1=1, y0=tap_threshold, y1=tap_threshold, xref="paper", yref="y2", line=dict(color='gray', width=1, dash='dash'))
+            fig.add_shape(type='line', x0=0, x1=1, y0=tap_threshold, y1=tap_threshold, xref="paper", yref="y3", line=dict(color='gray', width=1, dash='dash'))
 
         fig.update_layout(hovermode='x unified',
-          yaxis=dict(title="Z", overlaying="y", side="right"), # Z axis
-          yaxis2=dict(title="Freq", tickformat="d", side="left"), # Freq + WMA
+          yaxis=dict(title="Z", side="right"), # Z axis
+          yaxis2=dict(overlaying="y", title="Freq", tickformat="d", side="left"), # Freq + WMA
           yaxis3=dict(overlaying="y", side="right", tickformat="d", position=0.5), # derivatives, tap accum
           height=800)
         fig.write_html("/tmp/tap.html")
