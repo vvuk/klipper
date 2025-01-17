@@ -614,7 +614,7 @@ class BedMeshCalibrate:
                 self.radius, self.origin, probe_method
             )
             gcmd.respond_info("Generating new points...")
-            self.print_generated_points(gcmd.respond_info)
+            #self.print_generated_points(gcmd.respond_info)
             msg = "\n".join(["%s: %s" % (k, v)
                              for k, v in self.mesh_config.items()])
             logging.info("Updated Mesh Configuration:\n" + msg)
