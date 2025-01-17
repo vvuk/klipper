@@ -1194,7 +1194,7 @@ class ProbeEddy:
     def _write_tap_plot(self):
         if not HAS_PLOTLY:
             return
-        
+
         samples = self._last_sampler_samples
         raw_samples = self._last_sampler_raw_samples
         memos = self._last_sampler_memos
@@ -1204,8 +1204,6 @@ class ProbeEddy:
         th = self._printer.lookup_object('toolhead')
 
         s_t = np.asarray([s[0] for s in samples])
-        #s_f = np.array([s[1] for s in samples])
-        # Note: we're using raw freqs
         s_rf = s_f = np.asarray([s[1] for s in raw_samples])
         s_z = np.asarray([s[2] for s in samples])
         s_kinz = np.asarray([get_toolhead_kin_pos(self._printer, s[0])[0][2] for s in samples])
@@ -1218,41 +1216,85 @@ class ProbeEddy:
         tap_end_time = memos.get('tap_end_time', time_start) - time_start
         tap_threshold = memos.get('tap_threshold', 0)
 
-        s_f_wma = np_wma(s_rf, 16)
-        s_f_wma_d = np.gradient(s_f_wma)
+        # Compute exactly (mostly) how the C code does it, so that the accum
+        # values are identical
+        FREQ_WINDOW_SIZE = 16
+        WMA_D_WINDOW_SIZE = 4
+        s_freq_weight_sum = ((FREQ_WINDOW_SIZE * (FREQ_WINDOW_SIZE + 1)) / 2)
 
-        avg_window = 4
-        s_f_wma_d_avg = []
-        for i in range(len(s_f_wma_d)):
-            if i < avg_window:
-                s_f_wma_d_avg.append(0)
-            else:
-                s_f_wma_d_avg.append(np.sum(s_f_wma_d[i-avg_window+1:i+1])/avg_window)
-    
-        tap_accums = []
-        accum_val = 0
-        for i in range(len(s_f_wma_d)):
-            val = s_f_wma_d_avg[i]
-            last_val = 0 if i == 0 else s_f_wma_d_avg[i-1]
-            if val < last_val:
-                accum_val += last_val - val
-            else:
-                accum_val = 0
-            tap_accums.append(accum_val)
+        c_freq_buffer = np.zeros(FREQ_WINDOW_SIZE, np.uint32)
+        c_wma_d_buf = np.zeros(WMA_D_WINDOW_SIZE, np.int32)
+        c_freq_i = 0
+        c_wma_d_i = 0
 
-        import plotly.graph_objects as go 
+        c_last_wma = np.uint32(0)
+        c_last_wma_d_avg = np.int32(0)
+
+        c_tap_accum = np.int32(0)
+
+        c_wmas = np.zeros(len(s_rf), np.uint32)
+        c_wma_ds= np.zeros(len(s_rf), np.int32)
+        c_wma_d_avgs = np.zeros(len(s_rf), np.int32)
+        c_tap_accums = np.zeros(len(s_rf), np.int32)
+
+        # pre-fill so that the values don't blow up
+        for i in range(FREQ_WINDOW_SIZE):
+            c_freq_buffer[i] = s_rf[0]
+
+        for sample_i, rawf in enumerate(np.array(s_rf)):
+            c_freq_buffer[c_freq_i] = rawf
+            c_freq_i = (c_freq_i + 1) % FREQ_WINDOW_SIZE
+
+            c_wma_numerator = np.uint64(0)
+            for i in range(FREQ_WINDOW_SIZE):
+                j = (c_freq_i + i) % FREQ_WINDOW_SIZE
+                weight = np.uint64(i + 1)
+                val = c_freq_buffer[j]
+                c_wma_numerator += val * weight
+
+            c_wma = np.uint32(c_wma_numerator // s_freq_weight_sum)
+            c_wma_d = np.int32(c_wma) - np.int32(c_last_wma)
+
+            c_wma_d_buf[c_wma_d_i] = c_wma_d
+            c_wma_d_i = (c_wma_d_i + 1) % WMA_D_WINDOW_SIZE;
+            c_wma_d_avg = np.int32(0)
+            for i in range(WMA_D_WINDOW_SIZE):
+                c_wma_d_avg += c_wma_d_buf[i]
+            c_wma_d_avg = c_wma_d_avg // WMA_D_WINDOW_SIZE
+
+            if c_wma_d_avg < c_last_wma_d_avg:
+                c_tap_accum += c_last_wma_d_avg - c_wma_d_avg
+            else:
+                c_tap_accum = 0
+
+            c_last_wma = c_wma
+            c_last_wma_d_avg = c_wma_d_avg
+
+            c_wmas[sample_i] = c_wma
+            c_wma_ds[sample_i] = c_wma_d
+            c_wma_d_avgs[sample_i] = c_wma_d_avg
+            # the first few blow up because they
+            # start at 0 and go up to the large int freqval
+            if sample_i < 32:
+                c_tap_accum = 0
+            c_tap_accums[sample_i] = c_tap_accum
+
+        import plotly.graph_objects as go
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=s_t, y=s_z, mode='lines', name='Z', yaxis='y3'))
-        fig.add_trace(go.Scatter(x=s_t, y=s_kinz, mode='lines', name='KinZ', yaxis='y3'))
 
-        fig.add_trace(go.Scatter(x=s_t, y=s_f, mode='lines', name='Freq'))
-        #fig.add_trace(go.Scatter(x=tt, y=tfraw, mode='lines', name='Fraw', yaxis='y4'))
+        # toolhead and sensor Z
+        fig.add_trace(go.Scatter(x=s_t, y=s_z, mode='lines', name='Z'))
+        fig.add_trace(go.Scatter(x=s_t, y=s_kinz, mode='lines', name='KinZ'))
 
-        fig.add_trace(go.Scatter(x=s_t, y=s_f_wma, mode='lines', name='wma'))
-        fig.add_trace(go.Scatter(x=s_t, y=s_f_wma_d, mode='lines', name='wma_d', yaxis='y2'))
-        fig.add_trace(go.Scatter(x=s_t, y=s_f_wma_d_avg, mode='lines', name='wma_d_avg', yaxis='y2'))
+        # the frequency value from the sensor, and their WMA
+        fig.add_trace(go.Scatter(x=s_t, y=s_f, mode='lines', name='Freq', yaxis='y2', visible='legendonly'))
+        fig.add_trace(go.Scatter(x=s_t, y=c_wmas, mode='lines', name='wma', yaxis='y2'))
 
-        fig.add_trace(go.Scatter(x=s_t, y=tap_accums, mode='lines', name='accum', yaxis='y2'))
+        # the derivative and deriv averages
+        fig.add_trace(go.Scatter(x=s_t, y=c_wma_ds, mode='lines', name='wma_d', yaxis='y3', visible='legendonly'))
+        fig.add_trace(go.Scatter(x=s_t, y=c_wma_d_avgs, mode='lines', name='wma_d_avg', yaxis='y3'))
+
+        fig.add_trace(go.Scatter(x=s_t, y=c_tap_accums, mode='lines', name='accum', yaxis='y3'))
 
         if trigger_time > 0:
             fig.add_shape(type='line', x0=trigger_time, x1=trigger_time, y0=0, y1=1, xref="x", yref="paper", line=dict(color='orange', width=1))
@@ -1261,15 +1303,11 @@ class ProbeEddy:
         if tap_threshold > 0:
             fig.add_shape(type='line', x0=0, x1=1, y0=tap_threshold, y1=tap_threshold, xref="paper", yref="y2", line=dict(color='gray', width=1, dash='dash'))
 
-
         fig.update_layout(hovermode='x unified',
-            # Freq
-            yaxis=dict(title="Freq", tickformat='d'),
-            # WMA derivatives, WMA deriv averages, tap accum
-            yaxis2=dict(overlaying="y", side="right", tickformat='d'),
-            # Z axis
-            yaxis3=dict(title="Z", overlaying="y", side="right"),
-            height=800)
+          yaxis=dict(title="Z", overlaying="y", side="right"), # Z axis
+          yaxis2=dict(title="Freq", tickformat="d", side="left"), # Freq + WMA
+          yaxis3=dict(overlaying="y", side="right", tickformat="d", position=0.5), # derivatives, tap accum
+          height=800)
         fig.write_html("/tmp/tap.html")
         logging.info("Wrote tap plot")
 
@@ -1762,7 +1800,7 @@ class ProbeEddySampler:
             raise self._printer.command_error("ProbeEddySampler: no samples")
         return self._samples[-1][2]
 
-    # wait for a sample for the current time and get a new height 
+    # wait for a sample for the current time and get a new height
     def get_height_now(self, average=False) -> Optional[float]:
         start = end = self._mcu.estimated_print_time(self._reactor.monotonic())
         if average:
@@ -1985,8 +2023,7 @@ class ProbeEddyFrequencyMap:
                     s_af = avg_freqs[i]
                     s_az = avg_heights[i]
                     data_file.write(f"{s_t},{s_f},{s_af},{s_z},{s_az}\n")
-                logging.info(f"Wrote {len(raw_freqs)} samples to /tmp/eddy-calibration.csv")
-                #gcmd.respond_info(f"Wrote {len(raw_freqs)} samples to /tmp/eddy-calibration.csv")
+                self._eddy._log_info(f"Wrote {len(raw_freqs)} samples to /tmp/eddy-calibration.csv")
 
         max_height = float(avg_heights.max())
         min_height = float(avg_heights.min())
@@ -2036,21 +2073,25 @@ class ProbeEddyFrequencyMap:
     def _save_calibration_plot(self, freqs, heights, qf, qz, rmse_fth, rmse_htf):
         if not HAS_PLOTLY:
             return
-        
-        import plotly.graph_objects as go 
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=freqs, y=heights, mode='lines', name='Z'))
-        fig.add_trace(go.Scatter(x=freqs, y=np.interp(freqs, qf, qz), mode='lines', name=f'Z {rmse_fth:.4f}'))
 
-        fig.add_trace(go.Scatter(x=heights, y=freqs, mode='lines', name='F', xaxis='x2', yaxis='y2'))
-        fig.add_trace(go.Scatter(x=heights, y=np.interp(heights, qz[::-1], qf[::-1]), mode='lines', name=f'F ({rmse_htf:.2f})',
-                                 xaxis='x2', yaxis='y2'))
+        f_to_z_err = heights - np.interp(freqs, qf, qz)
+
+        import plotly.graph_objects as go
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(y=heights, mode='lines', name='Z'))
+        fig.add_trace(go.Scatter(y=np.interp(freqs, qf, qz), mode='lines', name=f'Z {rmse_fth:.4f}'))
+
+        fig.add_trace(go.Scatter(y=freqs, mode='lines', name='F', yaxis='y2'))
+        fig.add_trace(go.Scatter(y=np.interp(heights, qz[::-1], qf[::-1]), mode='lines', name=f'F ({rmse_htf:.2f})',
+                                 yaxis='y2'))
+
+        fig.add_trace(go.Scatter(y=f_to_z_err, mode='lines', name='Err', yaxis='y3'))
 
         fig.update_layout(
             hovermode='x unified',
             title=f"Calibration for drive current {self.drive_current}",
-            xaxis2=dict(title='Height', overlaying='x', side='top'),
             yaxis2=dict(title='Freq', overlaying='y', side='right'),
+            yaxis3=dict(overlaying='y', side='right'),
             )
         fig.write_html("/tmp/eddy-calibration.html")
 
