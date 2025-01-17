@@ -833,8 +833,10 @@ class ProbeEddy:
         with self.start_sampler(calculate_heights=False) as sampler:
             first_sample_time = th.get_last_move_time()
             th.manual_move([None, None, z_target], probe_speed)
+            th.dwell(0.020)
             th.wait_moves()
             last_sample_time = th.get_last_move_time()
+            sampler.wait_for_sample_at_time(last_sample_time)
             sampler.finish()
 
         # the samples are a list of [print_time, freq, dummy_height] tuples
@@ -868,7 +870,7 @@ class ProbeEddy:
                                                  self.params.probe_speed,
                                                  self.params.lift_speed,
                                                  drive_current,
-                                                 False)
+                                                 True)
         if mapping is None or fth is None or htf is None:
             self._log_error("Test failed: likely no samples received, check the log for more clues")
             return
@@ -1266,7 +1268,7 @@ class ProbeEddy:
         result = self.probe_static_height()
         self._tap_offset = self.params.home_trigger_height - result.value
 
-        self._log_info(f"Z offset set to {adjusted_tap_z:.3f}{scipy_msg} (raw: {tap_z:.3f}), " + \
+        self._log_info(f"Z offset set to {adjusted_tap_z:.3f}{scipy_msg} (raw: {tap_z:.3f}, " + \
                        f"sensor offset at z={self.params.home_trigger_height:.3f}: {self._tap_offset:.3f})")
 
         if abs(self._tap_offset) > 0.300: # arbitrary
