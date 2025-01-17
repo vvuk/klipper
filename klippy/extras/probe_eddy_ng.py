@@ -207,6 +207,13 @@ class ProbeEddyParams:
     home_xy: Optional[Tuple[float, float]] = None
     # number of points to save for calibration
     calibration_points: int = 150
+    # whether to use the scipy computed tap after the fact
+    use_scipy_tap: bool = False
+    # don't trust the scipy tap if the offset claims it's
+    # more than this
+    scipy_tap_max_z_offset: float = 0.075
+    # like tap_adjust_z, but only for the scipy tap
+    scipy_tap_adjust_z: float = 0.0
 
     x_offset: float = 0.0
     y_offset: float = 0.0
@@ -236,6 +243,14 @@ class ProbeEddyParams:
         self.tap_speed = config.getfloat('tap_speed', self.tap_speed, above=0.0)
         self.home_xy = self.str_to_floatlist(config.get('home_xy', None))
         self.tap_adjust_z = config.getfloat('tap_adjust_z', self.tap_adjust_z)
+        self.calibration_points = config.getint('calibration_points', self.calibration_points)
+        self.scipy_tap_max_z_offset = config.getfloat('scipy_tap_max_z_offset', self.scipy_tap_max_z_offset)
+        self.scipy_tap_adjust_z = config.getfloat('scipy_tap_adjust_z', self.scipy_tap_adjust_z)
+
+        # sigh
+        #self.use_scipy_tap = config.getbool('use_scipy_tap', self.use_scipy_tap)
+        bool_choices = {'true': True, 'True': True, 'false': False, 'False': False, '1': True, '0': False}
+        self.use_scipy_tap = config.getchoice('use_scipy_tap', bool_choices, default='False')
 
         self.x_offset = config.getfloat('x_offset', self.x_offset)
         self.y_offset = config.getfloat('y_offset', self.y_offset)
@@ -1042,6 +1057,8 @@ class ProbeEddy:
         tap_end_time: float
         computed_tap_t: Optional[float]
         computed_tap_z: Optional[float]
+        computed_s_t: Optional[np.array]
+        computed_s_v: Optional[np.array]
 
     #self.save_samples_path = "/tmp/tap-samples.csv"
 
@@ -1114,7 +1131,7 @@ class ProbeEddy:
         # the toolhead is pushing into the build plate.
         overshoot = probe_z - now_z
 
-        computed_t, computed_z = self._compute_tap(self._last_sampler_samples, self._last_sampler_raw_samples)
+        computed_t, computed_z, computed_s_t, computed_s_v = self._compute_scipy_tap(self._last_sampler_samples, self._last_sampler_raw_samples)
 
         return ProbeEddy.TapResult(
             error=None,
@@ -1125,11 +1142,13 @@ class ProbeEddy:
             tap_end_time=self._endstop_wrapper.last_tap_end_time,
             computed_tap_t=computed_t,
             computed_tap_z=computed_z,
+            computed_s_t=computed_s_t,
+            computed_s_v=computed_s_v,
         )
 
-    def _compute_tap(self, samples, raw_samples):
+    def _compute_scipy_tap(self, samples, raw_samples):
         if not HAS_SCIPY:
-            return None, None
+            return None, None, None, None
 
         s_z = np.asarray([s[2] for s in samples])
         first_one = np.argmax(s_z <= 1.0)
@@ -1151,7 +1170,7 @@ class ProbeEddy:
         filtered = signal.filtfilt(bb, ba, s_f)
         # find the peak
         maxindex = np.argmax(filtered)
-        return s_t[maxindex], s_kinz[maxindex]
+        return float(s_t[maxindex]), float(s_kinz[maxindex]), s_t, filtered
 
     def cmd_TAP_next(self, gcmd: Optional[GCodeCommand]=None):
         self._log_trace("\nEDDYng Tap begin")
@@ -1166,6 +1185,12 @@ class ProbeEddy:
         target_z: float = gcmd.get_float('TARGET_Z', self.params.tap_target_z)
         tap_threshold: int = gcmd.get_int('THRESHOLD', self.params.tap_threshold, minval=0)
         tap_threshold = gcmd.get_int('TT', tap_threshold, minval=0) # alias for THRESHOLD
+        tap_adjust_z = gcmd.get_float('ADJUST_Z', self._tap_adjust_z)
+
+        use_scipy_tap = gcmd.get_int('SCIPY_TAP', 1 if self.params.use_scipy_tap else 0) == 1
+        scipy_tap_adjust_z = gcmd.get_float('SCIPY_ADJUST_Z', self.params.scipy_tap_adjust_z)
+        scipy_tap_max_z_offset = gcmd.get_float('SCIPY_MAX_Z_OFFSET', self.params.scipy_tap_max_z_offset)
+
 
         do_retract = gcmd.get_int('RETRACT', 1) == 1
 
@@ -1187,15 +1212,28 @@ class ProbeEddy:
                 raise tap.error
         finally:
             # Need to do this right after to make sure we pick up the right samples
-            self._write_tap_plot()
+            self._write_tap_plot(tap)
             self._sensor.set_drive_current(self.params.reg_drive_current)
 
         self._log_trace(f"EDDYng post tap: trigger at: {tap.probe_z:.3f} toolhead at: {tap.toolhead_z:.3f} overshoot: {tap.overshoot:.3f}")
+        msg = f"probe computed tap: z={tap.probe_z:.3f} at {tap.tap_start_time:.4f}s"
         if tap.computed_tap_z is not None:
-            self._log_info(f"computed tap: {tap.computed_tap_z:.3f} at {tap.computed_tap_t:.3f}")
+            msg += f", scipy computed tap: z={tap.computed_tap_z:.3f} at {tap.computed_tap_t:.4f}s"
+        self._log_info(msg)
+
+        tap_z = tap.probe_z
+
+        scipy_msg = ""
+        if use_scipy_tap and tap.computed_tap_z is not None:
+            if abs(tap_z - tap.computed_tap_z) < scipy_tap_max_z_offset:
+                tap_z = tap.computed_tap_z
+                tap_adjust_z = scipy_tap_adjust_z
+                scipy_msg = " (via scipy)"
+            else:
+                self._log_error(f"Not using scipy tap. Offset is {tap_z - tap.computed_tap_z:.3f}")
 
         # Set the probe_trigger_z as the z offset
-        adjusted_tap_z = tap.probe_z + self._tap_adjust_z
+        adjusted_tap_z = tap_z + tap_adjust_z
 
         gcode_move = self._printer.lookup_object('gcode_move')
         gcode_delta = adjusted_tap_z - gcode_move.homing_position[2]
@@ -1207,9 +1245,15 @@ class ProbeEddy:
         # for future probes.
         #
 
-        # Move to the home trigger height, which should be the height that the sensor triggers
-        # and that we do bed meshes at. Note this is exactly home_trigger_height, without
-        # the gcode z offset (so without adjusted_tap_z) because that's where we move to for probing.
+        # This is actually unrelated to tap, but is related to temperature compensation.
+        # Bed mesh is going to read values relative to the probe's z_offset (home_trigger_height).
+        # But we can't trust the probe's values directly, because of temperature effects.
+        #
+        # What we can do though is move the toolhead to that height, take a probe reading,
+        # then save the delta there to apply as an offset for bed mesh in the future.
+        # That makes this bed height effectively "0", which is fine, because this is
+        # what we did tap at to get a height zero reading.
+        #
         th = self._printer.lookup_object('toolhead')
         th.manual_move([None, None, self.params.home_trigger_height], lift_speed)
         th.dwell(0.500)
@@ -1218,11 +1262,11 @@ class ProbeEddy:
         result = self.probe_static_height()
         self._tap_offset = self.params.home_trigger_height - result.value
 
-        self._log_info(f"Z offset set to {adjusted_tap_z:.3f} (raw: {tap.probe_z:.3f}), " + \
+        self._log_info(f"Z offset set to {adjusted_tap_z:.3f}{scipy_msg} (raw: {tap_z:.3f}), " + \
                        f"sensor offset at z={self.params.home_trigger_height:.3f}: {self._tap_offset:.3f})")
 
-        if abs(self._tap_offset) > 0.250:
-            gcmd.respond_raw("!! WARNING: Tap offset is high; consider recalibrating sensor\n")
+        if abs(self._tap_offset) > 0.300: # arbitrary
+            self._log_error("WARNING: Tap offset is high; consider recalibrating sensor")
 
         if do_retract:
             th.manual_move([None, None, tap_start_z], lift_speed)
@@ -1231,7 +1275,7 @@ class ProbeEddy:
 
         self._log_trace("EDDYng Tap end\n")
 
-    def _write_tap_plot(self):
+    def _write_tap_plot(self, tap: ProbeEddy.TapResult):
         if not HAS_PLOTLY:
             return
 
@@ -1273,7 +1317,7 @@ class ProbeEddy:
         c_tap_accum = np.int32(0)
 
         c_wmas = np.zeros(len(s_rf), np.uint32)
-        c_wma_ds= np.zeros(len(s_rf), np.int32)
+        c_wma_ds = np.zeros(len(s_rf), np.int32)
         c_wma_d_avgs = np.zeros(len(s_rf), np.int32)
         c_tap_accums = np.zeros(len(s_rf), np.int32)
 
@@ -1311,12 +1355,14 @@ class ProbeEddy:
             c_last_wma_d_avg = c_wma_d_avg
 
             c_wmas[sample_i] = c_wma
-            c_wma_ds[sample_i] = c_wma_d
-            c_wma_d_avgs[sample_i] = c_wma_d_avg
             # the first few blow up because they
             # start at 0 and go up to the large int freqval
             if sample_i < 32:
                 c_tap_accum = 0
+                c_wma_d_avg = 0
+                c_wma_d = 0
+            c_wma_ds[sample_i] = c_wma_d
+            c_wma_d_avgs[sample_i] = c_wma_d_avg
             c_tap_accums[sample_i] = c_tap_accum
 
         import plotly.graph_objects as go
@@ -1335,17 +1381,24 @@ class ProbeEddy:
         fig.add_trace(go.Scatter(x=s_t, y=c_wma_d_avgs, mode='lines', name='wma_d_avg', yaxis='y3'))
         fig.add_trace(go.Scatter(x=s_t, y=c_tap_accums, mode='lines', name='accum', yaxis='y3'))
 
+        # the alternate scipy tap if we have the data
+        if tap.computed_s_t is not None and tap.computed_tap_t is not None:
+            fig.add_trace(go.Scatter(x=(tap.computed_s_t - time_start), y=tap.computed_s_v, mode='lines', name='alt', yaxis='y4'))
+
         if trigger_time > 0:
             fig.add_shape(type='line', x0=trigger_time, x1=trigger_time, y0=0, y1=1, xref="x", yref="paper", line=dict(color='orange', width=1))
         if tap_end_time > 0:
             fig.add_shape(type='line', x0=tap_end_time, x1=tap_end_time, y0=0, y1=1, xref="x", yref="paper", line=dict(color='green', width=1))
         if tap_threshold > 0:
             fig.add_shape(type='line', x0=0, x1=1, y0=tap_threshold, y1=tap_threshold, xref="paper", yref="y3", line=dict(color='gray', width=1, dash='dash'))
+        if tap.computed_tap_t is not None:
+            fig.add_shape(type='line', x0=tap.computed_tap_t, x1=tap.computed_tap_t, y0=0, y1=1, xref="x", yref="paper", line=dict(color='pink', width=1))
 
         fig.update_layout(hovermode='x unified',
           yaxis=dict(title="Z", side="right"), # Z axis
           yaxis2=dict(overlaying="y", title="Freq", tickformat="d", side="left"), # Freq + WMA
           yaxis3=dict(overlaying="y", side="right", tickformat="d", position=0.5), # derivatives, tap accum
+          yaxis4=dict(overlaying="y", side="right", showticklabels=False), # alt
           height=800)
         fig.write_html("/tmp/tap.html")
         logging.info("Wrote tap plot")
