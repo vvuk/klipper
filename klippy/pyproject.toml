@@ -14,4 +14,5 @@ dependencies = [
     "numpy>=2.2.1",
     "pyserial==3.4",
     "python-can==3.3.4",
+    "scipy>=1.15.1",
 ]
