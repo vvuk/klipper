@@ -240,7 +240,7 @@ class ProbeEddyParams:
         req_cal_z_max = self.home_trigger_safe_start_offset + self.home_trigger_height + 1.0
         if self.calibration_z_max < req_cal_z_max:
             raise config.get_printer().config_error(f"calibration_z_max must be at least home_trigger_safe_start_offset+home_trigger_height+1.0 ({self.home_trigger_safe_start_offset:.3f}+{self.home_trigger_height:.3f}+1.0={req_cal_z_max:.3f})")
-        if self.x_offset == 0.0 and self.y_offset == 0.0:
+        if self.x_offset == 0.0 and self.y_offset == 0.0 and not ALLOW_UNSAFE:
             raise config.get_printer().config_error(f"ProbeEddy: x_offset and y_offset are both 0.0; is the sensor really mounted at the nozzle?")
 
 @dataclass
@@ -271,6 +271,8 @@ class ProbeEddyProbeResult:
         mean_star = '*' if self.USE_MEAN_FOR_VALUE else ''
         median_star = '*' if not self.USE_MEAN_FOR_VALUE else ''
         return f"mean{mean_star}={self.mean:.3f}, median{median_star}={self.median:.3f}, range={self.min_value:.3f} to {self.max_value:.3f}, stddev={self.stddev:.3f}"
+
+ALLOW_UNSAFE=True
 
 @final
 class ProbeEddy:
@@ -357,7 +359,11 @@ class ProbeEddy:
     def _log_error(self, msg):
         logging.error(f"{self._name}: {msg}")
         self._gcode.respond_raw(f"!! {msg}\n")
-    
+
+    def _log_warning(self, msg):
+        logging.warning(f"{self._name}: {msg}")
+        self._gcode.respond_raw(f"!! {msg}\n")
+
     def _log_info(self, msg):
         logging.info(f"{self._name}: {msg}")
         self._gcode.respond_info(msg)
@@ -722,6 +728,7 @@ class ProbeEddy:
                                        lambda kin_pos: self.cmd_CALIBRATE_next(gcmd, kin_pos, was_homed))
 
     def cmd_CALIBRATE_next(self, gcmd: GCodeCommand, kin_pos: List[float], was_homed: bool):
+        th = self._printer.lookup_object('toolhead')
         if kin_pos is None:
             if not was_homed and hasattr(th.get_kinematics(), "note_z_not_homed"):
                 th.get_kinematics().note_z_not_homed()
@@ -735,8 +742,6 @@ class ProbeEddy:
 
         probe_speed: float = gcmd.get_float('SPEED', self.params.probe_speed, above=0.0)
         lift_speed: float = gcmd.get_float('LIFT_SPEED', self.params.lift_speed, above=0.0)
-
-        th = self._printer.lookup_object('toolhead')
 
         # We just did a ManualProbeHelper, so we're going to zero the z-axis
         # to make the following code easier, so it can assume z=0 is actually real zero.
@@ -1017,12 +1022,101 @@ class ProbeEddy:
     def cmd_TAP(self, gcmd: GCodeCommand):
         drive_current = self._sensor.get_drive_current()
         try:
-            self.tapping_home(gcmd)
+            self.cmd_TAP_next(gcmd)
         finally:
             self._sensor.set_drive_current(drive_current)
 
-    def tapping_home(self, gcmd: Optional[GCodeCommand]=None):
-        logging.info("\nEDDYng Tapping move begin")
+    @dataclass
+    class TapResult:
+        error: Exception
+        probe_z: float
+        toolhead_z: float
+        overshoot: float
+        tap_start_time: float
+        tap_end_time: float
+
+    #self.save_samples_path = "/tmp/tap-samples.csv"
+
+    def do_one_tap(self,
+                   start_z: float,
+                   target_z: float,
+                   tap_speed: float,
+                   lift_speed: float,
+                   tap_threshold: int) -> TapResult:
+        self.probe_to_start_position(start_z)
+
+        th = self._printer.lookup_object('toolhead')
+
+        target_position = th.get_position()
+        target_position[2] = target_z
+
+        phoming = self._printer.lookup_object('homing')
+        try:
+            # configure the endstop for tap (gets reset at the end of a tap sequence,
+            # also in finally just in case
+            self._endstop_wrapper.tap_threshold = tap_threshold
+
+            endstops = [(self._endstop_wrapper, "probe")]
+            hmove = HomingMove(self._printer, endstops)
+
+            try:
+                probe_position = hmove.homing_move(target_position, tap_speed, probe_pos=True)
+            except self._printer.command_error as err:
+                if self._printer.is_shutdown():
+                    raise self._printer.command_error("Probing failed due to printer shutdown")
+
+                # in case of failure don't leave the toolhead in a bad spot (i.e. in bed)
+                th_pos_z = th.get_position()[2]
+                if th_pos_z < 1.0:
+                    th.manual_move([None, None, start_z], lift_speed)
+
+                # If just sensor errors, let the caller handle it
+                if "Sensor error" in str(err):
+                    return ProbeEddy.TapResult(
+                        error=err,
+                        toolhead_z=th_pos_z,
+                        probe_z=0.0,
+                        overshoot=0.0,
+                        tap_start_time=0.0,
+                        tap_end_time=0.0
+                    )
+
+                self._log_error(f"Tap failed at {th_pos_z:.3f}")
+                raise
+
+            if hmove.check_no_movement() is not None:
+                raise self._printer.command_error("Probe triggered prior to movement")
+        finally:
+            self._endstop_wrapper.tap_threshold = 0
+
+        # this Z value is what this tap detected as "true height=0"
+        probe_z = probe_position[2]
+        # where the toolhead is now
+        now_z = th.get_position()[2]
+
+        # we're at now_z, but probe_z is the actual zero. We expect now_z
+        # to be below or equal to probe_z because there will always be
+        # a bit of overshoot due to trigger delay, and because we actually
+        # fire the trigger later than when the tap starts (and the tap start
+        # time is what's used to compute probe_position)
+        if now_z > probe_z:
+            raise self._printer.command_error(f"Unexpected: now_z {now_z:.3f} is above probe_z {probe_z:.3f} after tap")
+
+        # How much the toolhead overshot the real z=0 position. This is the amount
+        # the toolhead is pushing into the build plate.
+        overshoot = probe_z - now_z
+
+        return ProbeEddy.TapResult(
+            error=None,
+            probe_z=probe_z,
+            toolhead_z=now_z,
+            overshoot=overshoot,
+            tap_start_time=self._endstop_wrapper.last_trigger_time,
+            tap_end_time=self._endstop_wrapper.last_tap_end_time,
+        )
+
+    def cmd_TAP_next(self, gcmd: Optional[GCodeCommand]=None):
+        self._log_trace("\nEDDYng Tap begin")
 
         if gcmd is None:
             gcmd = self._dummy_gcode_cmd
@@ -1042,121 +1136,62 @@ class ProbeEddy:
         if not self._z_homed():
             raise self._printer.command_error("Z axis must be homed before tapping")
 
-        # move to tap_start_z
-        self.probe_to_start_position(tap_start_z)
-
-        th = self._printer.lookup_object('toolhead')
-        initial_position = th.get_position()
-        target_position = initial_position[:]
-        target_position[2] = target_z
-
-        phoming = self._printer.lookup_object('homing')
         try:
             self.save_samples_path = "/tmp/tap-samples.csv"
-            self._endstop_wrapper.tap_threshold = tap_threshold
+            tap = self.do_one_tap(start_z=tap_start_z,
+                                  target_z=target_z,
+                                  tap_speed=tap_speed,
+                                  lift_speed=lift_speed,
+                                  tap_threshold=tap_threshold)
 
-            # so, we want something like a probing_move, but we want it 
-            # this does a HomingMove.homing_move with a probe_pos = True
-            #probe_position = phoming.probing_move(self._endstop_wrapper, target_position, tap_speed)
-            endstops = [(self._endstop_wrapper, "probe")]
-            hmove = HomingMove(self._printer, endstops)
-            try:
-                probe_position = hmove.homing_move(target_position, tap_speed, probe_pos=True)
-            except self._printer.command_error:
-                if self._printer.is_shutdown():
-                    raise self._printer.command_error("Probing failed due to printer shutdown")
-                th_pos = th.get_position()
-                gcmd.respond_raw(f"!! Tap failed at {th_pos[2]:.3f}\n")
-                if th_pos[2] < 1.0:
-                    th_pos[2] = tap_start_z
-                    th.manual_move(th_pos, lift_speed)
-                raise
-            if hmove.check_no_movement() is not None:
-                raise self._printer.command_error("Probe triggered prior to movement")
+            if tap.error:
+                self._log_error(f"Tap failed at: {tap.toolhead_z}")
+                raise tap.error
         finally:
-            self._endstop_wrapper.tap_threshold = 0
             # Need to do this right after to make sure we pick up the right samples
-            try:
-                self._write_tap_plot()
-            except:
-                logging.info(f"Failed to write tap plot.")
+            self._write_tap_plot()
+            self._sensor.set_drive_current(self.params.reg_drive_current)
 
-        # same as what's returned    
-        probe_position = hmove.trigpos
-        haltpos = hmove.haltpos
-
-        th_pos = th.get_position()
-        logging.info(f"HMOVE: trigpos: {probe_position[2]:.3f} haltpos: {haltpos[2]:.3f} thpos: {th_pos[2]:.3f}")
-
-        # this is the real height=0 position
-        probe_trigger_z = probe_position[2]
-
-        now_z = th_pos[2]
-
-        # we're at now_z, but probe_z is the actual zero. We expect now_z
-        # to be below or equal to probe_z because there will always be
-        # a bit of overshoot due to trigger delay, and because we actually
-        # fire the trigger later than when the tap starts (and the tap start
-        # time is what's used to compute probe_position)
-        if now_z > probe_trigger_z:
-            raise self._printer.command_error(f"Unexpected: now_z {now_z:.3f} is above probe_z {probe_trigger_z:.3f} after tap")
-
-        # How much the toolhead overshot the real z=0 position. This is the amount
-        # the toolhead is pushing into the build plate.
-        overshoot = probe_trigger_z - now_z
-
-        logging.info(f"Tap triggered at z: {probe_trigger_z:.4f}, now z: {now_z:.4f}, overshoot: {overshoot:.4f}")
-
-        # To re-home the toolhead to true zero, we need to adjust its position up by the overshoot,
-        # which means the real current toolhead position is just how much it overshot zero by.
-        #toolhead_real_z = -overshoot
-        # This is just for logging
-        #th_adjust = now_z - toolhead_real_z
-        # Actually set the position for the toolhead
-        #gcmd.respond_info(f"Adjusting z by {th_adjust:.4f}")
-        #logging.info(f"Changing current toolhead z by {th_adjust:.4f} from {now_z:.3f} to {toolhead_real_z:.3f} {'' if do_adjust else '(no adjust set; no change)'}")
-        #th_pos[2] = toolhead_real_z
-        #th.set_position(th_pos)
+        self._log_trace(f"EDDYng post tap: trigger at: {tap.probe_z:.3f} toolhead at: {tap.toolhead_z:.3f} overshoot: {tap.overshoot:.3f}")
 
         # Set the probe_trigger_z as the z offset
+        adjusted_tap_z = tap.probe_z + self._tap_adjust_z
+
         gcode_move = self._printer.lookup_object('gcode_move')
-        logging.info(f"  Pre: gcode homing position: {gcode_move.homing_position[2]:.3f}, base position: {gcode_move.base_position[2]:.3f}")
-        gcode_delta = probe_trigger_z - gcode_move.homing_position[2] + self._tap_adjust_z
+        gcode_delta = adjusted_tap_z - gcode_move.homing_position[2]
         gcode_move.base_position[2] += gcode_delta
-        gcode_move.homing_position[2] = probe_trigger_z + self._tap_adjust_z
-        logging.info(f"After: gcode homing position: {gcode_move.homing_position[2]:.3f}, base position: {gcode_move.base_position[2]:.3f}")
-
-        # Now the Z axis is in the proper physical-aligned system. Retract back to tap_start_z
-        if tap_start_z < th_pos[2]:
-            raise self._printer.command_error(f"Initial position {tap_start_z:.3f} is below current, not moving down!")
+        gcode_move.homing_position[2] = adjusted_tap_z
 
         #
-        # Figure out the offset to apply for future bed mesh calibrations and non-tap Z-homes
+        # Figure out the offset to apply to sensor readings at the home trigger height
+        # for future probes.
         #
-        self._sensor.set_drive_current(self.params.reg_drive_current)
 
         # Move to the home trigger height, which should be the height that the sensor triggers
-        # and that we do bed meshes at
+        # and that we do bed meshes at. Note this is exactly home_trigger_height, without
+        # the gcode z offset (so without adjusted_tap_z) because that's where we move to for probing.
+        th = self._printer.lookup_object('toolhead')
         th.manual_move([None, None, self.params.home_trigger_height], lift_speed)
         th.dwell(0.500)
         th.wait_moves()
 
         result = self.probe_static_height()
         self._tap_offset = self.params.home_trigger_height - result.value
-        gcmd.respond_info(f"Tap sensor offset at z={self.params.home_trigger_height:.3f}: {self._tap_offset:.4f} [probed {result}]")
+
+        self._log_info(f"Z offset set to {adjusted_tap_z:.3f} (raw: {tap.probe_z:.3f}), " + \
+                       f"sensor offset at z={self.params.home_trigger_height:.3f}: {self._tap_offset:.3f})")
 
         if abs(self._tap_offset) > 0.250:
             gcmd.respond_raw("!! WARNING: Tap offset is high; consider recalibrating sensor\n")
 
         if do_retract:
-            th_pos[2] = tap_start_z
-            th.manual_move(th_pos, lift_speed)
+            th.manual_move([None, None, tap_start_z], lift_speed)
             th.wait_moves()
             th.flush_step_generation()
 
-        logging.info("EDDYng Tapping move end\n")
+        self._log_trace("EDDYng Tap end\n")
 
-    def _write_tap_plot(self, gcmd=None):
+    def _write_tap_plot(self):
         if not HAS_PLOTLY:
             return
         
@@ -1181,7 +1216,6 @@ class ProbeEddy:
         s_t = s_t - time_start
         trigger_time = memos.get('trigger_time', time_start) - time_start
         tap_end_time = memos.get('tap_end_time', time_start) - time_start
-
         tap_threshold = memos.get('tap_threshold', 0)
 
         s_f_wma = np_wma(s_rf, 16)
@@ -1405,9 +1439,9 @@ class ProbeEddyEndstopWrapper:
 
         self._dispatch = mcu.TriggerDispatch(self._mcu)
 
-        # the times of the 
-        self._trigger_time = 0.
-        self._tap_end_time = 0.0
+        # the times of the last successful endstop home_wait
+        self.last_trigger_time = 0.
+        self.last_tap_end_time = 0.0
 
         self._homing_in_progress = False
         self._sampler: ProbeEddySampler = None
@@ -1502,23 +1536,12 @@ class ProbeEddyEndstopWrapper:
         else:
             return self._home_trigger_height
 
-    # The Z homing sequence is:
-    #   - multi_probe_begin
-    #   - probe_prepare
-    #   - home_start
-    #   - home_wait
-    #   - probe_finish
-    #   - multi_probe_end
-    #
-    # Note no probing_move during homing! `HomingMove.homing_move` drives the above sequence.
-    # probing_move is only used during actual probe operations. 
-
     def home_start(self, print_time, sample_time, sample_count, rest_time, triggered=True):
         if not self._sampler.active():
             raise self._printer.command_error("home_start called without a sampler active")
 
-        self._trigger_time = 0.
-        self._tap_end_time = 0.
+        self.last_trigger_time = 0.
+        self.last_tap_end_time = 0.
 
         trigger_height = self._home_trigger_height
         safe_height = trigger_height + self._home_trigger_safe_start_offset
@@ -1554,8 +1577,7 @@ class ProbeEddyEndstopWrapper:
 
         self._sampler.memo("trigger_time", trigger_time)
         self._sampler.memo("tap_end_time", tap_end_time)
-        if self.tap_threshold > 0:
-            self._sampler.memo("tap_threshold", self.tap_threshold)
+        self._sampler.memo("tap_threshold", self.tap_threshold)
 
         logging.info(f"EDDYng trigger_time {trigger_time} (mcu: {self._mcu.print_time_to_clock(trigger_time)}) tap_end_time: {tap_end_time}")
 
@@ -1563,21 +1585,22 @@ class ProbeEddyEndstopWrapper:
         # and will only return those results. Fine for us since we only have one trsync,
         # but annoying in general.
         res = self._dispatch.stop()
-        is_tap = self.tap_threshold > 0
 
-        if is_tap:
-            logging.info(f"EDDYng mcu_probe: resetting tap_threshold")
-            self._tap_threshold = 0
+        # always reset this; taps are one-shot usages of the endstop wrapper
+        self.tap_threshold = 0
 
-        last_sample_time = trigger_time
-        if self.tap_threshold > 0:
-            last_sample_time = tap_end_time
-        self._sampler.wait_for_sample_at_time(last_sample_time)
+        # clean these up, and only update them if successful
+        self.last_trigger_time = 0.
+        self.last_tap_end_time = 0.
+
+        # if we're doing at ap, we wait for samples for the end as well so that we can get
+        # beter data for analysis
+        self._sampler.wait_for_sample_at_time(trigger_time if self.tap_threshold == 0 else tap_end_time)
 
         # success?
         if res == mcu.MCU_trsync.REASON_ENDSTOP_HIT:
-            self._trigger_time = trigger_time
-            self._tap_end_time = tap_end_time
+            self.last_trigger_time = trigger_time
+            self.last_tap_end_time = tap_end_time
             return trigger_time
 
         # various errors
@@ -1585,7 +1608,7 @@ class ProbeEddyEndstopWrapper:
             raise self._printer.command_error("Communication timeout during homing")
         if res == self.REASON_ERROR_SENSOR:
             status = self._sensor.latched_status_str()
-            raise self._printer.command_error(f"Sensor error (ldc status: {status})")
+            raise self._printer.command_error(f"Sensor error" + (f"(ldc status: {status})" if status else ""))
         if res == self.REASON_ERROR_PROBE_TOO_LOW:
             raise self._printer.command_error(f"Probe too low at start of homing, did not clear safe threshold.")
         if res == self.REASON_ERROR_TOO_EARLY:
@@ -1979,7 +2002,8 @@ class ProbeEddyFrequencyMap:
 
             if min_height > 0.25: # likewise can't do anything with this
                 self._eddy._log_error(f"Error: min height for valid samples is too high: {min_height:.3f} > 0.25. Refer to the documentation for troubleshooting.")
-                return None, None
+                if not ALLOW_UNSAFE:
+                    return None, None
 
             if min_height > 0.025:
                 self._eddy._log_info(f"Warning: min height is {min_height:.3f}, which is too high for tap. This drive current will likely not work for tap, but should be fine for homing.")
