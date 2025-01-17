@@ -25,6 +25,12 @@ try:
 except:
     HAS_PLOTLY=False
 
+try:
+    import scipy.signal as signal
+    HAS_SCIPY=True
+except:
+    HAS_SCIPY=False
+
 from configfile import ConfigWrapper
 from configfile import error as configerror
 from gcode import GCodeCommand
@@ -1034,6 +1040,8 @@ class ProbeEddy:
         overshoot: float
         tap_start_time: float
         tap_end_time: float
+        computed_tap_t: Optional[float]
+        computed_tap_z: Optional[float]
 
     #self.save_samples_path = "/tmp/tap-samples.csv"
 
@@ -1106,6 +1114,8 @@ class ProbeEddy:
         # the toolhead is pushing into the build plate.
         overshoot = probe_z - now_z
 
+        computed_t, computed_z = self._compute_tap(self._last_sampler_samples, self._last_sampler_raw_samples)
+
         return ProbeEddy.TapResult(
             error=None,
             probe_z=probe_z,
@@ -1113,7 +1123,35 @@ class ProbeEddy:
             overshoot=overshoot,
             tap_start_time=self._endstop_wrapper.last_trigger_time,
             tap_end_time=self._endstop_wrapper.last_tap_end_time,
+            computed_tap_t=computed_t,
+            computed_tap_z=computed_z,
         )
+
+    def _compute_tap(self, samples, raw_samples):
+        if not HAS_SCIPY:
+            return None, None
+
+        s_z = np.asarray([s[2] for s in samples])
+        first_one = np.argmax(s_z <= 1.0)
+        s_z = s_z[first_one:]
+
+        s_t = np.asarray([s[0] for s in samples[first_one:]])
+        s_f = np.asarray([s[1] for s in samples[first_one:]])
+        s_kinz = np.asarray([get_toolhead_kin_pos(self._printer, s[0])[0][2] for s in samples[first_one:]])
+
+        lowcut = 5
+        highcut = 50
+        order = 4
+
+        nyquist = 0.5 * self._sensor._data_rate  # Nyquist frequency
+        low = lowcut / nyquist
+        high = highcut / nyquist
+        bb, ba = signal.butter(4, [low, high], btype='band')
+
+        filtered = signal.filtfilt(bb, ba, s_f)
+        # find the peak
+        maxindex = np.argmax(filtered)
+        return s_t[maxindex], s_kinz[maxindex]
 
     def cmd_TAP_next(self, gcmd: Optional[GCodeCommand]=None):
         self._log_trace("\nEDDYng Tap begin")
@@ -1153,6 +1191,7 @@ class ProbeEddy:
             self._sensor.set_drive_current(self.params.reg_drive_current)
 
         self._log_trace(f"EDDYng post tap: trigger at: {tap.probe_z:.3f} toolhead at: {tap.toolhead_z:.3f} overshoot: {tap.overshoot:.3f}")
+        self._log_info(f"computed tap: {tap.computed_tap_z:.3f} at {tap.computed_tap_t:.3f}")
 
         # Set the probe_trigger_z as the z offset
         adjusted_tap_z = tap.probe_z + self._tap_adjust_z
