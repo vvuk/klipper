@@ -214,6 +214,10 @@ class ProbeEddyParams:
     scipy_tap_max_z_offset: float = 0.075
     # like tap_adjust_z, but only for the scipy tap
     scipy_tap_adjust_z: float = 0.0
+    # configuration for butterworth filter
+    scipy_tap_butter_lowcut: float = 5.0
+    scipy_tap_butter_highcut: float = 25.0
+    scipy_tap_butter_order: int = 1
     # Probe position relative to toolhead
     x_offset: float = 0.0
     y_offset: float = 0.0
@@ -250,6 +254,9 @@ class ProbeEddyParams:
         self.calibration_points = config.getint('calibration_points', self.calibration_points)
         self.scipy_tap_max_z_offset = config.getfloat('scipy_tap_max_z_offset', self.scipy_tap_max_z_offset)
         self.scipy_tap_adjust_z = config.getfloat('scipy_tap_adjust_z', self.scipy_tap_adjust_z)
+        self.scipy_tap_butter_lowcut = config.getfloat('scipy_tap_butter_lowcut', self.scipy_tap_butter_lowcut, above=0.0)
+        self.scipy_tap_butter_highcut = config.getfloat('scipy_tap_butter_highcut', self.scipy_tap_butter_highcut, above=self.scipy_tap_butter_lowcut)
+        self.scipy_tap_butter_order = config.getint('scipy_tap_butter_order', self.scipy_tap_butter_order, minval=1)
 
         # sigh
         #self.use_scipy_tap = config.getbool('use_scipy_tap', self.use_scipy_tap)
@@ -1176,14 +1183,14 @@ class ProbeEddy:
         s_f = np.asarray([s[1] for s in samples[first_one:]])
         s_kinz = np.asarray([get_toolhead_kin_pos(self._printer, s[0])[0][2] for s in samples[first_one:]])
 
-        lowcut = 5
-        highcut = 50
-        order = 4
+        lowcut = self.params.scipy_tap_butter_lowcut
+        highcut = self.params.scipy_tap_butter_highcut
+        order = self.params.scipy_tap_butter_order
 
         nyquist = 0.5 * self._sensor._data_rate  # Nyquist frequency
         low = lowcut / nyquist
         high = highcut / nyquist
-        bb, ba = signal.butter(4, [low, high], btype='band')
+        bb, ba = signal.butter(order, [low, high], btype='band')
 
         filtered = signal.filtfilt(bb, ba, s_f)
         # find the peak
