@@ -833,10 +833,14 @@ class ProbeEddy:
         with self.start_sampler(calculate_heights=False) as sampler:
             first_sample_time = th.get_last_move_time()
             th.manual_move([None, None, z_target], probe_speed)
-            th.dwell(0.020)
-            th.wait_moves()
             last_sample_time = th.get_last_move_time()
-            sampler.wait_for_sample_at_time(last_sample_time)
+            # Can't use wait_for_sample_at_time here, because the tail end of
+            # samples might be errors so they won't be passed to the sampler.
+            # Should fix that, but for now just wait an extra half second which
+            # should be more than enough.
+            #sampler.wait_for_sample_at_time(last_sample_time)
+            th.dwell(0.500)
+            th.wait_moves()
             sampler.finish()
 
         # the samples are a list of [print_time, freq, dummy_height] tuples

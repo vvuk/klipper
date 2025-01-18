@@ -523,10 +523,6 @@ simple_average_i32(int32_t* buf, uint8_t buf_size)
 void
 ldc1612_ng_check_home(struct ldc1612_ng* ld, uint32_t data, uint32_t time)
 {
-    // should be a constexpr, the compiler will sort it out
-    const uint64_t s_freq_weight_sum = WEIGHT_SUM(FREQ_WINDOW_SIZE);
-
-    struct ldc1612_ng_homing *lh = &ld->homing;
     uint8_t homing_flags = ld->homing_flags;
     uint8_t is_tap = !!(homing_flags & LH_WANT_TAP);
 
@@ -579,6 +575,9 @@ ldc1612_ng_check_home(struct ldc1612_ng* ld, uint32_t data, uint32_t time)
     lh->freq_i = NEXT_FREQ_I(lh->freq_i);
 
 #if false
+    const uint64_t s_freq_weight_sum = WEIGHT_SUM(FREQ_WINDOW_SIZE);
+
+    struct ldc1612_ng_homing *lh = &ld->homing;
     // TODO: We can avoid 64-bit integers here by just offseting
     // the numbers -- it should be safe to subtract the safe_start_freq
     // and just deal with offsets above that, because ultimately we
