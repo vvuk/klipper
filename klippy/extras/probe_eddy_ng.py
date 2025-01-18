@@ -1084,6 +1084,8 @@ class ProbeEddy:
         target_position = th.get_position()
         target_position[2] = target_z
 
+        error = None
+
         phoming = self._printer.lookup_object('homing')
         try:
             # configure the endstop for tap (gets reset at the end of a tap sequence,
@@ -1095,6 +1097,7 @@ class ProbeEddy:
 
             try:
                 probe_position = hmove.homing_move(target_position, tap_speed, probe_pos=True)
+                th_pos_z = th.get_position()[2]
             except self._printer.command_error as err:
                 if self._printer.is_shutdown():
                     raise self._printer.command_error("Probing failed due to printer shutdown")
@@ -1114,9 +1117,14 @@ class ProbeEddy:
                         tap_start_time=0.0,
                         tap_end_time=0.0
                     )
-
-                self._log_error(f"Tap failed at {th_pos_z:.3f}")
-                raise
+                elif "Probe completed movement before triggering" in str(err):
+                    # No tap was detected on the MCU. But maybe we'll still
+                    # figure something out afterwards with our filter magic.
+                    probe_position = [0.0, 0.0, 0.0, 0.0]
+                    error = err
+                else:
+                    self._log_error(f"Tap failed at {th_pos_z:.3f}")
+                    raise
 
             if hmove.check_no_movement() is not None:
                 raise self._printer.command_error("Probe triggered prior to movement")
@@ -1125,8 +1133,9 @@ class ProbeEddy:
 
         # this Z value is what this tap detected as "true height=0"
         probe_z = probe_position[2]
-        # where the toolhead is now
-        now_z = th.get_position()[2]
+        # where the toolhead is now (note: this is set in both the success and failure cases;
+        # on failure, before we retract)
+        now_z = th_pos_z
 
         # we're at now_z, but probe_z is the actual zero. We expect now_z
         # to be below or equal to probe_z because there will always be
@@ -1143,7 +1152,7 @@ class ProbeEddy:
         computed_t, computed_z, computed_s_t, computed_s_v = self._compute_scipy_tap(self._last_sampler_samples, self._last_sampler_raw_samples)
 
         return ProbeEddy.TapResult(
-            error=None,
+            error=error,
             probe_z=probe_z,
             toolhead_z=now_z,
             overshoot=overshoot,
@@ -1209,6 +1218,7 @@ class ProbeEddy:
             raise self._printer.command_error("Z axis must be homed before tapping")
 
         tap = None
+        only_scipy = False
         try:
             self.save_samples_path = "/tmp/tap-samples.csv"
             tap = self.do_one_tap(start_z=tap_start_z,
@@ -1218,15 +1228,23 @@ class ProbeEddy:
                                   tap_threshold=tap_threshold)
 
             if tap.error:
-                self._log_error(f"Tap failed at: {tap.toolhead_z}")
-                raise tap.error
+                if "Probe completed movement" in str(tap.error) and use_scipy_tap:
+                    # we're going to allow this to continue, because the filter magic
+                    # will always detect, but we'll see where we get
+                    only_scipy = True
+                else:
+                    self._log_error(f"Tap failed at: {tap.toolhead_z}")
+                    raise tap.error
         finally:
             self._sensor.set_drive_current(self.params.reg_drive_current)
             # Need to do this right after to make sure we pick up the right samples
             self._write_tap_plot(tap)
 
         self._log_trace(f"EDDYng post tap: trigger at: {tap.probe_z:.3f} toolhead at: {tap.toolhead_z:.3f} overshoot: {tap.overshoot:.3f}")
-        msg = f"probe computed tap: z={tap.probe_z:.3f} at {tap.tap_start_time:.4f}s"
+        if not only_scipy:
+            msg = f"probe computed tap: z={tap.probe_z:.3f} at {tap.tap_start_time:.4f}s"
+        else:
+            msg = "probe didn't compute tap"
         if tap.computed_tap_z is not None:
             msg += f", scipy computed tap: z={tap.computed_tap_z:.3f} at {tap.computed_tap_t:.4f}s"
         self._log_info(msg)
@@ -1235,7 +1253,7 @@ class ProbeEddy:
 
         scipy_msg = ""
         if use_scipy_tap and tap.computed_tap_z is not None:
-            if abs(tap_z - tap.computed_tap_z) < scipy_tap_max_z_offset:
+            if only_scipy or abs(tap_z - tap.computed_tap_z) < scipy_tap_max_z_offset:
                 tap_z = tap.computed_tap_z
                 tap_adjust_z = scipy_tap_adjust_z
                 scipy_msg = " (via scipy)"
