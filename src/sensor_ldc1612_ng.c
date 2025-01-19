@@ -567,6 +567,8 @@ ldc1612_ng_check_home(struct ldc1612_ng* ld, uint32_t data, uint32_t time)
     // TODO: the below can absolutely be made more efficient, but I'm
     // keeping it simple while things are dialed in.
 
+    struct ldc1612_ng_homing *lh = &ld->homing;
+
     // Helpers to clean up the adds/mods/etc. to make the below more readable
     #define NEXT_FREQ_I(i) (((i) + 1) % FREQ_WINDOW_SIZE)
     #define NEXT_WMA_D_I(i) (((i) + 1) % WMA_D_WINDOW_SIZE)
@@ -577,7 +579,6 @@ ldc1612_ng_check_home(struct ldc1612_ng* ld, uint32_t data, uint32_t time)
 #if false
     const uint64_t s_freq_weight_sum = WEIGHT_SUM(FREQ_WINDOW_SIZE);
 
-    struct ldc1612_ng_homing *lh = &ld->homing;
     // TODO: We can avoid 64-bit integers here by just offseting
     // the numbers -- it should be safe to subtract the safe_start_freq
     // and just deal with offsets above that, because ultimately we
