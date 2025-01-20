@@ -2161,19 +2161,20 @@ class ProbeEddyFrequencyMap:
         if for_calibration:
             if max_height < 2.5: # we really can't do anything with this
                 self._eddy._log_error(f"Error: max height for valid samples is too low: {max_height:.3f} < 2.5. Refer to the documentation for troubleshooting.")
-                return None, None
+                if not self._eddy.params.allow_unsafe:
+                    return None, None
 
-            if min_height > 0.25: # likewise can't do anything with this
-                self._eddy._log_error(f"Error: min height for valid samples is too high: {min_height:.3f} > 0.25. Refer to the documentation for troubleshooting.")
+            if min_height > 0.65: # this is a bit arbitrary; but if it's this far off we shouldn't trust it
+                self._eddy._log_error(f"Error: min height for valid samples is too high: {min_height:.3f} > 0.65. Refer to the documentation for troubleshooting.")
                 if not self._eddy.params.allow_unsafe:
                     return None, None
 
             if min_height > 0.025:
-                self._eddy._log_info(f"Warning: min height is {min_height:.3f}, which is too high for tap. This drive current will likely not work for tap, but should be fine for homing.")
+                self._eddy._log_info(f"Warning: min height is {min_height:.3f} (> 0.025), which is too high for tap. This drive current will likely not work for tap, but should be fine for homing.")
 
             # somewhat arbitrary spread
             if freq_spread < 0.85:
-                self._eddy._log_info(f"Warning: frequency spread is low ({freq_spread:.2f}%, {min_freq:.1f}-{max_freq:.1f}), consider adjusting your sensor height")
+                self._eddy._log_info(f"Warning: frequency spread is low ({freq_spread:.2f}%, {min_freq:.1f}-{max_freq:.1f}), adjusting your sensor's height may help.")
 
         # Calculate RMSE
 
