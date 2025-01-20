@@ -42,8 +42,6 @@ from .homing import HomingMove
 
 from . import ldc1612_ng, probe, manual_probe
 
-from .ldc1612_ng import SETTLETIME as LDC1612_SETTLETIME
-
 # In this file, a couple of conventions are used (for sanity).
 # Variables are named according to:
 # - "height" is always a physical height as detected by the probe in mm
@@ -316,11 +314,12 @@ class ProbeEddy:
 
         sensors = {
             "ldc1612": ldc1612_ng.LDC1612_ng,
-            "btt_eddy" : ldc1612_ng.LDC1612_ng,
-            }
+            "btt_eddy": ldc1612_ng.LDC1612_ng,
+            "cartographer": ldc1612_ng.LDC1612_ng,
+        }
         sensor_type = config.getchoice('sensor_type', {s: s for s in sensors})
 
-        self._sensor = sensors[sensor_type](config, sensor_type)
+        self._sensor = sensors[sensor_type](config)
         self._mcu = self._sensor.get_mcu()
 
         self.params = ProbeEddyParams()
@@ -652,7 +651,7 @@ class ProbeEddy:
         now = self._mcu.estimated_print_time(reactor.monotonic())
 
         with self.start_sampler() as sampler:
-            sampler.wait_for_sample_at_time(now + (duration + LDC1612_SETTLETIME))
+            sampler.wait_for_sample_at_time(now + (duration + self._sensor._ldc_settle_time))
             sampler.finish()
 
             samples = sampler.get_samples()
@@ -661,7 +660,7 @@ class ProbeEddy:
 
             # skip LDC1612_SETTLETIME samples at start and end by looking
             # at the time values
-            stime = samples[0][0] + LDC1612_SETTLETIME
+            stime = samples[0][0] + self._sensor._ldc_settle_time
             etime = samples[-1][0]
 
             samples = [s[2] for s in samples if s[0] > stime]

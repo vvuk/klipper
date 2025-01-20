@@ -7,6 +7,7 @@
 // This file may be distributed under the terms of the GNU GPLv3 license.
 
 #include <string.h> // memcpy
+#include "autoconf.h"
 #include "basecmd.h" // oid_alloc
 #include "board/irq.h" // irq_disable
 #include "board/misc.h" // timer_read_time
@@ -15,10 +16,21 @@
 #include "sched.h" // DECL_TASK
 #include "sensor_bulk.h" // sensor_bulk_report
 #include "trsync.h" // trsync_do_trigger
-#include "printf.h"
 
+#if CONFIG_MACH_STM32F0
+// For Cartographer
+#include "board/internal.h"
+#include "board/gpio.h"
+#define SUPPORT_CARTOGRAPHER 1
+// not enough flash for printf
+#define LDC_DEBUG 0
+#else
+#define SUPPORT_CARTOGRAPHER 0
 #define LDC_DEBUG 1
+#endif
+
 #if defined(LDC_DEBUG) && LDC_DEBUG > 0
+#include "printf.h"
 void dprint(const char *fmt, ...);
 #else
 #define dprint(...) do { } while (0)
@@ -36,6 +48,11 @@ enum {
 #define REASON_ERROR_SENSOR 0
 #define REASON_ERROR_PROBE_TOO_LOW 1
 #define REASON_ERROR_TOO_EARLY 2
+
+// should match ldc1612_ng.py
+#define PRODUCT_UNKNOWN 0
+#define PRODUCT_BTT_EDDY 1
+#define PRODUCT_CARTOGRAPHER 2
 
 // Chip registers
 #define REG_DATA0_MSB 0x00
@@ -116,6 +133,8 @@ struct ldc1612_ng {
     struct sensor_bulk sb;
     struct gpio_in intb_pin;
 
+    uint8_t product;
+
     uint32_t rest_ticks;
     uint8_t flags;
     uint16_t last_status;
@@ -132,6 +151,10 @@ struct ldc1612_ng {
     // homing state
     uint8_t homing_flags;
     struct ldc1612_ng_homing homing;
+
+#if SUPPORT_CARTOGRAPHER
+    struct gpio_out led_gpio;
+#endif
 };
 
 void command_config_ldc1612_ng(uint32_t *args);
@@ -232,7 +255,7 @@ ldc1612_ng_shutdown(void)
 DECL_SHUTDOWN(ldc1612_ng_shutdown);
 
 static void
-config_ldc1612_ng(uint32_t oid, uint32_t i2c_oid, int32_t intb_pin)
+config_ldc1612_ng(uint32_t oid, uint32_t i2c_oid, uint8_t product, int32_t intb_pin)
 {
     dprint("EDDYng cfg o=%u i=%u b=%d", oid, i2c_oid, intb_pin);
 
@@ -244,6 +267,37 @@ config_ldc1612_ng(uint32_t oid, uint32_t i2c_oid, int32_t intb_pin)
         ld->intb_pin = gpio_in_setup(intb_pin, 1);
         ld->flags = LDC_HAVE_INTB;
     }
+    ld->product = product;
+
+    switch (product) {
+    case PRODUCT_UNKNOWN:
+    case PRODUCT_BTT_EDDY:
+        break;
+#if SUPPORT_CARTOGRAPHER
+    case PRODUCT_CARTOGRAPHER:
+        // This enables the ldc1612 (CS?)
+        gpio_out_setup(GPIO('A', 15), 0);
+
+        // The Cartographer hardware uses a timer in the STM32F0
+        // to generate a 24MHz reference clock for the ldc1612.
+        // Uses a new _with_max setup here because otherwise we
+        // can't actually get to 24MHz from 48MHz. This could be
+        // configured from the python side but that requires
+        // adding a bunch of new commands.
+        gpio_pwm_setup_with_max(GPIO('B', 4), 1, 1, 2);
+
+        // There's a LED -- do something with it in the future,
+        // showing homing progress
+        ld->led_gpio = gpio_out_setup(GPIO('B', 5), 1);
+        gpio_out_write(ld->led_gpio, 1);
+
+        // There's also a temp sensor on A4, but we can
+        // pull that out on the python side.
+        break;
+#endif
+    default:
+        shutdown("ldc1612_ng: unknown product");
+    }
 }
 
 void
@@ -251,22 +305,24 @@ command_config_ldc1612_ng(uint32_t *args)
 {
     uint32_t oid = args[0];
     uint32_t i2c_oid = args[1];
+    uint8_t product = args[2];
 
-    config_ldc1612_ng(oid, i2c_oid, -1);
+    config_ldc1612_ng(oid, i2c_oid, product, -1);
 }
-DECL_COMMAND(command_config_ldc1612_ng, "config_ldc1612_ng oid=%c i2c_oid=%c");
+DECL_COMMAND(command_config_ldc1612_ng, "config_ldc1612_ng oid=%c i2c_oid=%c product=%i");
 
 void
 command_config_ldc1612_ng_with_intb(uint32_t *args)
 {
     uint32_t oid = args[0];
     uint32_t i2c_oid = args[1];
-    uint32_t intb_pin = args[2];
+    uint8_t product = args[2];
+    uint32_t intb_pin = args[3];
 
-    config_ldc1612_ng(oid, i2c_oid, intb_pin);
+    config_ldc1612_ng(oid, i2c_oid, product, intb_pin);
 }
 DECL_COMMAND(command_config_ldc1612_ng_with_intb,
-             "config_ldc1612_ng_with_intb oid=%c i2c_oid=%c intb_pin=%c");
+             "config_ldc1612_ng_with_intb oid=%c i2c_oid=%c product=%i intb_pin=%c");
 
 void
 command_query_ldc1612_ng_latched_status(uint32_t *args)
