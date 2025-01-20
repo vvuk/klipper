@@ -17,10 +17,6 @@ BATCH_UPDATES = 0.100
 
 LDC1612_ADDR = 0x2a
 
-LDC1612_FREQ = 12000000
-SETTLETIME = 0.005
-DRIVE_CURRENT_DEFAULT = 15
-
 # TODO: configure these as part of calibration
 DEGLITCH_1_0MHZ = 0x01
 DEGLITCH_3_3MHZ = 0x04
@@ -41,6 +37,11 @@ REG_DRIVE_CURRENT0 = 0x1e
 REG_MANUFACTURER_ID = 0x7e
 REG_DEVICE_ID = 0x7f
 
+# Device product
+PRODUCT_UNKNOWN = 0
+PRODUCT_BTT_EDDY = 1
+PRODUCT_CARTOGRAPHER = 2
+
 @dataclass
 class LDC1612_ng_value:
     status: int
@@ -55,17 +56,40 @@ class LDC1612_ng_homing_result:
 
 # Interface class to LDC1612 mcu support
 class LDC1612_ng:
-    def __init__(self, config, sensor_type=None):
+    def __init__(self, config):
         self.printer: Printer = config.get_printer()
 
-        # sensor_type not used yet, but will be used to configure
-        # defaults for different products
-
         self._name = config.get_name().split()[-1]
-        self._drive_current: int = config.getint("reg_drive_current", DRIVE_CURRENT_DEFAULT, minval=0, maxval=31)
+        self._verbose = config.getboolean("verbose", True)
+
+        device_choices = {
+            'ldc1612': PRODUCT_UNKNOWN,
+            'btt_eddy': PRODUCT_BTT_EDDY,
+            'cartographer': PRODUCT_CARTOGRAPHER
+        }
+        self._device_product = config.getchoice("sensor_type", device_choices, PRODUCT_UNKNOWN)
+
+        # Fin0 = Fsensor0 / FIN_DIVIDER0
+        # Fref0 = Fclk / FREF_DIVIDER0
+        if self._device_product == PRODUCT_CARTOGRAPHER:
+            self._ldc_freq_clk = 24_000_000
+            self._ldc_fin_divider = 1
+            self._ldc_fref_divider = 1
+            self._ldc_settle_time = 0.0001706
+            self._drive_current = 26
+        else: # Generic/BTT Eddy using external 12MHz clock source
+            # TODO add a generic setup that usees internal ldc1612 clock
+            self._ldc_freq_clk = 12_000_000
+            self._ldc_settle_time = 0.005
+            self._ldc_fin_divider = 1
+            self._ldc_fref_divider = 1
+            self._drive_current = 15
+
+        self._ldc_freq_ref = round(self._ldc_freq_clk / self._ldc_fref_divider)
+
+        self._drive_current: int = config.getint("reg_drive_current", self._drive_current, minval=0, maxval=31)
         self._deglitch: str = config.get("ldc_deglitch", "default").lower()
         self._data_rate: int = config.getint("samples_per_second", 250, minval=50)
-        self._verbose = config.getboolean("verbose", True)
 
         # Setup mcu sensor_ldc1612 bulk query code
         self._i2c = bus.MCU_I2C_from_config(config,
@@ -85,11 +109,11 @@ class LDC1612_ng:
             if pin_params['chip'] != mcu:
                 raise config.error("ldc1612 intb_pin must be on same mcu")
             mcu.add_config_cmd(
-                "config_ldc1612_ng_with_intb oid=%d i2c_oid=%d intb_pin=%s"
-                % (oid, self._i2c.get_oid(), pin_params['pin']))
+                "config_ldc1612_ng_with_intb oid=%d i2c_oid=%d product=%i intb_pin=%s"
+                % (oid, self._i2c.get_oid(), self._device_product, pin_params['pin']))
         else:
-            mcu.add_config_cmd("config_ldc1612_ng oid=%d i2c_oid=%d"
-                               % (oid, self._i2c.get_oid()))
+            mcu.add_config_cmd("config_ldc1612_ng oid=%d i2c_oid=%d product=%i"
+                               % (oid, self._i2c.get_oid(), self._device_product))
 
         # Make sure the sensor is stopped on restart
         mcu.add_config_cmd("ldc1612_ng_start_stop oid=%d rest_ticks=0" % (oid,), on_restart=True)
@@ -227,12 +251,12 @@ class LDC1612_ng:
                                 freq=self.from_ldc_freqval(lastval, ignore_err=True))
 
     def to_ldc_freqval(self, freq):
-        return int(freq * (1<<28) / float(LDC1612_FREQ) + 0.5)
+        return int(freq * (1<<28) / float(self._ldc_freq_ref) + 0.5)
 
     def from_ldc_freqval(self, val, ignore_err = False):
         if val >= 0x0fffffff and not ignore_err:
             raise self.printer.command_error(f"LDC1612 frequency value has error bits: {hex(val)}")
-        return round(val * (float(LDC1612_FREQ) / (1<<28)), 3)
+        return round(val * (float(self._ldc_freq_ref) / (1<<28)), 3)
 
     #
     # Homing
@@ -268,7 +292,7 @@ class LDC1612_ng:
 
     # The value that freqvals are multiplied by to get a float frequency
     def freqval_conversion_value(self):
-        return float(LDC1612_FREQ) / (1<<28)
+        return float(self._ldc_freq_ref) / (1<<28)
 
     # Measurement decoding
     def _convert_samples(self, samples):
@@ -282,6 +306,7 @@ class LDC1612_ng:
                     self._last_err_kind = val >> 28
                 self._last_error_count += 1
             else:
+                # Note! Raw values here
                 samples[count] = (round(ptime, 6), val, math.inf)
                 count += 1
         # remove the samples we didn't fill in because of errors
@@ -317,16 +342,13 @@ class LDC1612_ng:
         else:
             raise self.printer.error(f"Invalid {self._name} deglitch value: {self._deglitch}")
 
-        # this is the settle time for the initial conversion (and initial conversion only)
-        settle_time = SETTLETIME
-
         # This is the TI-recommended register configuration order
         # Setup chip in requested query rate
-        rcount0 = LDC1612_FREQ / (16. * (self._data_rate - 4))
+        rcount0 = self._ldc_freq_ref / (16. * (self._data_rate - 4))
         self.set_reg(REG_RCOUNT0, int(rcount0 + 0.5))
         self.set_reg(REG_OFFSET0, 0)
-        self.set_reg(REG_SETTLECOUNT0, int(settle_time*LDC1612_FREQ/16. + .5))
-        self.set_reg(REG_CLOCK_DIVIDERS0, (1 << 12) | 1)
+        self.set_reg(REG_SETTLECOUNT0, int(self._ldc_settle_time*self._ldc_freq_ref/16. + .5))
+        self.set_reg(REG_CLOCK_DIVIDERS0, (self._ldc_fin_divider << 12) | (self._ldc_fref_divider))
         self.set_reg(REG_ERROR_CONFIG, 0b1111_1100_1111_1001) # report everything to STATUS and INTB except ZC
         self.set_reg(REG_MUX_CONFIG, 0x0208 | deglitch)
         # RP_OVERRIDE_EN | AUTO_AMP_DIS | REF_CLK_SRC=clkin | reserved
