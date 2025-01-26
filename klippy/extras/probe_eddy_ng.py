@@ -1981,7 +1981,7 @@ class ProbeEddySampler:
             now = self._mcu.estimated_print_time(self._reactor.monotonic())
             if now - wait_start_time > max_wait_time:
                 return report_no_samples()
-            self._reactor.pause(now + 0.010)
+            self._reactor.pause(self._reactor.monotonic() + 0.010)
 
         return True
 
@@ -2004,7 +2004,7 @@ class ProbeEddySampler:
                 if raise_error:
                     raise self._printer.command_error(f"probe_eddy_ng sensor outage: no samples for {max_wait_time:.2f}s (got {self._errors - start_error_count} errors)")
                 return False
-            self._reactor.pause(now + 0.010)
+            self._reactor.pause(self._reactor.monotonic() + 0.010)
 
         return True
 
