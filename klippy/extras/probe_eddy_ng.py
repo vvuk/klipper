@@ -202,9 +202,9 @@ class ProbeEddyParams:
     # values will raise the toolhead, negative values will lower it.
     tap_adjust_z: float = 0.0
     # The number of times to do a tap, averaging the results.
-    tap_samples: int = 1
+    tap_samples: int = 3
     # The maximum number of tap samples.
-    tap_max_samples: int = 1
+    tap_max_samples: int = 5
     # The maximum standard deviation for any 3 samples to be considered valid.
     tap_samples_stddev: float = 0.020
 
@@ -1265,12 +1265,14 @@ class ProbeEddy:
                 sample_i += 1
 
                 if tap.error:
+                    self._log_info(f"Tap {sample_i}: failed")
                     sample_err_count += 1
                     sample_last_err = tap
                     continue
 
                 results.append(tap)
 
+                self._log_info(f"Tap {sample_i}: z={tap.probe_z:.3f}")
                 self._log_trace(
                     f"EDDYng tap[{sample_i}]: {tap.probe_z:.3f} toolhead at: {tap.toolhead_z:.3f} "
                     f"overshoot: {tap.overshoot:.3f} at {tap.tap_start_time:.4f}s")
@@ -1294,13 +1296,12 @@ class ProbeEddy:
         if tap_z is None:
             err_msg = "Tap failed:"
             if tap_stddev is not None:
-                err_msg += f" stddev {tap_stddev:.3f} > {samples_stddev:.3f}"
+                err_msg += f" stddev {tap_stddev:.3f} > {samples_stddev:.3f}."
+                err_msg += " Consider adjusting tap_samples, tap_max_samples, or tap_samples_stddev."
             if sample_err_count > 0:
                 err_msg += f" {sample_err_count} errors, last: {sample_last_err.error} at toolhead z={sample_last_err.toolhead_z:.3f}"
             self._log_error(err_msg)
             raise self._printer.command_error("Tap failed")
-
-        self._log_info(f"probe computed tap: z={tap_z:.3f} (stddev {tap_stddev:.3f})")
 
         # Adjust the computed tap_z by the user's tap_adjust_z, typically to raise
         # it to account for flex in the system (otherwise the Z would be too low)
@@ -1338,8 +1339,8 @@ class ProbeEddy:
         result = self.probe_static_height()
         self._tap_offset = self.params.home_trigger_height - result.value
 
-        self._log_info(f"Z offset set to {adjusted_tap_z:.3f} (raw: {tap_z:.3f}, "
-                       f"sensor offset set to {self._tap_offset:.3f} (at z={self.params.home_trigger_height:.3f})")
+        self._log_info(f"Probe computed z offset {adjusted_tap_z:.3f} (tap at z={tap_z:.3f}, stddev {tap_stddev:.3f}),"
+                       f" sensor offset {self._tap_offset:.3f} at z={self.params.home_trigger_height:.3f}")
 
         if abs(self._tap_offset) > 0.300: # arbitrary
             self._log_error(f"WARNING: Sensor offset is high ({self._tap_offset:.3f}); consider recalibrating sensor")
@@ -1893,7 +1894,7 @@ class ProbeEddyEndstopWrapper:
 
         # if in error, return -inf height to make endstop checks easier
         if freqval > 0x0fffffff:
-            logging.warning(f"query_endstop: got error")
+            logging.warning("query_endstop: got error")
             return True
 
         height = self.eddy.freq_to_height(freq)
