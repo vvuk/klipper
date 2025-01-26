@@ -893,17 +893,10 @@ class ProbeEddy:
                                                  self.params.probe_speed,
                                                  self.params.lift_speed,
                                                  drive_current,
-                                                 True)
+                                                 for_calibration=False)
         if mapping is None or fth is None or htf is None:
             self._log_error("Test failed: likely no samples received, check the log for more clues")
             return
-
-        hmin, hmax = mapping._height_range
-        fmin, fmax = mapping._freq_range
-        fpct = ((fmax / fmin) - 1.0) * 100.0
-
-        self._log_info(f"Drive current {drive_current}: valid height range: {hmin:.3f} to {hmax:.3f}, " + \
-                       f"freq range: {fmin:.1f} to {fmax:.1f} (spread {fpct:.2f}%. (Fit {fth:.4f},{htf:.4f})")
 
     #
     # PrinterProbe interface
@@ -2272,9 +2265,11 @@ class ProbeEddyFrequencyMap:
         self._freq_range = (min_freq, max_freq)
         self.drive_current = drive_current
 
+        self._eddy._log_info(f"Drive current {drive_current}: valid height: {min_height:.3f} to {max_height:.3f}, "
+                             f"freq spread {freq_spread:.2f}% ({min_freq:.1f} - {max_freq:.1f}), "
+                             f"RMSE F->H: {rmse_fth:.4f}, H->F: {rmse_htf:.2f}")
+
         if for_calibration:
-            self._eddy._log_info(f"Calibration for drive current {drive_current}: height: {min_height:.3f} to {max_height:.3f}, " + \
-                                f"freq spread {freq_spread:.2f}% (max freq: {max_freq:.1f}), RMSE F->H: {rmse_fth:.4f}, H->F: {rmse_htf:.2f}")
             self._save_calibration_plot(avg_freqs, avg_heights, qf, qz, rmse_fth, rmse_htf)
 
         return rmse_fth, rmse_htf
