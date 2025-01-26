@@ -12,21 +12,25 @@ class error(Exception):
 # Attempt to enter bootloader via 1200 baud request
 def enter_bootloader(device):
     try:
+        sys.stderr.write("Entering bootloader on %s\n" % (device,))
         f = open(device, 'rb')
         fd = f.fileno()
         fcntl.ioctl(fd, termios.TIOCMBIS, struct.pack('I', termios.TIOCM_DTR))
         t = termios.tcgetattr(fd)
         t[4] = t[5] = termios.B1200
-        sys.stderr.write("Entering bootloader on %s\n" % (device,))
         termios.tcsetattr(fd, termios.TCSANOW, t)
         fcntl.ioctl(fd, termios.TIOCMBIC, struct.pack('I', termios.TIOCM_DTR))
         f.close()
+        sys.stderr.write("Entered bootloader on %s\n" % (device,))
     except (IOError, OSError) as e:
-        pass
+        sys.stderr.write(e)
+        raise e
 
 # Translate a serial device name to a stable serial name in /dev/serial/by-path/
 def translate_serial_to_tty(device):
     ttyname = os.path.realpath(device)
+    if sys.platform == 'darwin':
+        return ttyname, ttyname
     if not os.path.exists('/dev/serial/by-path/'):
         raise error("Unable to find serial 'by-path' folder")
     for fname in os.listdir('/dev/serial/by-path/'):
@@ -37,6 +41,8 @@ def translate_serial_to_tty(device):
 
 # Translate a serial device name to a usb path (suitable for dfu-util)
 def translate_serial_to_usb_path(device):
+    if sys.platform == 'darwin':
+        return device, device
     realdev = os.path.realpath(device)
     fname = os.path.basename(realdev)
     try:
@@ -194,10 +200,14 @@ def call_picoboot(bus, addr, binfile, sudo):
 # Flash via Klipper modified "picoboot"
 def flash_picoboot(device, binfile, sudo):
     ttyname, serbypath = translate_serial_to_tty(device)
+    enter_bootloader(device)
+    if sys.platform == 'darwin':
+        wait_path("/Volumes/RPI-RP2")
+        os.system(f"cp {binfile} /Volumes/RPI-RP2")
+        return
     buspath, devpath = translate_serial_to_usb_path(device)
     # We need one level up to get access to busnum/devnum files
     usbdir = os.path.dirname(devpath)
-    enter_bootloader(device)
     wait_path(usbdir + "/busnum")
     with open(usbdir + "/busnum") as f:
         bus = f.read().strip()
