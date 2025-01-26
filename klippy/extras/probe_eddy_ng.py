@@ -11,6 +11,7 @@ import numpy as np
 import numpy.polynomial as npp
 import traceback
 import pickle, base64
+from itertools import combinations
 
 import mcu
 import pins
@@ -200,6 +201,13 @@ class ProbeEddyParams:
     # the computed tap is a bit too high or too low for your taste. Positive
     # values will raise the toolhead, negative values will lower it.
     tap_adjust_z: float = 0.0
+    # The number of times to do a tap, averaging the results.
+    tap_samples: int = 1
+    # The maximum number of tap samples.
+    tap_max_samples: int = 1
+    # The maximum standard deviation for any 3 samples to be considered valid.
+    tap_samples_stddev: float = 0.020
+
     # When probing multiple points (not rapid scan), how long to sample for at each probe point,
     # after a scan_sample_time_delay delay. The total dwell time at each probe point is
     # scan_sample_time + scan_sample_time_delay.
@@ -259,6 +267,10 @@ class ProbeEddyParams:
         self.tap_butter_lowcut = config.getfloat('tap_butter_lowcut', self.tap_butter_lowcut, above=0.0)
         self.tap_butter_highcut = config.getfloat('tap_butter_highcut', self.tap_butter_highcut, above=self.tap_butter_lowcut)
         self.tap_butter_order = config.getint('tap_butter_order', self.tap_butter_order, minval=1)
+
+        self.tap_samples = config.getint('tap_samples', self.tap_samples, minval=1)
+        self.tap_max_samples = config.getint('tap_max_samples', self.tap_max_samples, minval=self.tap_samples)
+        self.tap_samples_stddev = config.getfloat('tap_samples_stddev', self.tap_samples_stddev, above=0.0)
 
         self.allow_unsafe = config.getchoice('allow_unsafe', bool_choices, default='False')
         self.x_offset = config.getfloat('x_offset', self.x_offset)
@@ -1094,7 +1106,6 @@ class ProbeEddy:
 
         error = None
 
-        phoming = self._printer.lookup_object('homing')
         try:
             # configure the endstop for tap (gets reset at the end of a tap sequence,
             # also in finally just in case
@@ -1207,6 +1218,9 @@ class ProbeEddy:
         tap_threshold = gcmd.get_float('TT', tap_threshold) # alias for THRESHOLD
         tap_adjust_z = gcmd.get_float('ADJUST_Z', self._tap_adjust_z)
         do_retract = gcmd.get_int('RETRACT', 1) == 1
+        samples = gcmd.get_int('SAMPLES', self.params.tap_samples, minval=1)
+        max_samples = gcmd.get_int('MAX_SAMPLES', self.params.tap_max_samples, minval=samples)
+        samples_stddev = gcmd.get_float('SAMPLE_STDDEV', self.params.tap_samples_stddev, above=0.0)
 
         mode = gcmd.get('MODE', self.params.tap_mode).lower()
         if mode not in ('wma', 'butter'):
@@ -1230,36 +1244,66 @@ class ProbeEddy:
             sos = signal.butter(order, [lowcut, highcut], btype='bandpass', fs=self._sensor._data_rate, output='sos')
             tapcfg.sos = [s.tolist() for s in sos]
 
-        tap = None
-        only_scipy = False
+        results = []
+        tap_z = None
+        tap_stddev = None
+        sample_err_count = 0
+
         try:
             self._sensor.set_drive_current(tap_drive_current)
 
-            self.save_samples_path = "/tmp/tap-samples.csv"
-            tap = self.do_one_tap(start_z=tap_start_z,
-                                  target_z=target_z,
-                                  tap_speed=tap_speed,
-                                  lift_speed=lift_speed,
-                                  tapcfg=tapcfg)
+            sample_i = 0
+            sample_last_err = None
 
-            if tap.error:
-                self._log_error(f"Tap failed at: {tap.toolhead_z}")
-                raise tap.error
+            while sample_i < max_samples:
+                self.save_samples_path = "/tmp/tap-samples.csv"
+                tap = self.do_one_tap(start_z=tap_start_z,
+                                      target_z=target_z,
+                                      tap_speed=tap_speed,
+                                      lift_speed=lift_speed,
+                                      tapcfg=tapcfg)
+                sample_i += 1
+
+                if tap.error:
+                    sample_err_count += 1
+                    sample_last_err = tap
+                    continue
+
+                results.append(tap)
+
+                self._log_trace(
+                    f"EDDYng tap[{sample_i}]: {tap.probe_z:.3f} toolhead at: {tap.toolhead_z:.3f} "
+                    f"overshoot: {tap.overshoot:.3f} at {tap.tap_start_time:.4f}s")
+
+                if samples == 1:
+                    # only one sample, we're done
+                    tap_z = tap.probe_z
+                    tap_stddev = 0.
+                    break
+
+                if len(results) >= samples:
+                    tap_z, tap_stddev = self._compute_tap_z(results, samples, samples_stddev)
+                    if tap_z is not None:
+                        break
         finally:
             self._sensor.set_drive_current(self.params.reg_drive_current)
-            # Need to do this right after to make sure we pick up the right samples
+            # This only writes the plot for the very last tap
             self._write_tap_plot(tap)
 
-        self._log_trace(f"EDDYng post tap: trigger at: {tap.probe_z:.3f} toolhead at: {tap.toolhead_z:.3f} overshoot: {tap.overshoot:.3f}")
-        if not only_scipy:
-            msg = f"probe computed tap: z={tap.probe_z:.3f} at {tap.tap_start_time:.4f}s"
-        else:
-            msg = "probe didn't compute tap"
-        self._log_info(msg)
+        # If we didn't compute a tap_z report the error
+        if tap_z is None:
+            err_msg = "Tap failed:"
+            if tap_stddev is not None:
+                err_msg += f" stddev {tap_stddev:.3f} > {samples_stddev:.3f}"
+            if sample_err_count > 0:
+                err_msg += f" {sample_err_count} errors, last: {sample_last_err.error} at toolhead z={sample_last_err.toolhead_z:.3f}"
+            self._log_error(err_msg)
+            raise self._printer.command_error("Tap failed")
 
-        tap_z = tap.probe_z
+        self._log_info(f"probe computed tap: z={tap_z:.3f} (stddev {tap_stddev:.3f})")
 
-        # Set the probe_trigger_z as the z offset
+        # Adjust the computed tap_z by the user's tap_adjust_z, typically to raise
+        # it to account for flex in the system (otherwise the Z would be too low)
         adjusted_tap_z = tap_z + tap_adjust_z
 
         gcode_move = self._printer.lookup_object('gcode_move')
@@ -1271,7 +1315,6 @@ class ProbeEddy:
         # Figure out the offset to apply to sensor readings at the home trigger height
         # for future probes.
         #
-
         # This is actually unrelated to tap, but is related to temperature compensation.
         # Bed mesh is going to read values relative to the probe's z_offset (home_trigger_height).
         # But we can't trust the probe's values directly, because of temperature effects.
@@ -1281,26 +1324,53 @@ class ProbeEddy:
         # That makes this bed height effectively "0", which is fine, because this is
         # what we did tap at to get a height zero reading.
         #
+        # Toolhead moves are absolute; they don't take into account the gcode offset.
+        # Probes happen at absolute z=z_offset, so this doesn't take into account the
+        # tap_z computed above. This does mean that the actual physical height probing happens at
+        # is not likely to be exactly the same as the Z position, but all we care about is
+        # variance from that position so this should be fine.
         th = self._printer.lookup_object('toolhead')
-        th.manual_move([None, None, self.params.home_trigger_height], lift_speed)
+        th.manual_move([None, None, self.params.home_trigger_height + 1.0], lift_speed)
+        th.manual_move([None, None, self.params.home_trigger_height], tap_speed)
         th.dwell(0.500)
         th.wait_moves()
 
         result = self.probe_static_height()
         self._tap_offset = self.params.home_trigger_height - result.value
 
-        self._log_info(f"Z offset set to {adjusted_tap_z:.3f} (raw: {tap_z:.3f}, " + \
-                       f"sensor offset at z={self.params.home_trigger_height:.3f}: {self._tap_offset:.3f})")
+        self._log_info(f"Z offset set to {adjusted_tap_z:.3f} (raw: {tap_z:.3f}, "
+                       f"sensor offset set to {self._tap_offset:.3f} (at z={self.params.home_trigger_height:.3f})")
 
         if abs(self._tap_offset) > 0.300: # arbitrary
-            self._log_error("WARNING: Tap offset is high; consider recalibrating sensor")
+            self._log_error(f"WARNING: Sensor offset is high ({self._tap_offset:.3f}); consider recalibrating sensor")
 
         if do_retract:
-            th.manual_move([None, None, tap_start_z], lift_speed)
+            th.manual_move([None, None, self._home_start_height], lift_speed)
             th.wait_moves()
             th.flush_step_generation()
 
         self._log_trace("EDDYng Tap end\n")
+
+    # Compute the average tap_z from a set of tap results, taking a cluster of samples
+    # from the result that has the lowest standard deviation
+    def _compute_tap_z(self, taps: List[ProbeEddy.TapResult], samples: int, req_stddev: float) -> Tuple[float, float]:
+        if len(taps) < samples:
+            return None, None
+
+        tap_z = math.inf
+        std_min = math.inf
+        for cluster in combinations(taps, samples):
+            tap_zs = np.array([t.probe_z for t in cluster])
+            mean = np.mean(tap_zs)
+            std = np.std(tap_zs)
+            if std < std_min:
+                std_min = std
+                tap_z = mean
+
+        if std_min <= req_stddev:
+            return tap_z, std_min
+        else:
+            return None, std_min
 
     def _write_tap_plot(self, tap: ProbeEddy.TapResult):
         if not HAS_PLOTLY:
