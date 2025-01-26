@@ -1220,7 +1220,7 @@ class ProbeEddy:
         do_retract = gcmd.get_int('RETRACT', 1) == 1
         samples = gcmd.get_int('SAMPLES', self.params.tap_samples, minval=1)
         max_samples = gcmd.get_int('MAX_SAMPLES', self.params.tap_max_samples, minval=samples)
-        samples_stddev = gcmd.get_float('SAMPLE_STDDEV', self.params.tap_samples_stddev, above=0.0)
+        samples_stddev = gcmd.get_float('SAMPLES_STDDEV', self.params.tap_samples_stddev, above=0.0)
 
         mode = gcmd.get('MODE', self.params.tap_mode).lower()
         if mode not in ('wma', 'butter'):
