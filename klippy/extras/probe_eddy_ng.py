@@ -1368,9 +1368,9 @@ class ProbeEddy:
                 tap_z = mean
 
         if std_min <= req_stddev:
-            return tap_z, std_min
+            return float(tap_z), float(std_min)
         else:
-            return None, std_min
+            return None, float(std_min)
 
     def _write_tap_plot(self, tap: ProbeEddy.TapResult):
         if not HAS_PLOTLY:
