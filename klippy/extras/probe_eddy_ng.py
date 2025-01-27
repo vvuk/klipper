@@ -1627,6 +1627,7 @@ class ProbeEddy:
         tap_z = None
         tap_stddev = None
         sample_err_count = 0
+        tap = None
 
         try:
             self._sensor.set_drive_current(tap_drive_current)
