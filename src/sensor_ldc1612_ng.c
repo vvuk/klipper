@@ -18,19 +18,23 @@
 #include "sensor_bulk.h" // sensor_bulk_report
 #include "trsync.h" // trsync_do_trigger
 
+#if !defined(LDC_DEBUG)
+#define LDC_DEBUG 0
+#endif
+
 #if CONFIG_MACH_STM32F0
 // For Cartographer
 #include "board/internal.h"
 #include "board/gpio.h"
 #define SUPPORT_CARTOGRAPHER 1
 // not enough flash for printf
+#undef LDC_DEBUG
 #define LDC_DEBUG 0
 #else
 #define SUPPORT_CARTOGRAPHER 0
-#define LDC_DEBUG 1
 #endif
 
-#if defined(LDC_DEBUG) && LDC_DEBUG > 0
+#if LDC_DEBUG > 0
 #include "printf.h"
 void dprint(const char *fmt, ...);
 #else

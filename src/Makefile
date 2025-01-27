@@ -3,6 +3,7 @@
 src-y += sched.c command.c basecmd.c debugcmds.c
 ifneq ($(CONFIG_HAVE_LIMITED_CODE_SIZE), y)
 src-y += printf.c
+CFLAGS += -DLDC_DEBUG=1
 endif
 src-$(CONFIG_HAVE_GPIO) += initial_pins.c gpiocmds.c endstop.c trsync.c
 src-$(CONFIG_HAVE_GPIO) += stepper.c
