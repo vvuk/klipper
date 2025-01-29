@@ -40,6 +40,7 @@ CFLAGS := -iquote $(OUT) -iquote src -iquote $(OUT)board-generic/ \
 		-Wold-style-definition $(call cc-option,$(CC),-Wtype-limits,) \
     -ffunction-sections -fdata-sections -fno-delete-null-pointer-checks
 CFLAGS += -flto=auto -fwhole-program -fno-use-linker-plugin -ggdb3
+CFLAGS += $(EXTRA_CFLAGS)
 
 OBJS_klipper.elf = $(patsubst %.c, $(OUT)src/%.o,$(src-y))
 OBJS_klipper.elf += $(OUT)compile_time_request.o
