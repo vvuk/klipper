@@ -180,7 +180,7 @@ class ProbeEddyParams:
     tap_target_z: float = -0.250
     # the tap mode to use. 'wma' is a derivative of weighted moving average,
     # 'butter' is a butterworth filter
-    tap_mode: str = "wma"
+    tap_mode: str = "butter"
     # The threshold at which to detect a tap. This value is raw sensor value
     # specific. A good value can be obtained by running [....] and examining
     # the graph. See [calibration docs coming soon].
@@ -243,6 +243,13 @@ class ProbeEddyParams:
         except:
             raise configerror(f"Can't parse '{s}' as list of floats")
 
+    def is_default_butter_config(self):
+        return (
+            self.tap_butter_lowcut == 5.0
+            and self.tap_butter_highcut == 25.0
+            and self.tap_butter_order == 2
+        )
+
     def load_from_config(self, config: ConfigWrapper):
         bool_choices = {
             "true": True,
@@ -294,7 +301,7 @@ class ProbeEddyParams:
         )
 
         self.tap_mode = config.getchoice(
-            "tap_mode", mode_choices, default="wma"
+            "tap_mode", mode_choices, self.tap_mode
         )
         default_tap_threshold = 1000.0  # for wma
         if self.tap_mode == "butter":
@@ -350,9 +357,14 @@ class ProbeEddyParams:
             raise config.get_printer().config_error(
                 "ProbeEddy: x_offset and y_offset are both 0.0; is the sensor really mounted at the nozzle?"
             )
-        if self.tap_mode == "butter" and not HAS_SCIPY:
+
+        need_scipy = False
+        if self.tap_mode == "butter" and not self.is_default_butter_config():
+            need_scipy = True
+
+        if need_scipy and not HAS_SCIPY:
             raise config.get_printer().config_error(
-                "ProbeEddy: butter mode requires scipy, which is not available; please install scipy or use wma mode"
+                "ProbeEddy: butter mode with custom filter parameters requires scipy, which is not available; please install scipy, use the defaults, or use wma mode"
             )
 
 
@@ -1611,17 +1623,66 @@ class ProbeEddy:
 
         tapcfg = ProbeEddy.TapConfig(mode=mode, threshold=tap_threshold)
         if mode == "butter":
-            lowcut = self.params.tap_butter_lowcut
-            highcut = self.params.tap_butter_highcut
-            order = self.params.tap_butter_order
-            sos = signal.butter(
-                order,
-                [lowcut, highcut],
-                btype="bandpass",
-                fs=self._sensor._data_rate,
-                output="sos",
-            )
-            tapcfg.sos = [s.tolist() for s in sos]
+            if (
+                self.params.is_default_butter_config()
+                and self._sensor._data_rate == 250
+            ):
+                sos = [
+                    [
+                        0.046131802093312926,
+                        0.09226360418662585,
+                        0.046131802093312926,
+                        1.0,
+                        -1.3297767184682712,
+                        0.5693902189294331,
+                    ],
+                    [
+                        1.0,
+                        -2.0,
+                        1.0,
+                        1.0,
+                        -1.845000600983779,
+                        0.8637525213328747,
+                    ],
+                ]
+            elif (
+                self.params.is_default_butter_config()
+                and self._sensor._data_rate == 500
+            ):
+                sos = [
+                    [
+                        0.013359200027856505,
+                        0.02671840005571301,
+                        0.013359200027856505,
+                        1.0,
+                        -1.686278256753083,
+                        0.753714473246724,
+                    ],
+                    [
+                        1.0,
+                        -2.0,
+                        1.0,
+                        1.0,
+                        -1.9250515947328444,
+                        0.9299234737648037,
+                    ],
+                ]
+            elif HAS_SCIPY:
+                sos = signal.butter(
+                    self.params.tap_butter_order,
+                    [
+                        self.params.tap_butter_lowcut,
+                        self.params.tap_butter_highcut,
+                    ],
+                    btype="bandpass",
+                    fs=self._sensor._data_rate,
+                    output="sos",
+                ).tolist()
+            else:
+                raise self._printer.command_error(
+                    "Scipy is not available, cannot use custom filter, or data rate is not 250 or 500"
+                )
+            tapcfg.sos = sos
 
         results = []
         tap_z = None
