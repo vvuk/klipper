@@ -1259,8 +1259,14 @@ class ProbeEddy:
         if not r.valid:
             raise self._printer.command_error("Probe captured no samples!")
 
+        # At what Z position would the toolhead be at for the probe to read
+        # _home_trigger_height? In other words, if the probe tells us
+        # the height is 1.5 when the toolhead is at z=2.0, if the toolhead
+        # was moved up to 2.5, then the probe should read 2.0.
+        probe_z = z + (z - r.value)
+
         # is this supposed to return xyze or xyz?
-        return [th_pos[0], th_pos[1], r.value, th_pos[3]]
+        return [th_pos[0], th_pos[1], probe_z, th_pos[3]]
 
     #
     # Moving the sensor to the correct position
