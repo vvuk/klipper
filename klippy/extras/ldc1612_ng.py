@@ -39,10 +39,11 @@ REG_DRIVE_CURRENT0 = 0x1E
 REG_MANUFACTURER_ID = 0x7E
 REG_DEVICE_ID = 0x7F
 
-# Device product
+# Device product (match sensor_ldc1612_ng.c)
 PRODUCT_UNKNOWN = 0
 PRODUCT_BTT_EDDY = 1
 PRODUCT_CARTOGRAPHER = 2
+PRODUCT_MELLOW_FLY = 3
 
 HOME_MODE_NONE = 0
 HOME_MODE_HOME = 1
@@ -75,6 +76,7 @@ class LDC1612_ng:
             "ldc1612": PRODUCT_UNKNOWN,
             "btt_eddy": PRODUCT_BTT_EDDY,
             "cartographer": PRODUCT_CARTOGRAPHER,
+            "mellow_fly": PRODUCT_MELLOW_FLY,
         }
         self._device_product = config.getchoice(
             "sensor_type", device_choices, PRODUCT_UNKNOWN
@@ -88,6 +90,12 @@ class LDC1612_ng:
             self._ldc_fref_divider = 1
             self._ldc_settle_time = 0.0001706
             self._drive_current = 26
+        elif self._device_product == PRODUCT_MELLOW_FLY:
+            self._ldc_freq_clk = 40_000_000
+            self._ldc_fin_divider = 1
+            self._ldc_fref_divider = 1
+            self._ldc_settle_time = 0.00125
+            self._drive_current = 15
         else:  # Generic/BTT Eddy using external 12MHz clock source
             # TODO add a generic setup that usees internal ldc1612 clock
             self._ldc_freq_clk = 12_000_000
@@ -105,6 +113,7 @@ class LDC1612_ng:
         self._data_rate: int = config.getint(
             "samples_per_second", 250, minval=50
         )
+        self._ldc_settle_time = min(self._ldc_settle_time, 1.0 / self._data_rate)
 
         # Setup mcu sensor_ldc1612 bulk query code
         self._i2c = bus.MCU_I2C_from_config(

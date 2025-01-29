@@ -27,9 +27,6 @@
 #include "board/internal.h"
 #include "board/gpio.h"
 #define SUPPORT_CARTOGRAPHER 1
-// not enough flash for printf
-#undef LDC_DEBUG
-#define LDC_DEBUG 0
 #else
 #define SUPPORT_CARTOGRAPHER 0
 #endif
@@ -67,6 +64,7 @@ enum {
 #define PRODUCT_UNKNOWN 0
 #define PRODUCT_BTT_EDDY 1
 #define PRODUCT_CARTOGRAPHER 2
+#define PRODUCT_MELLOW_FLY 3
 
 // Chip registers
 #define REG_DATA0_MSB 0x00
@@ -321,6 +319,9 @@ config_ldc1612_ng(uint32_t oid, uint32_t i2c_oid, uint8_t product, int32_t intb_
     case PRODUCT_UNKNOWN:
     case PRODUCT_BTT_EDDY:
         ld->sensor_cvt = 12000000.0f / (float)(1<<28);
+        break;
+    case PRODUCT_MELLOW_FLY:
+        ld->sensor_cvt = 40000000.0f / (float)(1<<28);
         break;
 #if SUPPORT_CARTOGRAPHER
     case PRODUCT_CARTOGRAPHER:
