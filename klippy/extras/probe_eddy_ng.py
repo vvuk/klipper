@@ -141,11 +141,10 @@ class ProbeEddyParams:
     # that are above the safe position before it's crossed, to ensure that homing
     # doesn't begin with the toolhead too low.
     home_trigger_safe_time_offset: float = 0.100
-    # The maximum z value to calibrate from. 5.0 is fine as a default,  calibrating
-    # at higher values is not needed. You may need to lower  this value while
-    # calibrating a separate tap drive current, but do that directly in the
-    # CALIBRATE command by passing a Z_MAX parameter.
-    calibration_z_max: float = 5.0
+    # The maximum z value to calibrate from. 15.0 is fine as a default, calibrating
+    # at higher values is not needed. Calibration will start with the first
+    # valid height.
+    calibration_z_max: float = 15.0
     # The "drive current" for the LDC1612 sensor. This value is typically
     # sensor specific and depends on the coil design and the operating distance.
     # A good starting value for BTT Eddy is 15. A good value can be obtained
@@ -159,7 +158,7 @@ class ProbeEddyParams:
     # Note that the sensor needs to be calibrated for both drive currents separately.
     # Pass the DRIVE_CURRENT argument to EDDY_NG_CALIBRATE.
     tap_drive_current: int = 0
-    # The Z position at which to start a tap-home operation. This height will
+    # The Z position at which to start a tap-home operation. This height may
     # need to be fine-tuned to ensure that the sensor can provide readings across the
     # entire tap range (i.e. from this value down to tap_target_z), which in turn
     # will depend on the tap_drive_current. When the tap_drive_current is
@@ -171,7 +170,7 @@ class ProbeEddyParams:
     # to the toolhead. The actual sensor coil is mounted higher -- but must be placed
     # between 2.5 and 3mm above the nozzle, ideally around 2.75mm. If there are
     # amplitude errors, try raising or lowering the sensor coil slightly.
-    tap_start_z: float = 3.2
+    tap_start_z: float = 3.0
     # The target Z position for a tap operation. This is the lowest position that
     # the toolhead may travel to in case of a failed tap. Do not set this very low,
     # as it will cause your toolhead to try to push through your build plate in
@@ -194,7 +193,8 @@ class ProbeEddyParams:
     # find a good value.
     #
     # You may also need to use different thresholds for different build plates.
-    tap_threshold: int = 1000
+    # Note that the default value of this threshold depends on the tap_mode.
+    tap_threshold: float = 250.
     # The speed at which a tap operation should be performed at. This shouldn't
     # be much slower than 3.0, but you can experiment with lower or higher values.
     # Don't go too high though, because Klipper needs some small amount of time
@@ -415,6 +415,7 @@ class ProbeEddy:
             "ldc1612": ldc1612_ng.LDC1612_ng,
             "btt_eddy": ldc1612_ng.LDC1612_ng,
             "cartographer": ldc1612_ng.LDC1612_ng,
+            "mellow_fly": ldc1612_ng.LDC1612_ng,
         }
         sensor_type = config.getchoice("sensor_type", {s: s for s in sensors})
 
@@ -620,7 +621,6 @@ class ProbeEddy:
             .get_kinematics()
             .get_status(curtime_r)
         )
-        logging.info(f"homed_axes: {kin_status['homed_axes']}")
         return "z" in kin_status["homed_axes"]
 
     def _xy_homed(self):
@@ -743,7 +743,7 @@ class ProbeEddy:
         # How long to read at each sample time
         duration: float = gcmd.get_float("DURATION", 0.100, above=0.0)
         # whether to check +/- 1mm positions for accuracy
-        start_z: float = gcmd.get_float("Z", self.params.home_trigger_height)
+        start_z: float = gcmd.get_float("Z", 5.0)
         offsets = gcmd.get("OFFSETS", None)
 
         probe_speed = gcmd.get_float(
@@ -757,6 +757,8 @@ class ProbeEddy:
 
         if offsets is not None:
             probe_zs.extend([float(v) + start_z for v in offsets.split(",")])
+        else:
+            probe_zs.extend(np.arange(0.5, start_z, 0.5).tolist())
 
         probe_zs.sort()
         probe_zs.reverse()
@@ -775,15 +777,12 @@ class ProbeEddy:
         try:
             self._sensor.set_drive_current(drive_current)
             th = self._printer.lookup_object("toolhead")
-            th_pos = th.get_position()
 
-            if th_pos[2] != probe_zs[0]:
-                th.manual_move(
-                    [None, None, probe_zs[0] + self.params.backlash_comp],
-                    lift_speed,
-                )
-                th.wait_moves()
-                th_pos = th.get_position()
+            th.manual_move(
+                [None, None, probe_zs[0] + 1.0],
+                lift_speed,
+            )
+            th.wait_moves()
 
             results = []
             ranges = []
@@ -803,7 +802,7 @@ class ProbeEddy:
                     [(s - result.value) ** 2.0 for s in result.samples]
                 )
 
-                gcmd.respond_info("Probe at z={pz:.3f} is {result:v}")
+                self._log_info(f"Probe at z={pz:.3f} is {result}")
 
                 stddev_sums.append(stddev_sum)
                 stddev_count += len(result.samples)
