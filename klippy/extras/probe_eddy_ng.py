@@ -1548,7 +1548,7 @@ class ProbeEddy:
 
     def _compute_butter_tap(self, samples, raw_samples):
         if not HAS_SCIPY:
-            return None, None, None, None
+            return None, None
 
         trigger_freq = self.height_to_freq(self.params.home_trigger_height)
 
