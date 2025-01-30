@@ -1288,7 +1288,9 @@ class ProbeEddy:
         zlim = th_kin.limits[2]
         rail_range = th_kin.rails[2].get_range()
         logging.info(
-            f"EDDYng probe to start unhomed: before movement: Z pos {th_pos[2]:.3f}, Z limits {zlim[0]:.2f}-{zlim[1]:.2f}, rail range {rail_range[0]:.2f}-{rail_range[1]:.2f}"
+            f"EDDYng probe to start unhomed: before movement: Z pos {th_pos[2]:.3f}, "
+            f"Z limits {zlim[0]:.2f}-{zlim[1]:.2f}, "
+            f"rail range {rail_range[0]:.2f}-{rail_range[1]:.2f}"
         )
 
         start_height_ok_factor = 0.100
@@ -1302,7 +1304,8 @@ class ProbeEddy:
         if now_height is None:
             raise self._printer.command_error(
                 "Couldn't get any valid samples from sensor. "
-                + "If the toolhead is high off the build plate, this usually indicates a bad reg_drive_current."
+                "If the toolhead is high off the build plate, this usually "
+                "indicates a bad reg_drive_current."
             )
 
         logging.info(
@@ -1353,7 +1356,8 @@ class ProbeEddy:
             zlim = th_kin.limits[2]
             rail_range = th_kin.rails[2].get_range()
             logging.info(
-                f"EDDYng: after reset: Z pos {n_pos[2]:.3f}, Z limits {zlim[0]:.2f}-{zlim[1]:.2f}, rail range {rail_range[0]:.2f}-{rail_range[1]:.2f}"
+                f"EDDYng: after reset: Z pos {n_pos[2]:.3f}, Z limits {zlim[0]:.2f}-{zlim[1]:.2f}, "
+                f"rail range {rail_range[0]:.2f}-{rail_range[1]:.2f}"
             )
 
             th_pos[2] += move_up_by
