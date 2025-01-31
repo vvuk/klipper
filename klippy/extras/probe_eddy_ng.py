@@ -124,10 +124,6 @@ class ProbeEddyParams:
     lift_speed: float = 10.0
     # The speed at which to move in the xy plane (typically only for calibration)
     move_speed: float = 50.0
-    # Backlash compensation -- if we need to move the toolhead above the
-    # current position, how much to add to the movement before coming back
-    # down to the requested position
-    backlash_comp: float = 0.0
     # The height at which the virtual endstop should trigger. A value
     # between 1.0 and 3.0 is recommended, with 2.0 or 2.5 being good
     # choices.
@@ -270,9 +266,6 @@ class ProbeEddyParams:
         )
         self.move_speed = config.getfloat(
             "move_speed", self.move_speed, above=0.0
-        )
-        self.backlash_comp = config.getfloat(
-            "backlash_comp", self.backlash_comp
         )
         self.home_trigger_height = config.getfloat(
             "home_trigger_height", self.home_trigger_height, above=0.0
