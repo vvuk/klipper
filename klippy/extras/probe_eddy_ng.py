@@ -26,6 +26,8 @@ from typing import (
 )
 
 try:
+    import plotly as plt
+
     HAS_PLOTLY = True
 except:
     HAS_PLOTLY = False
