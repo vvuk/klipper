@@ -26,18 +26,17 @@ from typing import (
 )
 
 try:
-    import plotly as plt
+    import plotly
 
     HAS_PLOTLY = True
 except:
     HAS_PLOTLY = False
 
 try:
-    import scipy.signal as signal
+    import scipy
 
     HAS_SCIPY = True
-except Exception as e:
-    logging.info(f"EDDYng: no scipy: {e}")
+except:
     HAS_SCIPY = False
 
 from configfile import ConfigWrapper
@@ -196,7 +195,7 @@ class ProbeEddyParams:
     #
     # You may also need to use different thresholds for different build plates.
     # Note that the default value of this threshold depends on the tap_mode.
-    tap_threshold: float = 250.
+    tap_threshold: float = 250.0
     # The speed at which a tap operation should be performed at. This shouldn't
     # be much slower than 3.0, but you can experiment with lower or higher values.
     # Don't go too high though, because Klipper needs some small amount of time
@@ -501,6 +500,10 @@ class ProbeEddy:
         self._dummy_gcode_cmd = self._gcode.create_gcode_command("", "", {})
         self.define_commands(self._gcode)
 
+        self._printer.register_event_handler(
+            "gcode:command_error", self._handle_command_error
+        )
+
     def _log_error(self, msg):
         logging.error(f"{self._name}: {msg}")
         self._gcode.respond_raw(f"!! {msg}\n")
@@ -584,6 +587,15 @@ class ProbeEddy:
             self.cmd_TAP,
             self.cmd_TAP_help + " (alias for PROBE_EDDY_NG_TAP)",
         )
+
+    def _handle_command_error(self, gcmd=None):
+        try:
+            if self._sampler is not None:
+                self._sampler.finish()
+        except:
+            logging.exception(
+                "EDDYng handle_command_error: sampler.finish() failed"
+            )
 
     def current_drive_current(self) -> int:
         return self._sensor.get_drive_current()
@@ -1434,9 +1446,6 @@ class ProbeEddy:
         overshoot: float
         tap_start_time: float
         tap_end_time: float
-        # this is computed for filter just to draw the plot
-        butter_s_t: Optional[np.array] = None
-        butter_s_v: Optional[np.array] = None
 
     @dataclass
     class TapConfig:
@@ -1475,6 +1484,10 @@ class ProbeEddy:
                 probe_position = hmove.homing_move(
                     target_position, tap_speed, probe_pos=True
                 )
+                if hmove.check_no_movement() is not None:
+                    raise self._printer.command_error(
+                        "Probe triggered prior to movement"
+                    )
                 th_pos_z = th.get_position()[2]
             except self._printer.command_error as err:
                 if self._printer.is_shutdown():
@@ -1488,7 +1501,7 @@ class ProbeEddy:
                     th.manual_move([None, None, start_z], lift_speed)
 
                 # If just sensor errors, let the caller handle it
-                if "Sensor error" in str(err):
+                if "Sensor error" or "Probe completed movement" in str(err):
                     return ProbeEddy.TapResult(
                         error=err,
                         toolhead_z=th_pos_z,
@@ -1497,19 +1510,10 @@ class ProbeEddy:
                         tap_start_time=0.0,
                         tap_end_time=0.0,
                     )
-                elif "Probe completed movement before triggering" in str(err):
-                    # No tap was detected on the MCU. But maybe we'll still
-                    # figure something out afterwards with our filter magic.
-                    probe_position = [0.0, 0.0, 0.0, 0.0]
-                    error = err
                 else:
                     self._log_error(f"Tap failed at {th_pos_z:.3f}")
                     raise
 
-            if hmove.check_no_movement() is not None:
-                raise self._printer.command_error(
-                    "Probe triggered prior to movement"
-                )
         finally:
             self._endstop_wrapper.tap_config = None
 
@@ -1533,10 +1537,6 @@ class ProbeEddy:
         # the toolhead is pushing into the build plate.
         overshoot = probe_z - now_z
 
-        butter_s_t, butter_s_v = self._compute_butter_tap(
-            self._last_sampler_samples, self._last_sampler_raw_samples
-        )
-
         return ProbeEddy.TapResult(
             error=error,
             probe_z=probe_z,
@@ -1544,8 +1544,6 @@ class ProbeEddy:
             overshoot=overshoot,
             tap_start_time=self._endstop_wrapper.last_trigger_time,
             tap_end_time=self._endstop_wrapper.last_tap_end_time,
-            butter_s_t=butter_s_t,
-            butter_s_v=butter_s_v,
         )
 
     def _compute_butter_tap(self, samples, raw_samples):
@@ -1679,7 +1677,7 @@ class ProbeEddy:
                     ],
                 ]
             elif HAS_SCIPY:
-                sos = signal.butter(
+                sos = scipy.signal.butter(
                     self.params.tap_butter_order,
                     [
                         self.params.tap_butter_lowcut,
@@ -1866,6 +1864,15 @@ class ProbeEddy:
         tap_end_time = memos.get("tap_end_time", time_start) - time_start
         tap_threshold = memos.get("tap_threshold", 0)
 
+        # compute the butterworth filter, if we have scipy
+        if tap is not None and HAS_SCIPY:
+            butter_s_t, butter_s_v = self._compute_butter_tap(
+                samples, raw_samples
+            )
+            butter_s_t = butter_s_t - time_start
+        else:
+            butter_s_t = butter_s_v = None
+
         # Compute exactly (mostly) how the C code does it, so that the accum
         # values are identical
         FREQ_WINDOW_SIZE = 16
@@ -1931,6 +1938,24 @@ class ProbeEddy:
             c_wma_d_avgs[sample_i] = c_wma_d_avg
             c_tap_accums[sample_i] = c_tap_accum
 
+        butter_accum = None
+        if butter_s_v is not None:
+            # Note: we don't handle freq offset or
+            # start this at same point as the C code does
+            butter_accum = np.zeros(len(butter_s_v))
+            last_value = butter_s_v[0]
+            falling = False
+            accum_val = 0.0
+            for bi, bv in enumerate(butter_s_v):
+                if bv <= last_value:
+                    falling = True
+                    accum_val += last_value - bv
+                elif falling and bv > last_value:
+                    falling = False
+                    accum_val = 0.0
+                butter_accum[bi] = accum_val
+                last_value = bv
+
         import plotly.graph_objects as go
 
         fig = go.Figure()
@@ -1951,7 +1976,14 @@ class ProbeEddy:
             )
         )
         fig.add_trace(
-            go.Scatter(x=s_t, y=c_wmas, mode="lines", name="wma", yaxis="y2")
+            go.Scatter(
+                x=s_t,
+                y=c_wmas,
+                mode="lines",
+                name="wma",
+                yaxis="y2",
+                visible="legendonly",
+            )
         )
 
         # the derivative and deriv averages
@@ -1972,23 +2004,38 @@ class ProbeEddy:
                 mode="lines",
                 name="wma_d_avg",
                 yaxis="y3",
+                visible="legendonly",
             )
         )
         fig.add_trace(
             go.Scatter(
-                x=s_t, y=c_tap_accums, mode="lines", name="accum", yaxis="y3"
+                x=s_t,
+                y=c_tap_accums,
+                mode="lines",
+                name="wma_threshold",
+                yaxis="y3",
+                visible="legendonly",
             )
         )
 
         # the butter tap if we have the data
-        if tap is not None and tap.butter_s_t is not None:
+        if butter_s_t is not None:
             fig.add_trace(
                 go.Scatter(
-                    x=(tap.butter_s_t - time_start),
-                    y=tap.butter_s_v,
+                    x=butter_s_t,
+                    y=butter_s_v,
                     mode="lines",
                     name="butter",
                     yaxis="y4",
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=butter_s_t,
+                    y=butter_accum,
+                    mode="lines",
+                    name="butter_threshold",
+                    yaxis="y3",
                 )
             )
 
@@ -2033,7 +2080,7 @@ class ProbeEddy:
                 overlaying="y", title="Freq", tickformat="d", side="left"
             ),  # Freq + WMA
             yaxis3=dict(
-                overlaying="y", side="right", tickformat="d", position=0.5
+                overlaying="y", side="left", tickformat="d", position=0.2
             ),  # derivatives, tap accum
             yaxis4=dict(
                 overlaying="y", side="right", showticklabels=False
@@ -2213,7 +2260,7 @@ class ProbeEddyEndstopWrapper:
         self._reactor = eddy._printer.get_reactor()
 
         # these two are filled in by the outside.
-        self.tap_config = None
+        self.tap_config: Optional[ProbeEddy.TapConfig] = None
         # if not None, after a probe session is finished we'll
         # write all samples here
         self.save_samples_path: Optional[str] = None
