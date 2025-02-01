@@ -1555,14 +1555,14 @@ class ProbeEddy:
         highcut = self.params.tap_butter_highcut
         order = self.params.tap_butter_order
 
-        sos = signal.butter(
+        sos = scipy.signal.butter(
             order,
             [lowcut, highcut],
             btype="bandpass",
             fs=self._sensor._data_rate,
             output="sos",
         )
-        filtered = signal.sosfilt(sos, s_f - s_f[0])
+        filtered = scipy.signal.sosfilt(sos, s_f - s_f[0])
 
         return s_t, filtered
 
@@ -1957,13 +1957,35 @@ class ProbeEddy:
         fig.add_trace(go.Scatter(x=s_t, y=s_z, mode="lines", name="Z"))
         fig.add_trace(go.Scatter(x=s_t, y=s_kinz, mode="lines", name="KinZ"))
 
+        # the butter tap if we have the data
+        if butter_s_t is not None:
+            fig.add_trace(
+                go.Scatter(
+                    x=butter_s_t,
+                    y=butter_s_v,
+                    mode="lines",
+                    name="butter",
+                    yaxis="y4",
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=butter_s_t,
+                    y=butter_accum,
+                    mode="lines",
+                    line=dict(color="#626b73"),
+                    name="butter_threshold",
+                    yaxis="y3",
+                )
+            )
+
         # the frequency value from the sensor, and their WMA
         fig.add_trace(
             go.Scatter(
                 x=s_t,
                 y=s_true_f,
                 mode="lines",
-                name="Freq",
+                name="Frea",
                 yaxis="y2",
                 visible="legendonly",
             )
@@ -2010,27 +2032,6 @@ class ProbeEddy:
                 visible="legendonly",
             )
         )
-
-        # the butter tap if we have the data
-        if butter_s_t is not None:
-            fig.add_trace(
-                go.Scatter(
-                    x=butter_s_t,
-                    y=butter_s_v,
-                    mode="lines",
-                    name="butter",
-                    yaxis="y4",
-                )
-            )
-            fig.add_trace(
-                go.Scatter(
-                    x=butter_s_t,
-                    y=butter_accum,
-                    mode="lines",
-                    name="butter_threshold",
-                    yaxis="y3",
-                )
-            )
 
         if trigger_time > 0:
             fig.add_shape(
