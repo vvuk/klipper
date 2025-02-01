@@ -424,6 +424,8 @@ class ProbeEddy:
         self._mcu = self._sensor.get_mcu()
 
         self.params = ProbeEddyParams()
+        # init this to the default from the sensor before loading config
+        self.params.reg_drive_current = self._sensor._drive_current
         self.params.load_from_config(config)
 
         # at what minimum physical height to start homing. It must be above the safe start position,
