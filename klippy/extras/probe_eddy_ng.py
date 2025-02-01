@@ -983,38 +983,32 @@ class ProbeEddy:
                 "X and Y must be homed before calibrating"
             )
 
-        was_homed = self._z_homed()
-        if was_homed:
+        if self._z_homed():
             # z-hop so that manual probe helper doesn't complain if we're already
             # at the right place
             self._z_hop()
-        else:
-            logging.info("Z not homed, forcing position before calibration")
-            # Z is probably not homed. So we'll set up a useful position so that
-            # ManualProbeHelper can work
-            th = self._printer.lookup_object("toolhead")
-            th_pos = th.get_position()
-            # This is proably not correct for some printers
-            zrange = th.get_kinematics().rails[2].get_range()
-            th_pos[2] = zrange[1] - 20.0
-            th.set_position(th_pos, [2])
+
+        # Now reset the axis so that we have a full range to calibrate withj
+        th = self._printer.lookup_object("toolhead")
+        th_pos = th.get_position()
+        # XXX This is proably not correct for some printers?
+        zrange = th.get_kinematics().rails[2].get_range()
+        th_pos[2] = zrange[1] - 20.0
+        th.set_position(th_pos, [2])
 
         manual_probe.ManualProbeHelper(
             self._printer,
             gcmd,
-            lambda kin_pos: self.cmd_CALIBRATE_next(gcmd, kin_pos, was_homed),
+            lambda kin_pos: self.cmd_CALIBRATE_next(gcmd, kin_pos),
         )
 
     def cmd_CALIBRATE_next(
-        self, gcmd: GCodeCommand, kin_pos: List[float], was_homed: bool
+        self, gcmd: GCodeCommand, kin_pos: List[float]
     ):
         th = self._printer.lookup_object("toolhead")
         if kin_pos is None:
-            if not was_homed and hasattr(
-                th.get_kinematics(), "note_z_not_homed"
-            ):
-                th.get_kinematics().note_z_not_homed()
             # User cancelled ManualProbeHelper
+            self._z_not_homed()
             return
 
         old_drive_current = self.current_drive_current()
@@ -1059,8 +1053,18 @@ class ProbeEddy:
         self._dc_to_fmap[drive_current] = mapping
         self.save_config()
 
-        if not was_homed and hasattr(th.get_kinematics(), "note_z_not_homed"):
-            th.get_kinematics().note_z_not_homed()
+        # reset the Z homing state after alibration
+        self._z_not_homed()
+
+    def _z_not_homed(self):
+        th = self._printer.lookup_object("toolhead")
+        kin = th.get_kinematics()
+        if hasattr(kin, "note_z_not_homed"):
+            kin.note_z_not_homed()
+        else:
+            # note: there was a brief period where the args to this were not
+            # strings but were axis numbers
+            kin.clear_homing_state("z")
 
     def _create_mapping(
         self,
