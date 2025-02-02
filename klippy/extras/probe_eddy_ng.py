@@ -391,9 +391,14 @@ class ProbeEddyProbeResult:
     def __format__(self, spec):
         if spec == "v":
             return f"{self.value:.3f}"
-        mean_star = "*" if self.USE_MEAN_FOR_VALUE else ""
-        median_star = "*" if not self.USE_MEAN_FOR_VALUE else ""
-        return f"mean{mean_star}={self.mean:.3f}, median{median_star}={self.median:.3f}, range={self.min_value:.3f} to {self.max_value:.3f}, stddev={self.stddev:.3f}"
+        if self.USE_MEAN_FOR_VALUE:
+            value = f"{self.mean:.3f}"
+            extra = f"med={self.median:.3f}"
+        else:
+            value = f"{self.median:.3f}"
+            extra = f"avg={self.mean:.3f}"
+
+        return f"{value} ({extra}, {self.min_value:.3f} to {self.max_value:.3f}, [{self.stddev:.3f}])"
 
 
 @final
@@ -824,11 +829,17 @@ class ProbeEddy:
                 avg_from_z = np.mean(from_zs)
                 stddev = (np.sum(stddev_sums) / stddev_count) ** 0.5
                 gcmd.respond_info(
-                    "Probe overall avg range: {avg_range:.3f}, avg z deviation: {avg_from_z:.3f}, stddev: {stddev:.3f}"
+                    f"Probe spread: {avg_range:.3f}, "
+                    f"z deviation: {avg_from_z:.3f}, "
+                    f"stddev: {stddev:.3f}"
                 )
 
         finally:
             self._sensor.set_drive_current(old_drive_current)
+            th.manual_move(
+                [None, None, start_z],
+                lift_speed,
+            )
 
     cmd_CLEAR_CALIBRATION_help = "Clear calibration for all drive currents"
 
