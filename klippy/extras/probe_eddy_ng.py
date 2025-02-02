@@ -2850,6 +2850,10 @@ class ProbeEddySampler:
 
         # average the heights of the samples in the range
         heights = [h for _, _, h in self._samples[start_idx:end_idx]]
+        if len(heights) == 0:
+            raise self._printer.command_error(
+                f"no samples between time {start_time:.1f} and {end_time:.1f}!"
+            )
         hmin, hmax = np.min(heights), np.max(heights)
         mean = np.mean(heights)
         median = np.median(heights)
