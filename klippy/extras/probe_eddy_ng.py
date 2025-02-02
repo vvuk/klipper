@@ -228,6 +228,8 @@ class ProbeEddyParams:
     y_offset: float = 0.0
     # remove some safety checks, largely for testing/development
     allow_unsafe: bool = False
+    # whether to write the tap plot after each tap
+    write_tap_plot: bool = True
 
     tap_trigger_safe_start_height: float = 1.5
 
@@ -329,6 +331,9 @@ class ProbeEddyParams:
 
         self.allow_unsafe = config.getchoice(
             "allow_unsafe", bool_choices, default="False"
+        )
+        self.write_tap_plot = config.getchoice(
+            "write_tap_plot", bool_choices, default="True"
         )
         self.x_offset = config.getfloat("x_offset", self.x_offset)
         self.y_offset = config.getfloat("y_offset", self.y_offset)
@@ -1756,7 +1761,8 @@ class ProbeEddy:
         finally:
             self._sensor.set_drive_current(self.params.reg_drive_current)
             # This only writes the plot for the very last tap
-            self._write_tap_plot(tap)
+            if self.params.write_tap_plot:
+                self._write_tap_plot(tap)
 
         # If we didn't compute a tap_z report the error
         if tap_z is None:
@@ -2719,7 +2725,6 @@ class ProbeEddySampler:
     ) -> bool:
         def report_no_samples():
             if raise_error:
-                log_traceback(5)
                 raise self._printer.command_error(
                     f"No samples received for time {sample_print_time:.3f} (waited for {max_wait_time:.3f})"
                 )
@@ -2745,12 +2750,9 @@ class ProbeEddySampler:
         # this is just a sanity check, there's no reason to ever wait this long
         if max_wait_time > 5.0:
             traceback.print_stack()
-            logging.info(
-                f"ProbeEddyFrequencySampler: max_wait_time {max_wait_time:.3f} is too far into the future"
-            )
-            raise self._printer.command_error(
-                f"ProbeEddyFrequencySampler: max_wait_time {max_wait_time:.3f} is too far into the future"
-            )
+            msg = f"ProbeEddyFrequencySampler: max_wait_time {max_wait_time:.3f} is too far into the future"
+            logging.info(msg)
+            raise self._printer.command_error(msg)
 
         if self._trace:
             logging.info(
@@ -3173,26 +3175,9 @@ def np_rolling_mean(data, window, center=True):
     return result
 
 
-def np_wma(series, window_size):
-    weights = np.arange(1, window_size + 1)
-    weight_sum = weights.sum()
-    wma = []
-    for i in range(len(series)):
-        if i < window_size:
-            wma.append(np.nan)  # Not enough data for WMA
-        else:
-            window = series[i - window_size : i]
-            wma.append(np.dot(window, weights) / weight_sum)
-    return wma
-
-
 def np_rmse(p, x, y):
     y_hat = p(x)
     return np.sqrt(np.mean((y - y_hat) ** 2))
-
-
-def log_traceback(limit=100):
-    pass
 
 
 def load_config_prefix(config: ConfigWrapper):
