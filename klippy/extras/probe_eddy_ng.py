@@ -1293,8 +1293,7 @@ class ProbeEddy:
         # was moved up to 2.5, then the probe should read 2.0.
         probe_z = z + (z - r.value)
 
-        # is this supposed to return xyze or xyz?
-        return [th_pos[0], th_pos[1], probe_z, th_pos[3]]
+        return [th_pos[0], th_pos[1], probe_z]
 
     #
     # Moving the sensor to the correct position
@@ -2249,7 +2248,7 @@ class ProbeEddyScanningProbe:
             th_pos[2] = float(self._scan_z + z_deviation)
             # toolhead_pos[2] = height
 
-            results.append(th_pos)
+            results.append([th_pos[0], th_pos[1], th_pos[2]])
 
         # reset notes so that this session can continue to be used
         self._notes = []
