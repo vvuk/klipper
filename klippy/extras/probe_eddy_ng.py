@@ -678,7 +678,7 @@ class ProbeEddy:
 
     def start_sampler(self, *args, **kwargs) -> ProbeEddySampler:
         if self._sampler:
-            raise self._printer.command_error("EDDYng Already sampling")
+            raise self._printer.command_error("EDDYng: Already sampling! (This shouldn't happen; FIRMWARE_RESTART to fix)")
         self._sampler = ProbeEddySampler(self, *args, **kwargs)
         self._sampler.start()
         return self._sampler
