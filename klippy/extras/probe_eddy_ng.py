@@ -1114,7 +1114,7 @@ class ProbeEddy:
         start_drive_current = drive_current
         result_msg = None
 
-        self._log_info("eddy-ng setup: calibrating homing")
+        self._log_info("EDDYng setup: calibrating homing")
         state = FINDING_HOMING
         while state < DONE:
             mapping, fth_fit, htf_fit = self._create_mapping(
@@ -1161,11 +1161,11 @@ class ProbeEddy:
             self._dc_to_fmap[drive_current] = mapping
             if state == FINDING_HOMING and ok_for_homing:
                 self.params.reg_drive_current = drive_current
-                self._log_info(f"Using {drive_current} for homing.")
+                self._log_info(f"EDDYng using {drive_current} for homing.")
                 state = FINDING_TAP
             if state == FINDING_TAP and ok_for_tap:
                 self.params.tap_drive_current = drive_current
-                self._log_info(f"Using {drive_current} for tap.")
+                self._log_info(f"EDDYng using {drive_current} for tap.")
                 state = DONE
 
             result_msg = "Eddy-ng setup success. Please check homing then check tap."
@@ -1689,6 +1689,19 @@ class ProbeEddy:
                     )
 
                 th_pos_z = th.get_position()[2]
+
+                if probe_position - target_z < 0.050:
+                    # we detected a tap but it was too close to our target z
+                    # to be trusted
+                    return ProbeEddy.TapResult(
+                        error=Exception("Tap detected too close to target z"),
+                        toolhead_z=th_pos_z,
+                        probe_z=probe_position,
+                        overshoot=0.0,
+                        tap_start_time=0.0,
+                        tap_end_time=0.0,
+                    )
+
             except self._printer.command_error as err:
                 if self._printer.is_shutdown():
                     raise self._printer.command_error(
@@ -1919,7 +1932,10 @@ class ProbeEddy:
                 sample_i += 1
 
                 if tap.error:
-                    self._log_info(f"Tap {sample_i}: failed")
+                    if "too close to target z" in str(tap.error):
+                        self._log_info(f"Tap {sample_i}: failed: try lowering TARGET_Z by 0.100 (to {target_z-0.100:.3f})")
+                    else:
+                        self._log_info(f"Tap {sample_i}: failed ({tap.error})")
                     sample_err_count += 1
                     sample_last_err = tap
                     continue
