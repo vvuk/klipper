@@ -672,11 +672,15 @@ class ProbeEddy:
         # klipper changed homing_axes to be a "xyz" string instead
         # of a tuple randomly on jan10 without support for the old
         # syntax
-        try:
-            self._toolhead.set_position(pos, homing_axes)
-        except TypeError: # "must be str, not int"
+        func = self._toolhead.set_position
+        kind = type(func.__defaults__[0])
+        if kind is str:
+            # new
             homing_axes_str = "".join(["xyz"[axis] for axis in homing_axes])
-            self._toolhead.set_position(pos, homing_axes_str)
+            return self._toolhead.set_position(pos, homing_axes=homing_axes_str)
+        else:
+            # old
+            return self._toolhead.set_position(pos, homing_axes=homing_axes)
 
     def _z_not_homed(self):
         kin = self._toolhead.get_kinematics()
