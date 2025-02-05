@@ -7,4 +7,5 @@
 
 _eddy-ng_ is an attempt at improving Eddy current probe support in Klipper.
 
-# [The full documentation has moved here.](https://hackmd.io/yEF4CEntSHiFTj230CdD0Q)
+# Please use the [standalone repository for installation](https://github.com/vvuk/eddy-ng)!
+# Documentation is linked there as well.
