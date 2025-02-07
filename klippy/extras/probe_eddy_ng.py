@@ -233,6 +233,9 @@ class ProbeEddyParams:
 
     tap_trigger_safe_start_height: float = 1.5
 
+    _config_reg_drive_current: int = 0
+    _config_tap_drive_current: int = 0
+
     @staticmethod
     def str_to_floatlist(s):
         if s is None:
@@ -280,12 +283,35 @@ class ProbeEddyParams:
         self.calibration_z_max = config.getfloat(
             "calibration_z_max", self.calibration_z_max, above=0.0
         )
-        self.reg_drive_current = config.getint(
-            "reg_drive_current", self.reg_drive_current, minval=0, maxval=31
-        )
-        self.tap_drive_current = config.getint(
-            "tap_drive_current", 0, minval=0, maxval=31
-        )  # 0 is a sentinel to be the same as reg
+
+        # "saved_" is the values that save_config will write
+        saved_reg_drive_current = config.getint("saved_reg_drive_current", 0)
+        saved_tap_drive_current = config.getint("saved_tap_drive_current", 0)
+        reg_drive_current = self._config_reg_drive_current = config.getint("reg_drive_current", 0, minval=0, maxval=31)
+        tap_drive_current = self._config_tap_drive_current = config.getint("tap_drive_current", 0, minval=0, maxval=31)
+
+        if saved_reg_drive_current != 0 and reg_drive_current != 0 and reg_drive_current != saved_reg_drive_current:
+            printer = config.get_printer()
+            printer.lookup_object('gcode').respond_raw(f"!! probe_eddy_ng has reg_drive_current specified in config and in saved variables. Config value ({reg_drive_current}) is taking precedence. Remove one of these to remote this warning.\n")
+
+        if saved_tap_drive_current != 0 and tap_drive_current != 0 and tap_drive_current != saved_tap_drive_current:
+            printer = config.get_printer()
+            printer.lookup_object('gcode').respond_raw(f"!! probe_eddy_ng has tap_drive_current specified in config and in saved variables. Config value ({tap_drive_current}) is taking precedence. Remove one of these to remote this warning.\n")
+
+        if reg_drive_current != 0:
+            self.reg_drive_current = reg_drive_current
+        elif saved_reg_drive_current != 0:
+            self.reg_drive_current = saved_reg_drive_current
+        else:
+            self.reg_drive_current = 0
+
+        if tap_drive_current != 0:
+            self.tap_drive_current = tap_drive_current
+        elif saved_tap_drive_current != 0:
+            self.tap_drive_current = saved_tap_drive_current
+        else:
+            self.tap_drive_current = 0
+
         self.tap_start_z = config.getfloat(
             "tap_start_z", self.tap_start_z, above=0.0
         )
@@ -348,11 +374,12 @@ class ProbeEddyParams:
         self.validate(config)
 
     def validate(self, config: ConfigWrapper = None):
+        printer = config.get_printer()
         req_cal_z_max = (
             self.home_trigger_safe_start_offset + self.home_trigger_height + 1.0
         )
         if self.calibration_z_max < req_cal_z_max:
-            raise config.get_printer().config_error(
+            raise printer.config_error(
                 f"calibration_z_max must be at least home_trigger_safe_start_offset+home_trigger_height+1.0 ({self.home_trigger_safe_start_offset:.3f}+{self.home_trigger_height:.3f}+1.0={req_cal_z_max:.3f})"
             )
         if (
@@ -360,12 +387,12 @@ class ProbeEddyParams:
             and self.y_offset == 0.0
             and not self.allow_unsafe
         ):
-            raise config.get_printer().config_error(
+            raise printer.config_error(
                 "ProbeEddy: x_offset and y_offset are both 0.0; is the sensor really mounted at the nozzle?"
             )
 
         if self.home_trigger_height <= self.tap_trigger_safe_start_height:
-            raise config.get_printer().config_error(
+            raise printer.config_error(
                 "ProbeEddy: home_trigger_height must be greater than tap_trigger_safe_start_height"
             )
 
@@ -374,7 +401,7 @@ class ProbeEddyParams:
             need_scipy = True
 
         if need_scipy and not HAS_SCIPY:
-            raise config.get_printer().config_error(
+            raise printer.config_error(
                 "ProbeEddy: butter mode with custom filter parameters requires scipy, which is not available; please install scipy, use the defaults, or use wma mode"
             )
 
@@ -424,6 +451,7 @@ class ProbeEddy:
         logging.info("Hello from ProbeEddyNG")
 
         self._printer: Printer = config.get_printer()
+        self._gcode = self._printer.lookup_object("gcode")
         self._full_name = config.get_name()
         self._name = self._full_name.split()[-1]
 
@@ -515,7 +543,6 @@ class ProbeEddy:
         self._tap_adjust_z = self.params.tap_adjust_z
 
         # define our own commands
-        self._gcode = self._printer.lookup_object("gcode")
         self._dummy_gcode_cmd = self._gcode.create_gcode_command("", "", {})
         self.define_commands(self._gcode)
 
@@ -723,16 +750,20 @@ class ProbeEddy:
             "calibration_version",
             str(ProbeEddyFrequencyMap.calibration_version),
         )
-        if self.params.reg_drive_current != 0 and self.params.reg_drive_current != self._sensor._drive_current:
+        if self.params._config_reg_drive_current == 0 or self.params.reg_drive_current != self.params._config_reg_drive_current:
+            if self.params._config_reg_drive_current != 0:
+                self._log_warning(f"Warning: reg_drive_current set in config ({self.params._config_reg_drive_current}) is different the value that is being saved. Please remove the config value, as it will override this one.")
             configfile.set(
                 self._full_name,
-                "reg_drive_current",
+                "saved_reg_drive_current",
                 str(self.params.reg_drive_current),
             )
-        if self.params.tap_drive_current != 0 and self.params.tap_drive_current != self.params.reg_drive_current:
+        if self.params._config_tap_drive_current == 0 or self.params.tap_drive_current != self.params._config_tap_drive_current:
+            if self.params._config_tap_drive_current != 0:
+                self._log_warning(f"Warning: tap_drive_current set in config ({self.params._config_tap_drive_current}) is different the value that is being saved. Please remove the config value, as it will override this one.")
             configfile.set(
                 self._full_name,
-                "tap_drive_current",
+                "saved_tap_drive_current",
                 str(self.params.tap_drive_current),
             )
 
