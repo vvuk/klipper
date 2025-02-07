@@ -464,9 +464,9 @@ class ProbeEddy:
         self._toolhead: ToolHead = None # filled in _handle_connect
 
         self.params = ProbeEddyParams()
-        # init this to the default from the sensor before loading config
-        self.params.reg_drive_current = self._sensor._drive_current
         self.params.load_from_config(config)
+        if self.params.reg_drive_current == 0:
+            self.params.reg_drive_current = self._sensor._drive_current
 
         # at what minimum physical height to start homing. It must be above the safe start position,
         # because we need to move from the start through the safe start position
