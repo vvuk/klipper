@@ -3251,14 +3251,16 @@ class ProbeEddyFrequencyMap:
             self._eddy.params.calibration_points,
         )
         qz = np.interp(qf, avg_freqs, avg_heights)
-        # 50: because we don't care too much about the early (high z) values
+        # calculate rms using later values because we don't care much about the precision of the
+        # early (high z) values
+        rmse_start_index = len(avg_freqs) // 3 if len(avg_freqs) > 50 else 0
         rmse_fth = np_rmse(
-            lambda v: np.interp(v, qf, qz), avg_freqs[50:], avg_heights[50:]
+            lambda v: np.interp(v, qf, qz), avg_freqs[rmse_start_index:], avg_heights[rmse_start_index:]
         )
         rmse_htf = np_rmse(
             lambda v: np.interp(v, qz[::-1], qf[::-1]),
-            avg_heights[50],
-            avg_freqs[50],
+            avg_heights[rmse_start_index:],
+            avg_freqs[rmse_start_index:],
         )
 
         self._freqs = qf
