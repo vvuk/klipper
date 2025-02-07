@@ -359,8 +359,9 @@ class ProbeEddyParams:
             -1.0,
             above=0.0,
         )
+
         if self.tap_trigger_safe_start_height == -1.0: # sentinel
-            self.tap_trigger_safe_start_height = self.home_trigger_height - 0.3
+            self.tap_trigger_safe_start_height = self.home_trigger_height / 2.0
 
         self.allow_unsafe = config.getchoice(
             "allow_unsafe", bool_choices, default="False"
@@ -1075,7 +1076,7 @@ class ProbeEddy:
                 th_pos = th.get_position()
                 th_pos[2] = r.value
                 self._set_toolhead_position(th_pos, [2])
-                self._log_info(f"Homed Z to {r}")
+                self._log_trace(f"Homed Z to {r}")
             else:
                 self._log_info(f"Probed {r}")
 
@@ -1160,7 +1161,7 @@ class ProbeEddy:
         self._log_info("EDDYng setup: calibrating homing")
         state = FINDING_HOMING
         while state < DONE:
-            mapping, fth_fit, htf_fit = self._create_mapping(
+            mapping, fth_rms, htf_rms = self._create_mapping(
                 self.params.calibration_z_max,
                 0.0, # z_target
                 self.params.probe_speed,
@@ -1184,6 +1185,14 @@ class ProbeEddy:
             if ok_for_tap and (mapping.height_range[0] > tap_req_min or
                                 mapping.height_range[1] < tap_req_max):
                 ok_for_tap = False
+
+            if ok_for_homing or ok_for_tap:
+                if mapping.freq_spread() < 0.30:
+                    self._log_warning(f"EDDYng warning: frequency spread {mapping.freq_spread()} is very low at drive current {drive_current}. If setup fails completely, the sensor is probably mounted too high.")
+                    ok_for_homing = ok_for_tap = False
+                if fth_rms > 0.050:
+                    self._log_info(f"EDDYng: calibration error rate is too high ({fth_rms}) at drive current {drive_current}. Ignoring.")
+                    ok_for_homing = ok_for_tap = False
 
             if (state == FINDING_HOMING and not ok_for_homing) or (state == FINDING_TAP and not ok_for_tap):
                 # calibration failed, have we exceeded our max DC increase?
@@ -1410,7 +1419,7 @@ class ProbeEddy:
         )
         z_end: float = gcmd.get_float("Z_TARGET", 0.0)
         self._log_info(
-            f"Testing Z={z_start:.3f} to Z={z_end:.3f}, drive current {drive_current}"
+            f"Testing Z={z_start:.3f} to Z={z_end:.3f}"
         )
 
         mapping, fth, htf = self._create_mapping(
@@ -1420,10 +1429,11 @@ class ProbeEddy:
             self.params.lift_speed,
             drive_current,
             report_errors=False,
+            write_debug_files=False,
         )
         if mapping is None or fth is None or htf is None:
             self._log_error(
-                "Test failed: likely no samples received, check the log for more clues"
+                f"Test failed: drive current {drive_current} is not usable."
             )
             return
 
@@ -1791,13 +1801,16 @@ class ProbeEddy:
         # the toolhead is pushing into the build plate.
         overshoot = probe_z - now_z
 
+        tap_start_time=self._endstop_wrapper.last_trigger_time
+        tap_end_time=self._endstop_wrapper.last_tap_end_time
+
         return ProbeEddy.TapResult(
             error=error,
             probe_z=probe_z,
             toolhead_z=now_z,
             overshoot=overshoot,
-            tap_start_time=self._endstop_wrapper.last_trigger_time,
-            tap_end_time=self._endstop_wrapper.last_tap_end_time,
+            tap_start_time=tap_start_time,
+            tap_end_time=tap_end_time,
         )
 
     def _compute_butter_tap(self, samples, raw_samples):
@@ -2736,18 +2749,16 @@ class ProbeEddyEndstopWrapper:
         # but annoying in general.
         res = self._dispatch.stop()
 
-        # always reset this; taps are one-shot usages of the endstop wrapper
-        self.tap_config = None
-
         # clean these up, and only update them if successful
         self.last_trigger_time = 0.0
         self.last_tap_end_time = 0.0
 
+        # always reset this; taps are one-shot usages of the endstop wrapper
+        self.tap_config = None
+
         # if we're doing at ap, we wait for samples for the end as well so that we can get
         # beter data for analysis
-        self._sampler.wait_for_sample_at_time(
-            trigger_time if self.tap_config is None else tap_end_time
-        )
+        self._sampler.wait_for_sample_at_time(max(trigger_time, tap_end_time))
 
         # success?
         if res == mcu.MCU_trsync.REASON_ENDSTOP_HIT:
@@ -2767,58 +2778,21 @@ class ProbeEddyEndstopWrapper:
             )
         if res == self.REASON_ERROR_PROBE_TOO_LOW:
             raise self._printer.command_error(
-                "Probe too low at start of homing, did not clear safe threshold."
+                "Probe too low at start of homing, did not clear safe height."
             )
         if res == self.REASON_ERROR_TOO_EARLY:
             raise self._printer.command_error(
-                "Probe did not clear safe time threshold."
+                "Probe did not clear safe height after safe time."
             )
         if res == mcu.MCU_trsync.REASON_PAST_END_TIME:
             raise self._printer.command_error(
-                "Probe completed movement before triggering. If this is a tap, try lowering the threshold. See the docs for more information."
+                "Probe completed movement before triggering. If this is a tap, try lowering TARGET_Z or adjusting the THRESHOLD."
             )
 
         raise self._printer.command_error(f"Unknown homing error: {res}")
 
     def query_endstop(self, print_time):
-        # XXX TODO is this valuable at all? Should we just always return False? Or True?
-        # query_endstops is a web request, meaning this might keep getting hit, which means
-        # it'll keep starting/stopping measurement
-
-        SUPPORT_QUERY_ENDSTOP = False
-        if not SUPPORT_QUERY_ENDSTOP:
-            return False
-
-        if self.tap_config is not None:
-            # XXX unclear how to do this with tap? It's basically always going to be false
-            # unless the toolhead is somehow at 0.0, and we will never know if that's true 0.0
-            # unless we tap.  We could remember the tap freq?
-            return False
-
-        curtime = self._reactor.monotonic()
-        est_print_time = self._mcu.estimated_print_time(curtime)
-        if est_print_time < (print_time - 0.050) or est_print_time > (
-            print_time + 0.050
-        ):
-            logging.warning(
-                f"query_endstop: print_time {print_time} is too far from current {est_print_time}"
-            )
-            return True
-
-        self._sensor._start_measurements()
-        result = self._sensor.read_one_value()
-        self._sensor._finish_measurements()
-
-        freqval = result.freqval
-        freq = result.freq
-
-        # if in error, return -inf height to make endstop checks easier
-        if freqval > 0x0FFFFFFF:
-            logging.warning("query_endstop: got error")
-            return True
-
-        height = self.eddy.freq_to_height(freq)
-        return bool(height < self._home_trigger_height)
+        return False
 
     def _setup_sampler(self):
         self._sampler = self.eddy.start_sampler()
@@ -3154,6 +3128,9 @@ class ProbeEddyFrequencyMap:
             )
         )
 
+    def freq_spread(self) -> float:
+        return ((self.freq_range[1] / self.freq_range[0]) - 1.0) * 100.0
+
     def load_from_config(self, config: ConfigWrapper, drive_current: int):
         calibstr = config.get(f"calibration_{drive_current}", None)
         if calibstr is None:
@@ -3215,6 +3192,9 @@ class ProbeEddyFrequencyMap:
         if len(raw_freqs_list) != len(raw_heights_list):
             raise ValueError("freqs and heights must be the same length")
 
+        if len(raw_freqs_list) == 0:
+            return None, None
+
         # everything must be a np.array or things get confused below
         raw_freqs = np.asarray(raw_freqs_list)
         raw_heights = np.asarray(raw_heights_list)
@@ -3238,6 +3218,11 @@ class ProbeEddyFrequencyMap:
                 self._eddy._log_trace(
                     f"Wrote {len(raw_freqs)} samples to /tmp/eddy-calibration.csv"
                 )
+
+        if len(avg_freqs) == 0 or len(avg_heights) == 0:
+            if report_errors:
+                self._eddy._log_error(f"Error: Calibration failed, couldn't compute averages ({len(raw_freqs_list)}, {len(raw_heights_list)}, {len(avg_freqs)}, {len(avg_heights)}), probably due to no samples received.")
+            return None, None
 
         max_height = float(avg_heights.max())
         min_height = float(avg_heights.min())
@@ -3269,9 +3254,10 @@ class ProbeEddyFrequencyMap:
                 )
 
             # somewhat arbitrary spread
-            if freq_spread < 0.85:
-                self._eddy._log_info(
-                    f"Warning: frequency spread is low ({freq_spread:.2f}%, {min_freq:.1f}-{max_freq:.1f}), adjusting your sensor's height may help."
+            if freq_spread < 0.30:
+                extremely = "EXTREMELY " if freq_spread < 0.15 else ""
+                self._eddy._log_warning(
+                    f"Warning: frequency spread is {extremely}low ({freq_spread:.2f}%, {min_freq:.1f}-{max_freq:.1f}), which will greatly impact accuracy. Your sensor may be too high."
                 )
 
         # Calculate RMSE
@@ -3294,6 +3280,14 @@ class ProbeEddyFrequencyMap:
             avg_freqs[rmse_start_index:],
         )
 
+        if report_errors:
+            if rmse_fth > 0.050:
+                self._eddy._log_error(
+                    f"Error: calibration error margin is too high ({rmse_fth:.3f}). Possible causes: bad drive current, bad sensor mount height."
+                )
+                if not self._eddy.params.allow_unsafe:
+                    return None, None
+
         self._freqs = qf
         self._heights = qz
         self.height_range = (min_height, max_height)
@@ -3303,7 +3297,7 @@ class ProbeEddyFrequencyMap:
         self._eddy._log_info(
             f"Drive current {drive_current}: valid height: {min_height:.3f} to {max_height:.3f}, "
             f"freq spread {freq_spread:.2f}% ({min_freq:.1f} - {max_freq:.1f}), "
-            f"RMSE F->H: {rmse_fth:.4f}, H->F: {rmse_htf:.2f}"
+            f"Fit {rmse_fth:.4f} ({rmse_htf:.2f})"
         )
 
         if write_debug_files:
