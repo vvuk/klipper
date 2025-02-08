@@ -15,7 +15,7 @@ from itertools import combinations
 import mcu
 import pins
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     Dict,
     List,
@@ -236,6 +236,8 @@ class ProbeEddyParams:
     _config_reg_drive_current: int = 0
     _config_tap_drive_current: int = 0
 
+    _warning_msgs: List[str] = field(default_factory=list)
+
     @staticmethod
     def str_to_floatlist(s):
         if s is None:
@@ -293,11 +295,15 @@ class ProbeEddyParams:
         logging.info(f"saved {saved_reg_drive_current} reg {reg_drive_current}")
         if saved_reg_drive_current != 0 and reg_drive_current != 0 and reg_drive_current != saved_reg_drive_current:
             printer = config.get_printer()
-            printer.lookup_object('gcode').respond_raw(f"!! probe_eddy_ng has reg_drive_current specified in config and in saved variables. Config value ({reg_drive_current}) is taking precedence. Remove one of these to remove this warning.\n")
+            msg = f"probe_eddy_ng has reg_drive_current specified in config and in saved variables. Config value ({reg_drive_current}) is taking precedence. Remove one of these to remove this warning."
+            logging.warning(msg)
+            self._warning_msgs.append(msg)
 
         if saved_tap_drive_current != 0 and tap_drive_current != 0 and tap_drive_current != saved_tap_drive_current:
             printer = config.get_printer()
-            printer.lookup_object('gcode').respond_raw(f"!! probe_eddy_ng has tap_drive_current specified in config and in saved variables. Config value ({tap_drive_current}) is taking precedence. Remove one of these to remove this warning.\n")
+            msg = f"probe_eddy_ng has tap_drive_current specified in config and in saved variables. Config value ({tap_drive_current}) is taking precedence. Remove one of these to remove this warning."
+            logging.warning(msg)
+            self._warning_msgs.append(msg)
 
         # the config value overrides a saved value, if any
         if reg_drive_current == 0:
@@ -653,6 +659,8 @@ class ProbeEddy:
 
     def _handle_connect(self):
         self._toolhead = self._printer.lookup_object("toolhead")
+        for msg in self.params._warning_msgs:
+            self._log_warning(msg)
 
     def current_drive_current(self) -> int:
         return self._sensor.get_drive_current()
